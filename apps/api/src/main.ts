@@ -15,6 +15,9 @@ async function bootstrap() {
     if ((process.env.SESSION_SECRET?.length ?? 0) < 32 || (process.env.OTP_ENCRYPTION_SECRET?.length ?? 0) < 32) {
       throw new Error('SESSION_SECRET and OTP_ENCRYPTION_SECRET must be at least 32 characters');
     }
+    if (process.env.SESSION_SECRET === process.env.OTP_ENCRYPTION_SECRET) {
+      throw new Error('OTP_ENCRYPTION_SECRET must be distinct from SESSION_SECRET');
+    }
   }
   const app = await NestFactory.create(AppModule);
   app.setGlobalPrefix('api');

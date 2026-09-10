@@ -735,8 +735,11 @@ export class TicketService {
   }
 
   private otpKey() {
-    const secret = process.env.OTP_ENCRYPTION_SECRET ?? process.env.SESSION_SECRET;
+    const secret = process.env.OTP_ENCRYPTION_SECRET;
     if (!secret || secret.length < 32) throw new Error('OTP_ENCRYPTION_SECRET must contain at least 32 characters');
+    if (process.env.NODE_ENV === 'production' && secret === process.env.SESSION_SECRET) {
+      throw new Error('OTP_ENCRYPTION_SECRET must be distinct from SESSION_SECRET');
+    }
     return createHash('sha256').update(secret).digest();
   }
 

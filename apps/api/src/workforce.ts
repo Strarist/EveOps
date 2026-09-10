@@ -248,8 +248,8 @@ export class WorkforceService {
             if (routed.version === before) break;
           }
         }
-      } catch (error) {
-        routingWarning = error instanceof Error ? error.message : 'Queue routing failed after availability update';
+      } catch {
+        routingWarning = 'Availability updated, but queued work could not be drained automatically';
       }
     }
     return routingWarning ? { availability: value, routingWarning } : { availability: value };
