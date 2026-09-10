@@ -447,6 +447,49 @@ test.describe.serial('isolated multi-role operational acceptance', () => {
     await Promise.all([manager.close(), admin.close()]);
   });
 
+  test('11b Admin create Staff requires hall and succeeds with hall', async ({ browser }) => {
+    const admin = await login(browser, emails.admin);
+    const missingHall = await admin.request.post('/api/workforce/people', {
+      data: {
+        name: 'No Hall Staff',
+        email: `${runKey}.no-hall@eveops.test`,
+        password,
+        role: 'STAFF',
+        eventId: ids.event,
+        serviceCategory: 'ELECTRICAL',
+        serviceSubtype: 'Lighting',
+        capacity: 1,
+      },
+    });
+    expect(missingHall.status()).toBe(400);
+    expect(String((await missingHall.json()).message)).toMatch(/hall/i);
+
+    const adminPage = await admin.newPage();
+    await adminPage.goto('/admin');
+    await adminPage.getByRole('button', { name: 'Workforce' }).click();
+    await adminPage.getByRole('button', { name: 'Add person' }).click();
+    await expect(adminPage.getByLabel(/^Hall/)).toBeVisible();
+    await adminPage.getByLabel(/^Name/).fill('Admin Created Electrician');
+    await adminPage.getByLabel(/Login email/).fill(`${runKey}.admin-created@eveops.test`);
+    await adminPage.getByLabel(/Temporary password/).fill(password);
+    await adminPage.getByLabel(/^Hall/).selectOption(ids.hall);
+    await adminPage.getByLabel(/Service category/).selectOption('ELECTRICAL');
+    await adminPage.getByLabel(/Service subtype/).selectOption('Lighting');
+    await adminPage.getByRole('button', { name: 'Create account' }).click();
+    await expect.poll(async () => {
+      const created = await prisma.user.findUnique({ where: { email: `${runKey}.admin-created@eveops.test` } });
+      return created?.approvalStatus === 'APPROVED' && created.mustChangePassword === true;
+    }, { timeout: 15_000 }).toBe(true);
+    await expect(adminPage.getByText(/Temporary password must be changed on first sign-in|Created Admin Created Electrician/i)).toBeVisible({ timeout: 10_000 });
+
+    const created = await prisma.user.findUnique({ where: { email: `${runKey}.admin-created@eveops.test` } });
+    expect(created?.approvalStatus).toBe('APPROVED');
+    expect(created?.mustChangePassword).toBe(true);
+    const scope = await prisma.userScope.findFirst({ where: { userId: created!.id } });
+    expect(scope?.hallId).toBe(ids.hall);
+    await admin.close();
+  });
+
   test('12 House Help OTP flow closes and frees capacity', async ({ browser }) => {
     const stall = await login(browser, emails.stall);
     const house = await login(browser, emails.houseStaff);
