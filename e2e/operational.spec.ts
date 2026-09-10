@@ -184,12 +184,18 @@ async function advanceToOtp(context: BrowserContext, ticketId: string) {
   }
 }
 
-async function closeWithOtp(stall: BrowserContext, ticketId: string) {
+async function closeWithOtp(stall: BrowserContext, staff: BrowserContext, ticketId: string) {
   const otpResponse = await stall.request.get(`/api/tickets/${ticketId}/otp`);
   expect(otpResponse.status()).toBe(200);
-  const { otp } = await otpResponse.json() as { otp: string };
-  const closeResponse = await stall.request.post(`/api/tickets/${ticketId}/otp/verify`, { data: { otp } });
-  expect(closeResponse.status()).toBe(201);
+  const body = await otpResponse.json() as { otp: string | null; expired?: boolean };
+  expect(body.otp).toMatch(/^\d{6}$/);
+  const stallVerify = await stall.request.post(`/api/tickets/${ticketId}/otp/verify`, { data: { otp: body.otp } });
+  expect([403, 429].includes(stallVerify.status()), `stall verify status ${stallVerify.status()}`).toBe(true);
+  if (stallVerify.status() === 403) {
+    expect(String((await stallVerify.json()).message ?? '')).toMatch(/assigned staff|Forbidden/i);
+  }
+  const closeResponse = await staff.request.post(`/api/tickets/${ticketId}/otp/verify`, { data: { otp: body.otp } });
+  expect(closeResponse.status(), await closeResponse.text()).toBe(201);
 }
 
 test.describe.serial('isolated multi-role operational acceptance', () => {
@@ -214,7 +220,7 @@ test.describe.serial('isolated multi-role operational acceptance', () => {
     const staffPage = await staff.newPage();
     await staffPage.goto('/staff');
     await expect(staffPage.getByText(ticket.publicNo)).toBeVisible();
-    await expect(staffPage.getByRole('button', { name: 'Accept' })).toBeVisible();
+    await expect(staffPage.getByRole('button', { name: 'Accept assignment' })).toBeVisible();
     await advanceToOtp(staff, ticket.id);
     const afterRequest = await (await staff.request.get(`/api/tickets/${ticket.id}`)).json() as { status: string; completionRequestedAt: string | null };
     expect(afterRequest.status).toBe('AWAITING_OTP');
@@ -222,8 +228,20 @@ test.describe.serial('isolated multi-role operational acceptance', () => {
     const stallPage = await stall.newPage();
     await stallPage.goto('/stall');
     await expect(stallPage.getByText(ticket.publicNo)).toBeVisible();
-    await expect(stallPage.getByText('Awaiting stall OTP')).toBeVisible();
-    await closeWithOtp(stall, ticket.id);
+    await expect(stallPage.getByText('Waiting for completion verification')).toBeVisible();
+    const showCode = stallPage.getByRole('button', { name: /Show completion code|Loading code/ });
+    if (await showCode.isVisible().catch(() => false)) {
+      await expect.poll(async () => showCode.isEnabled(), { timeout: 15_000 }).toBe(true);
+      await showCode.click();
+    }
+    await expect(stallPage.getByText('Completion code', { exact: true })).toBeVisible({ timeout: 15_000 });
+    await expect(stallPage.locator('.otp-digits')).toBeVisible();
+    const staffAwait = await staff.newPage();
+    await staffAwait.goto('/staff');
+    await expect(staffAwait.getByText('Waiting for stall code')).toBeVisible();
+    await expect(staffAwait.getByRole('button', { name: 'Verify & close ticket' })).toBeVisible();
+    await expect(staffAwait.locator('.otp-digits')).toHaveCount(0);
+    await closeWithOtp(stall, staff, ticket.id);
     const detail = await admin.request.get(`/api/tickets/${ticket.id}`);
     const closed = await detail.json() as { status: string; closedAt: string | null; firstAcceptedAt: string | null; firstStartedAt: string | null };
     expect(closed.status).toBe('CLOSED');
@@ -254,7 +272,7 @@ test.describe.serial('isolated multi-role operational acceptance', () => {
     const active = await manager.request.get('/api/tickets?view=active');
     expect((await active.json()).items.some((item: { id: string }) => item.id === ticket.id)).toBe(true);
     await advanceToOtp(manager, ticket.id);
-    await closeWithOtp(stall, ticket.id);
+    await closeWithOtp(stall, manager, ticket.id);
     await Promise.all([stall.close(), manager.close()]);
   });
 
@@ -268,7 +286,7 @@ test.describe.serial('isolated multi-role operational acceptance', () => {
     expect(second.status).toBe('QUEUED');
     expect(third.status).toBe('QUEUED');
     await advanceToOtp(staff, first.id);
-    await closeWithOtp(stall, first.id);
+    await closeWithOtp(stall, staff, first.id);
     await expect.poll(async () => {
       const response = await stall.request.get(`/api/tickets/${second.id}`);
       return (await response.json()).status;
@@ -416,12 +434,14 @@ test.describe.serial('isolated multi-role operational acceptance', () => {
     const ticket = await createTicket(stall, 'HOUSE_HELP', 'General');
     expect(ticket.status).toBe('ASSIGNED');
     await advanceToOtp(house, ticket.id);
-    const wrong = await stall.request.post(`/api/tickets/${ticket.id}/otp/verify`, { data: { otp: '000000' } });
+    const wrong = await house.request.post(`/api/tickets/${ticket.id}/otp/verify`, { data: { otp: '000000' } });
     expect(wrong.status()).toBe(400);
-    await closeWithOtp(stall, ticket.id);
+    const stillOpen = await (await stall.request.get(`/api/tickets/${ticket.id}`)).json() as { status: string };
+    expect(stillOpen.status).toBe('AWAITING_OTP');
+    await closeWithOtp(stall, house, ticket.id);
     const closed = await (await stall.request.get(`/api/tickets/${ticket.id}`)).json() as { status: string };
     expect(closed.status).toBe('CLOSED');
-    const duplicate = await stall.request.post(`/api/tickets/${ticket.id}/otp/verify`, { data: { otp: '123456' } });
+    const duplicate = await house.request.post(`/api/tickets/${ticket.id}/otp/verify`, { data: { otp: '123456' } });
     expect([200, 201].includes(duplicate.status()), `duplicate OTP status ${duplicate.status()} ${await duplicate.text()}`).toBe(true);
     expect((await duplicate.json()).status).toBe('CLOSED');
     const me = await (await house.request.get('/api/workforce/me')).json() as { activeCount: number };
@@ -485,8 +505,29 @@ test.describe.serial('isolated multi-role operational acceptance', () => {
     const onDuty = await staff.request.patch('/api/workforce/availability', { data: { value: 'ON_DUTY' } });
     expect(onDuty.status()).toBe(200);
     await advanceToOtp(staff, first.id);
-    await closeWithOtp(stall, first.id);
+    await closeWithOtp(stall, staff, first.id);
     await expect.poll(async () => (await (await stall.request.get(`/api/tickets/${second.id}`)).json()).status).toBe('ASSIGNED');
+    await Promise.all([stall.close(), staff.close()]);
+  });
+
+  test('15 expired OTP rejects staff verify until stall regenerates', async ({ browser }) => {
+    const stall = await login(browser, emails.stall);
+    const staff = await login(browser, emails.staff);
+    const ticket = await createTicket(stall);
+    await advanceToOtp(staff, ticket.id);
+    const otpResponse = await stall.request.get(`/api/tickets/${ticket.id}/otp`);
+    const { otp } = await otpResponse.json() as { otp: string };
+    await prisma.otpChallenge.updateMany({
+      where: { ticketId: ticket.id, verifiedAt: null, invalidatedAt: null },
+      data: { expiresAt: new Date(Date.now() - 1000), createdAt: new Date(Date.now() - 60_000) },
+    });
+    const expired = await staff.request.post(`/api/tickets/${ticket.id}/otp/verify`, { data: { otp } });
+    expect(expired.status()).toBe(400);
+    expect(String((await expired.json()).message)).toMatch(/expired/i);
+    const regenerate = await stall.request.post(`/api/tickets/${ticket.id}/otp/regenerate`);
+    expect(regenerate.status()).toBe(201);
+    await closeWithOtp(stall, staff, ticket.id);
+    expect((await (await stall.request.get(`/api/tickets/${ticket.id}`)).json()).status).toBe('CLOSED');
     await Promise.all([stall.close(), staff.close()]);
   });
 });

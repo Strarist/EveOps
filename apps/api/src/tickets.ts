@@ -197,7 +197,7 @@ export class TicketService {
             : ticket.status === 'QUEUED'
               ? 'WAIT_FOR_ASSIGNMENT'
               : ticket.status === 'AWAITING_OTP'
-                ? 'STALL_VERIFY_OTP'
+                ? 'STAFF_VERIFY_OTP'
                 : current ? 'ASSIGNEE_ACTION' : 'ROUTE',
         };
       }),
@@ -470,14 +470,18 @@ export class TicketService {
   async presentOtp(id: string, scope: AuthScope) {
     const ticket = await this.prisma.ticket.findUniqueOrThrow({ where: { id } });
     assertScope(scope, ticket);
-    if (scope.role !== 'STALL') throw new BadRequestException('Only the bound stall can view this OTP');
+    if (scope.role !== 'STALL') throw new ForbiddenException('Only the bound stall can view this OTP');
+    if (ticket.status === 'CLOSED') throw new BadRequestException('Completion already verified');
     if (ticket.status !== 'AWAITING_OTP') throw new BadRequestException('Ticket is not awaiting OTP');
     const challenge = await this.prisma.otpChallenge.findFirst({
       where: { ticketId: id, invalidatedAt: null, verifiedAt: null },
       orderBy: { createdAt: 'desc' },
     });
-    if (!challenge || challenge.expiresAt <= new Date()) throw new BadRequestException('OTP unavailable or expired');
-    return { otp: this.unprotectOtp(challenge.otpCiphertext), expiresAt: challenge.expiresAt };
+    if (!challenge) throw new BadRequestException('OTP unavailable or expired');
+    if (challenge.expiresAt <= new Date()) {
+      return { otp: null as string | null, expiresAt: challenge.expiresAt, expired: true as const };
+    }
+    return { otp: this.unprotectOtp(challenge.otpCiphertext), expiresAt: challenge.expiresAt, expired: false as const };
   }
 
   async regenerateOtp(id: string, scope: AuthScope) {
@@ -488,18 +492,47 @@ export class TicketService {
     const result = await this.prisma.$transaction(async (tx) => {
       const ticket = await tx.ticket.findUniqueOrThrow({ where: { id } });
       assertScope(scope, ticket);
-      if (scope.role !== 'STALL') throw new BadRequestException('Stall verification required');
-      if (ticket.status === 'CLOSED') return { invalidOtp: false as const, ticket, releasedStaffIds: [] as string[] };
+      if (!['STAFF', 'HALL_MANAGER'].includes(scope.role)) {
+        throw new ForbiddenException('Only the assigned staff can enter the stall completion code');
+      }
+      const priorAssignment = await tx.assignment.findFirst({
+        where: { ticketId: id, staffId: scope.userId },
+        orderBy: { assignedAt: 'desc' },
+      });
+      if (ticket.status === 'CLOSED') {
+        if (!priorAssignment) throw new ForbiddenException('Only the assigned staff can verify completion');
+        return { invalidOtp: false as const, expired: false as const, ticket, releasedStaffIds: [] as string[] };
+      }
       if (ticket.status !== 'AWAITING_OTP') throw new BadRequestException('Ticket is not awaiting OTP');
+      const assignment = await tx.assignment.findFirst({
+        where: { ticketId: id, staffId: scope.userId, status: { in: ['ACTIVE', 'ACCEPTED'] } },
+        orderBy: { assignedAt: 'desc' },
+      });
+      if (!assignment) throw new ForbiddenException('Only the assigned staff can enter the stall completion code');
       const challenge = await tx.otpChallenge.findFirst({ where: { ticketId: id, activeTicketKey: id, invalidatedAt: null, verifiedAt: null }, orderBy: { createdAt: 'desc' } });
       const now = new Date();
-      if (!challenge || challenge.expiresAt <= now || challenge.attempts >= 5) throw new BadRequestException('OTP unavailable or expired');
+      if (!challenge || challenge.attempts >= 5) throw new BadRequestException('OTP unavailable or expired');
+      if (challenge.expiresAt <= now) {
+        return { invalidOtp: false as const, expired: true as const };
+      }
       if (challenge.otpHash !== createHash('sha256').update(otp).digest('hex')) {
         await tx.otpChallenge.updateMany({
           where: { id: challenge.id, invalidatedAt: null, verifiedAt: null, attempts: { lt: 5 } },
           data: { attempts: { increment: 1 } },
         });
-        return { invalidOtp: true as const };
+        await tx.ticketEvent.create({
+          data: {
+            eventId: ticket.eventId,
+            ticketId: id,
+            eventType: 'OTP_VERIFY_FAILED',
+            actorId: scope.userId,
+            fromStatus: 'AWAITING_OTP',
+            toStatus: 'AWAITING_OTP',
+            correlationId: requestCorrelationId(),
+            metadata: { reason: 'mismatch' },
+          },
+        });
+        return { invalidOtp: true as const, expired: false as const };
       }
       const challengeUpdate = await tx.otpChallenge.updateMany({
         where: { id: challenge.id, activeTicketKey: id, invalidatedAt: null, verifiedAt: null },
@@ -521,7 +554,7 @@ export class TicketService {
       });
       await tx.complaint.updateMany({
         where: { ticketId: id, resolution: null },
-        data: { resolution: 'Resolved by stall-verified closure' },
+        data: { resolution: 'Resolved by stall-supplied completion code' },
       });
       if (releasedAssignments.length) {
         await tx.workforceMembership.updateMany({
@@ -529,12 +562,36 @@ export class TicketService {
           data: { lastAvailableAt: now },
         });
       }
-      await tx.ticketEvent.create({ data: { eventId: ticket.eventId, ticketId: id, eventType: 'OTP_VERIFIED', actorId: scope.userId, fromStatus: 'AWAITING_OTP', toStatus: 'CLOSED', correlationId: requestCorrelationId() } });
+      const correlationId = requestCorrelationId();
+      await tx.ticketEvent.create({
+        data: {
+          eventId: ticket.eventId,
+          ticketId: id,
+          eventType: 'OTP_VERIFIED',
+          actorId: scope.userId,
+          fromStatus: 'AWAITING_OTP',
+          toStatus: 'CLOSED',
+          correlationId,
+          metadata: { enteredBy: 'ASSIGNED_STAFF', credentialSource: 'STALL_DISPLAYED' },
+        },
+      });
+      await tx.ticketEvent.create({
+        data: {
+          eventId: ticket.eventId,
+          ticketId: id,
+          eventType: 'TICKET_CLOSED',
+          actorId: scope.userId,
+          fromStatus: 'AWAITING_OTP',
+          toStatus: 'CLOSED',
+          correlationId,
+        },
+      });
       await tx.outboxEvent.create({ data: { eventId: ticket.eventId, aggregateType: 'Ticket', aggregateId: id, eventType: 'OTP_VERIFIED', payload: { ticketId: id, eventId: ticket.eventId, hallId: ticket.hallId, stallId: ticket.stallId } } });
       const updated = await tx.ticket.findUniqueOrThrow({ where: { id } });
       await createLifecycleNotifications(tx, updated, 'TICKET_CLOSED', scope.userId);
-      return { invalidOtp: false as const, ticket: updated, releasedStaffIds: releasedAssignments.map((assignment) => assignment.staffId) };
+      return { invalidOtp: false as const, expired: false as const, ticket: updated, releasedStaffIds: releasedAssignments.map((assignment) => assignment.staffId) };
     });
+    if (result.expired) throw new BadRequestException('OTP expired');
     if (result.invalidOtp) throw new BadRequestException('Invalid OTP');
     const closed = result.ticket;
     await this.assignWaitingForReleasedStaff(result.releasedStaffIds);
@@ -768,7 +825,7 @@ export class TicketController {
   @Post(':id/transition') transition(@Param('id') id: string, @Body() body: TransitionTicketDto, @CurrentScope() scope: AuthScope) { return this.service.transition(id, body.to, scope, body.reason); }
   @Post(':id/snooze') snooze(@Param('id') id: string, @CurrentScope() scope: AuthScope) { return this.service.snooze(id, scope); }
   @Get(':id/otp')
-  @Throttle({ default: { limit: 10, ttl: 60000 } })
+  @Throttle({ default: { limit: 30, ttl: 60000 } })
   otp(@Param('id') id: string, @CurrentScope() scope: AuthScope) { return this.service.presentOtp(id, scope); }
   @Post(':id/otp/verify')
   @Throttle({ default: { limit: 20, ttl: 60000 } })

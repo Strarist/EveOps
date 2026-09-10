@@ -28,7 +28,7 @@ administrators, security/operations reviewers.
 
 | **Role**     | **Default scope**                    | **Core authority**                                                                       |
 |--------------|--------------------------------------|------------------------------------------------------------------------------------------|
-| Stall        | One stall within one event           | Create/track own stall tickets; verify OTP; raise complaint.                             |
+| Stall        | One stall within one event           | Create/track own stall tickets; display OTP; raise complaint.                            |
 | Staff        | Assigned event/hall/service scope    | Accept/snooze/start/request closure for own assigned tickets.                            |
 | Hall Manager | One or more halls within an event    | View all hall tickets; ping/reassign/reopen/escalate within scope.                       |
 | Admin        | One event or configured event set    | Full event operations, masters, workforce, ticket interventions, reports.                |
@@ -43,7 +43,8 @@ administrators, security/operations reviewers.
 | Accept assigned ticket  | No                   | Own only             | No                   | No            | No               |
 | Snooze assigned alert   | No                   | Own only             | No                   | No            | No               |
 | Start / request closure | No                   | Own only             | Manager override     | Yes           | Yes              |
-| Verify OTP              | Own stall            | No                   | No\*\*               | Override only | Override only    |
+| Display OTP             | Own stall            | No                   | No                   | No            | No               |
+| Enter / verify OTP      | No                   | Assigned only        | Assigned only\*\*    | Override only | Override only    |
 | Raise complaint         | Own stall            | No                   | On behalf            | On behalf     | On behalf        |
 | Reassign                | No                   | No                   | Within hall          | Within event  | All scoped       |
 | Reopen                  | No\*\*\*             | No                   | Within hall          | Within event  | All scoped       |
@@ -53,7 +54,7 @@ administrators, security/operations reviewers.
 | View audit log          | Own ticket timeline  | Own ticket timeline  | Hall timeline        | Event audit   | All scoped audit |
 
 \* Staff sees tickets assigned to them and any limited queue metadata
-needed for work. \*\* Normal OTP must be verified from the stall side.
+needed for work. \*\* Normal OTP is displayed only to the Stall; assigned Staff enters it as physical completion confirmation.
 \*\*\* Stall requests complaint/reopen; Hall Manager/Admin performs
 formal reopen.
 
@@ -88,7 +89,7 @@ CANCELLED with reason.
 | QUEUED           | ASSIGNED / CANCELLED                    | Queue engine / Admin                                      |
 | ACCEPTED         | IN_PROGRESS / REASSIGNED                | Assigned staff / Manager/Admin                            |
 | IN_PROGRESS      | AWAITING_OTP / ESCALATED                | Assigned staff / Manager/Admin                            |
-| AWAITING_OTP     | CLOSED / COMPLAINT_RAISED / IN_PROGRESS | Stall OTP / Stall dissatisfaction / authorized correction |
+| AWAITING_OTP     | CLOSED / COMPLAINT_RAISED / IN_PROGRESS | Staff enters stall OTP / Stall dissatisfaction / authorized correction |
 | CLOSED           | REOPENED                                | Hall Manager/Admin/SuperAdmin                             |
 | COMPLAINT_RAISED | REOPENED / ESCALATED                    | Hall Manager/Admin                                        |
 | REOPENED         | ASSIGNED / QUEUED                       | Routing engine                                            |
@@ -171,8 +172,9 @@ subtype/priority.
 - Maximum attempts and resend/regeneration rate limits must be
   configurable and logged.
 
-- Successful verification sets verified_at/verified_by and closes the
-  ticket atomically.
+- Successful verification sets verified_at/verified_by (assigned Staff
+  who entered the stall-supplied code) and closes the ticket atomically.
+  Plaintext OTP is never shown to Staff, managers, or exports.
 
 - OTP value must not appear in audit exports, analytics datasets or
   ordinary logs.

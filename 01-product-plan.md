@@ -117,8 +117,8 @@ complaint logs with one traceable ticket lifecycle.
 | QUEUED           | No eligible staff currently free                                | ASSIGNED, CANCELLED             |
 | ACCEPTED         | Staff acknowledged responsibility                               | IN_PROGRESS, REASSIGNED         |
 | IN_PROGRESS      | Work has started                                                | AWAITING_OTP, ESCALATED         |
-| AWAITING_OTP     | Staff claims work complete; stall must verify                   | CLOSED, COMPLAINT_RAISED        |
-| CLOSED           | OTP verified and ticket completed                               | REOPENED                        |
+| AWAITING_OTP     | Staff claims work complete; stall displays OTP for Staff entry  | CLOSED, COMPLAINT_RAISED        |
+| CLOSED           | Stall-supplied OTP entered by Staff; ticket completed           | REOPENED                        |
 | COMPLAINT_RAISED | Stall is not satisfied                                          | REOPENED, ESCALATED             |
 | REOPENED         | Manager/Admin has returned the ticket to active work            | ASSIGNED, QUEUED                |
 | ESCALATED        | Exception requiring managerial/admin attention                  | ASSIGNED, REOPENED, CLOSED      |
@@ -158,8 +158,11 @@ configured.
 - **Generation -** When staff taps “Work completed”, generate a
   short-lived numeric OTP tied to that ticket and stall.
 
-- **Verification -** Stall user enters/confirms the OTP; successful
-  verification records verified_by, timestamp and attempt count.
+- **Verification -** Stall displays the OTP on their authenticated
+  interface and verbally shares it only after checking the work. The
+  assigned Staff enters the OTP; successful verification records
+  verified_by (Staff), timestamp and attempt count. Staff must never
+  receive the OTP value from the system.
 
 - **Expiry -** OTP should expire after a configurable short period
   (recommended 10 minutes) and be regenerable with rate limits.
@@ -261,7 +264,8 @@ analytics and display a human-readable value in the UI.
 - An unanswered assignment produces a manager/admin alert at the
   configured 10-minute deadline.
 
-- Normal completion requires valid OTP verification by the stall side.
+- Normal completion requires the Stall to supply the displayed OTP and
+  the assigned Staff to enter it successfully.
 
 - A dissatisfied stall can raise a complaint; a Hall Manager/Admin can
   reopen the ticket without losing prior history.

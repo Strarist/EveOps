@@ -43,7 +43,8 @@ MANAGER**
 | 5        | Staff     | Accepts                                                               | Ticket becomes ACCEPTED; accepted_at is captured and assignment-to-accept duration becomes available.                              |
 | 6        | Staff     | Starts work                                                           | Ticket becomes IN_PROGRESS; started_at is captured.                                                                                |
 | 7        | Staff     | Marks work completed                                                  | Ticket becomes AWAITING_OTP; completion_requested_at is captured and closure OTP challenge is created for stall.                   |
-| 8        | Stall     | Confirms OTP                                                          | Ticket becomes CLOSED; closed_at is captured after valid OTP.                                                                      |
+| 8        | Stall     | Checks work and verbally shares displayed OTP with Staff              | Stall never enters the OTP. Staff enters the stall-supplied code.                                                                  |
+| 8b       | Staff     | Enters stall completion code                                          | Ticket becomes CLOSED; closed_at is captured after valid OTP.                                                                      |
 | 9        | System    | Finalizes timeline                                                    | System calculates dispatch, staff-response, mobilization, work, OTP-wait and total-resolution durations from immutable timestamps. |
 
 # 3. Stall workflow
@@ -65,8 +66,9 @@ assigned service type and live timeline.
 states should use human-readable labels such as “Waiting for staff”,
 “Staff assigned”, “Work in progress”, “Confirm completion”.
 
-6\. When staff marks completion, receive/see OTP challenge and provide
-confirmation only after checking the work.
+6\. When staff marks completion, view the completion code on your stall
+screen. Check the work, then verbally give the code to Staff. Do not
+enter the OTP yourself.
 
 7\. If dissatisfied, choose “Not resolved / Raise complaint”, select
 reason and enter a short note. The prior work attempt remains in
@@ -150,8 +152,8 @@ post-event performance analysis.
 |-------------------------|------------------------------------------------------------------------------------------------|
 | Request closure         | Only current assignee or authorized manager can initiate normal closure request.               |
 | Generate OTP            | Ticket must be IN_PROGRESS. Generate one active OTP challenge at a time.                       |
-| Present to stall        | OTP should be visible/delivered to the stall-side identity, not to staff as a trusted value.   |
-| Verify                  | Correct non-expired OTP changes status to CLOSED and logs the verifier.                        |
+| Present to stall        | OTP is visible only to the bound stall identity. Staff never see the generated value in-app.   |
+| Verify                  | Assigned Staff enters the stall-supplied OTP; correct non-expired OTP closes the ticket.       |
 | Wrong attempts          | Increment attempt counter and rate-limit; do not reveal whether individual digits are correct. |
 | Expired OTP             | Regenerate with a new challenge; invalidate previous one.                                      |
 | No stall representative | Manager/Admin may use audited override only under documented event policy.                     |

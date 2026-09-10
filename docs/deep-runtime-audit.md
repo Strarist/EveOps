@@ -74,8 +74,9 @@ flowchart LR
   Assigned --> AdminView["Event Admin"]
   Assigned --> SuperView["Authorized SuperAdmin"]
   AssigneeView --> Work["Accept, start, request OTP"]
-  Work --> StallOtp["Bound Stall verifies"]
-  StallOtp --> Closed["Same ticket CLOSED"]
+  Work --> StallDisplay["Bound Stall displays OTP"]
+  StallDisplay --> StaffVerify["Assigned Staff enters stall-supplied OTP"]
+  StaffVerify --> Closed["Same ticket CLOSED"]
   Closed --> Histories["Authorized role histories and timing"]
 ```
 
@@ -203,11 +204,55 @@ Additional defects closed in the final pass:
 
 - Staff blank action buttons (white-on-white CSS)
 - Ticket-age display humanization (`3h 49m` instead of `229m`)
-- Staff/Stall completion copy and OTP entry UX
 - Availability DTO validation and best-effort ON_DUTY routing
 - Lifecycle milestone fallback to ticket timestamps
 - Workforce person create/update/deactivate with RBAC + `ManagementAudit`
 - No person-age field; ticket age remains server-derived only
-- Playwright expanded to 14 scenarios; Jest to 45 tests
 
-Final gate: typecheck/lint/build/migration-preflight/load smoke passed; **14/14 Playwright** and **45 Jest** passed. Pilot readiness remains **YES** for the controlled local MVP.
+## OTP workflow correction pass (10 September 2026)
+
+### 1. Previous OTP behavior
+Stall both displayed and entered the OTP (`POST /otp/verify` required `STALL`). Staff saw “Waiting for stall OTP” with no entry UI. Specs and UI had drifted toward a form-heavy Stall verify path.
+
+### 2. New OTP behavior
+Authoritative field flow: Staff requests completion → Stall displays 6-digit code → Stall verbally shares only after checking work → assigned Staff enters code → ticket closes, capacity releases, FIFO may assign next. Specs (`01`–`04`) updated to match.
+
+### 3. Backend changes
+- `verifyOtp` requires assigned `STAFF`/`HALL_MANAGER`; Stall receives 403 on verify.
+- `presentOtp` remains Stall-only; returns `{ expired: true }` when challenge expired; refuses after `CLOSED`.
+- Success writes `OTP_VERIFIED` + `TICKET_CLOSED` (no plaintext OTP in metadata); mismatches write `OTP_VERIFY_FAILED`.
+- Complaint still invalidates active OTP. OTP encryption secret has no session fallback.
+
+### 4. Stall UI
+Removed OTP entry. Completion panel shows digit cards, countdown, assignee name, regenerate/expired states, and “Work is not satisfactory” complaint sheet.
+
+### 5. Staff UI
+`AWAITING_OTP` shows segmented 6-digit entry, paste/backspace, Verify & close with loading/error maps. Role status: “Waiting for stall code”. Availability is an explicit page (On duty / Paused / Off duty).
+
+### 6. Manager/Admin lifecycle
+Milestones show event-local times plus relative durations; Closed shows “Pending verification” while `AWAITING_OTP`. Status label: “Awaiting OTP”. No OTP value in drawers/tables.
+
+### 7. Security controls
+Stall owns display; Staff owns entry; managers never see plaintext; exports/audit unchanged (hash/ciphertext only). Prior hardenings preserved (`routingWarning`, distinct `OTP_ENCRYPTION_SECRET`, `db:deploy`).
+
+### 8. Realtime
+Unchanged SSE + REST reconciliation; role UIs refresh on `ticket.updated` after request-completion and verify.
+
+### 9. Error handling
+Shared `apiErrorMessage` sanitizes 5xx and maps OTP invalid/expired to field-safe copy for Stall/Staff/management actions.
+
+### 10. UI/UX improvements
+Role-aware status labels, location emphasis (Stall code), button hierarchy, blank control fixes on OTP panel, Staff metrics “At capacity”.
+
+### 11–15. Verification
+- Integration: operations suite **23 passed** (includes Stall-present / Staff-verify actor test).
+- Playwright: **15/15 passed** (closure via Staff verify, wrong OTP, expired+regenerate, FIFO/capacity).
+- Typecheck: API + web passed.
+- Lint: passed.
+- Production build: passed.
+
+### 16. Remaining MVP blockers
+Forced password rotation, management body DTO standardization, venue-scale load/HTTPS production drill — still deferred.
+
+### 17. Pilot readiness
+**YES** for controlled local pilot: Staff → Stall display → Staff verify → close works end-to-end with capacity release.

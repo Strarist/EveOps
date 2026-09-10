@@ -1,21 +1,26 @@
 'use client';
 
 import type { Role, TicketStatus } from '@eveops/contracts';
-import { FormEvent, useCallback, useEffect, useRef, useState } from 'react';
+import { FormEvent, KeyboardEvent, ClipboardEvent, useCallback, useEffect, useRef, useState } from 'react';
 import { useRouter } from 'next/navigation';
-import { apiFetch, AUTH_LOST_EVENT, subscribeRealtime } from '../lib/api-client';
+import { apiFetch, apiErrorMessage, AUTH_LOST_EVENT, subscribeRealtime } from '../lib/api-client';
 
 type Ticket = {
   id: string;
   no: string;
   service: string;
   location: string;
+  locationParts: { hall: string; zone: string; stall: string };
   status: TicketStatus;
   age: string;
   assignee: string;
   ownerId?: string;
   description: string;
   priority?: boolean;
+  createdAt: string;
+  firstStartedAt?: string | null;
+  completionRequestedAt?: string | null;
+  closedAt?: string | null;
   slaState: 'On track' | 'Response overdue' | 'SLA breached';
   capabilities: {
     advanceHallManagerWork: boolean;
@@ -45,7 +50,7 @@ type ApiTicket = {
   currentAssignee: { id: string; name: string } | null;
   lastAssignee: { id: string; name: string } | null;
   queueState: 'QUEUED' | 'ASSIGNED' | 'NONE';
-  nextAction: 'NONE' | 'WAIT_FOR_ASSIGNMENT' | 'STALL_VERIFY_OTP' | 'ASSIGNEE_ACTION' | 'ROUTE';
+  nextAction: 'NONE' | 'WAIT_FOR_ASSIGNMENT' | 'STAFF_VERIFY_OTP' | 'STALL_VERIFY_OTP' | 'ASSIGNEE_ACTION' | 'ROUTE';
   slaState: 'ON_TRACK' | 'RESPONSE_OVERDUE' | 'SLA_BREACHED';
   capabilities: {
     advanceHallManagerWork: boolean;
@@ -65,11 +70,15 @@ function formatTicketAge(createdAt: string) {
 }
 
 function mapTicket(ticket: ApiTicket): Ticket {
+  const hall = ticket.hall.code;
+  const zone = ticket.zone?.code ?? '';
+  const stall = ticket.stall.stallCode;
   return {
     id: ticket.id,
     no: ticket.publicNo,
     service: ticket.category.replaceAll('_', ' ') + ' · ' + ticket.subtype,
-    location: [ticket.hall.code, ticket.zone?.code, ticket.stall.stallCode].filter(Boolean).join(' · '),
+    location: [hall, zone, stall].filter(Boolean).join(' · '),
+    locationParts: { hall, zone, stall },
     status: ticket.status,
     age: formatTicketAge(ticket.createdAt),
     assignee: ticket.currentAssignee?.name
@@ -79,6 +88,10 @@ function mapTicket(ticket: ApiTicket): Ticket {
     ownerId: ticket.currentAssignee?.id,
     description: ticket.description,
     priority: ticket.priority === 'URGENT',
+    createdAt: ticket.createdAt,
+    firstStartedAt: ticket.firstStartedAt,
+    completionRequestedAt: ticket.completionRequestedAt,
+    closedAt: ticket.closedAt,
     slaState: ticket.slaState === 'SLA_BREACHED' ? 'SLA breached' : ticket.slaState === 'RESPONSE_OVERDUE' ? 'Response overdue' : 'On track',
     capabilities: ticket.capabilities ?? { advanceHallManagerWork: false, emergencyClose: false },
   };
@@ -211,11 +224,11 @@ function useAuthLoss(clear: () => void) {
 const statusLabels: Record<TicketStatus, string> = {
   NEW: 'Request received',
   QUEUED: 'Waiting for staff',
-  ASSIGNED: 'Staff assigned',
-  SNOOZED: 'Response pending',
-  ACCEPTED: 'Staff accepted',
+  ASSIGNED: 'New assignment',
+  SNOOZED: 'Snoozed',
+  ACCEPTED: 'Accepted',
   IN_PROGRESS: 'Work in progress',
-  AWAITING_OTP: 'Awaiting stall OTP',
+  AWAITING_OTP: 'Awaiting OTP',
   CLOSED: 'Closed · OTP verified',
   COMPLAINT_RAISED: 'Issue reported',
   REOPENED: 'Reopened',
@@ -223,8 +236,18 @@ const statusLabels: Record<TicketStatus, string> = {
   CANCELLED: 'Cancelled',
 };
 
-function Status({ value }: { value: TicketStatus }) {
-  return <span className={'status status-' + value.toLowerCase()}>{statusLabels[value]}</span>;
+function statusLabelFor(value: TicketStatus, audience: 'stall' | 'staff' | 'manager' = 'manager') {
+  if (value === 'ASSIGNED' && audience === 'staff') return 'New assignment';
+  if (value === 'ASSIGNED' && audience === 'stall') return 'Staff assigned';
+  if (value === 'AWAITING_OTP' && audience === 'stall') return 'Waiting for completion verification';
+  if (value === 'AWAITING_OTP' && audience === 'staff') return 'Waiting for stall code';
+  if (value === 'AWAITING_OTP') return 'Awaiting OTP';
+  if (value === 'CLOSED' && audience === 'stall') return 'Completion verified';
+  return statusLabels[value];
+}
+
+function Status({ value, audience = 'manager' }: { value: TicketStatus; audience?: 'stall' | 'staff' | 'manager' }) {
+  return <span className={'status status-' + value.toLowerCase()}>{statusLabelFor(value, audience)}</span>;
 }
 
 function LogoutButton() {
@@ -237,18 +260,127 @@ function LogoutButton() {
   return <button className="logout" onClick={logout}>Sign out</button>;
 }
 
-function TicketCard({ ticket, actions = false, actionLabel = 'Accept', actionDisabled = false, onAccept, onSnooze }: { ticket: Ticket; actions?: boolean; actionLabel?: string; actionDisabled?: boolean; onAccept?: () => void; onSnooze?: () => void }) {
+function shortTime(value: string | null | undefined, timezone = 'UTC') {
+  if (!value) return null;
+  return new Intl.DateTimeFormat('en-IN', { timeZone: timezone, timeStyle: 'short' }).format(new Date(value));
+}
+
+function countdownLabel(expiresAt: string | undefined, nowMs: number) {
+  if (!expiresAt) return '';
+  const remaining = Math.max(0, Math.floor((new Date(expiresAt).getTime() - nowMs) / 1000));
+  const minutes = Math.floor(remaining / 60);
+  const seconds = remaining % 60;
+  return `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
+}
+
+function OtpDigits({ value, empty = false }: { value?: string; empty?: boolean }) {
+  const digits = (value ?? '').padEnd(6, ' ').slice(0, 6).split('');
+  return (
+    <div className="otp-digits" aria-hidden={empty || !value}>
+      {digits.map((digit, index) => (
+        <span key={index} className={digit.trim() ? 'otp-digit' : 'otp-digit otp-digit-empty'}>{digit.trim() || '·'}</span>
+      ))}
+    </div>
+  );
+}
+
+function StaffOtpEntry({ disabled, value, onChange, onSubmit, submitting, error, success }: {
+  disabled?: boolean;
+  value: string;
+  onChange: (next: string) => void;
+  onSubmit: () => void;
+  submitting: boolean;
+  error: string;
+  success: string;
+}) {
+  const inputsRef = useRef<Array<HTMLInputElement | null>>([]);
+  function setDigit(index: number, digit: string) {
+    const clean = digit.replace(/\D/g, '').slice(-1);
+    const chars = value.padEnd(6, ' ').split('').slice(0, 6);
+    chars[index] = clean || ' ';
+    const next = chars.join('').replace(/ /g, '').slice(0, 6);
+    onChange(next);
+    if (clean && index < 5) inputsRef.current[index + 1]?.focus();
+  }
+  function onKeyDown(index: number, event: KeyboardEvent<HTMLInputElement>) {
+    if (event.key === 'Backspace' && !value[index] && index > 0) {
+      event.preventDefault();
+      onChange(value.slice(0, index - 1));
+      inputsRef.current[index - 1]?.focus();
+    }
+  }
+  function onPaste(event: ClipboardEvent<HTMLInputElement>) {
+    event.preventDefault();
+    const pasted = event.clipboardData.getData('text').replace(/\D/g, '').slice(0, 6);
+    onChange(pasted);
+    inputsRef.current[Math.min(Math.max(pasted.length - 1, 0), 5)]?.focus();
+  }
+  return (
+    <div className="otp-verify-panel">
+      <p className="otp-kicker">Completion verification</p>
+      <p>Ask the stall representative for the 6-digit completion code.</p>
+      <div className="otp-entry" role="group" aria-label="Completion code">
+        {Array.from({ length: 6 }, (_, index) => (
+          <input
+            key={index}
+            ref={(node) => { inputsRef.current[index] = node; }}
+            inputMode="numeric"
+            autoComplete={index === 0 ? 'one-time-code' : 'off'}
+            pattern="[0-9]*"
+            maxLength={1}
+            aria-label={`Digit ${index + 1}`}
+            disabled={disabled || submitting || !!success}
+            value={value[index] ?? ''}
+            onChange={(event) => setDigit(index, event.target.value)}
+            onKeyDown={(event) => onKeyDown(index, event)}
+            onPaste={onPaste}
+          />
+        ))}
+      </div>
+      {error && <p className="form-error" role="alert">{error}</p>}
+      {success && <p className="form-success" role="status">{success}</p>}
+      <button
+        type="button"
+        className="primary full-width"
+        disabled={disabled || submitting || value.length !== 6 || !!success}
+        onClick={onSubmit}
+      >
+        {success ? 'Ticket completed' : submitting ? 'Verifying code…' : 'Verify & close ticket'}
+      </button>
+      <p className="otp-hint">Only enter the code after the stall confirms the work is complete.</p>
+    </div>
+  );
+}
+
+function TicketCard({ ticket, actions = false, actionLabel = 'Accept assignment', actionDisabled = false, onAccept, onSnooze, audience = 'manager', loadingLabel }: {
+  ticket: Ticket;
+  actions?: boolean;
+  actionLabel?: string;
+  actionDisabled?: boolean;
+  onAccept?: () => void;
+  onSnooze?: () => void;
+  audience?: 'stall' | 'staff' | 'manager';
+  loadingLabel?: string;
+}) {
   return (
     <article className="ticket-card">
-      <div className="ticket-top"><span className="ticket-no">{ticket.no}</span><Status value={ticket.status} /></div>
+      <div className="ticket-top"><span className="ticket-no">{ticket.no}</span><Status value={ticket.status} audience={audience} /></div>
       <h3>{ticket.service}</h3>
       <p className="description">{ticket.description}</p>
-      <div className="location">{ticket.location}</div>
+      <div className="location location-emphasis">
+        <span>{ticket.locationParts.hall} · {ticket.locationParts.zone}</span>
+        <strong>Stall {ticket.locationParts.stall}</strong>
+      </div>
       <div className="ticket-meta">
         <span>Age <strong>{ticket.age}</strong></span>
-        <span>Owner <strong>{ticket.assignee}</strong></span>
+        <span>{audience === 'stall' ? 'Handled by' : 'Owner'} <strong>{ticket.assignee}</strong></span>
       </div>
-      {actions && <div className="ticket-actions"><button className="primary" disabled={actionDisabled} onClick={onAccept}>{actionLabel}</button>{ticket.status === 'ASSIGNED' && <button disabled={actionDisabled} onClick={onSnooze}>Snooze 10 min</button>}</div>}
+      {actions && (
+        <div className="ticket-actions">
+          <button className="primary" disabled={actionDisabled} onClick={onAccept}>{actionDisabled && loadingLabel ? loadingLabel : actionLabel}</button>
+          {ticket.status === 'ASSIGNED' && <button disabled={actionDisabled} onClick={onSnooze}>Snooze 10 min</button>}
+        </div>
+      )}
     </article>
   );
 }
@@ -278,11 +410,10 @@ function ComplaintDisclosure({ ticketId, summary, onSuccess }: { ticketId: strin
           idempotencyKey: idempotencyKey.current,
         }),
       });
-      const result = await response.json() as { message?: string };
-      if (!response.ok) throw new Error(result.message ?? 'Complaint could not be raised');
+      if (!response.ok) throw new Error(await apiErrorMessage(response, 'Complaint could not be raised'));
       idempotencyKey.current = crypto.randomUUID();
       form.reset();
-      setSuccess('Complaint recorded. This ticket is active again.');
+      setSuccess('Complaint recorded. Hall Manager has been notified.');
       await onSuccess();
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : 'Complaint could not be raised');
@@ -295,11 +426,11 @@ function ComplaintDisclosure({ ticketId, summary, onSuccess }: { ticketId: strin
     <details className="complaint-disclosure">
       <summary>{summary}</summary>
       <form onSubmit={(event) => void submitComplaint(event)}>
-        <label>Reason<select name="reasonCode" required disabled={submitting}><option value="">Choose reason</option><option value="WORK_INCOMPLETE">Work incomplete</option><option value="WORK_QUALITY">Quality issue</option><option value="WRONG_SERVICE">Wrong service/person</option></select></label>
-        <label>Note<textarea name="comment" maxLength={500} disabled={submitting} /></label>
+        <label>What is still wrong?<select name="reasonCode" required disabled={submitting}><option value="">Choose reason</option><option value="WORK_INCOMPLETE">Work incomplete</option><option value="WORK_QUALITY">Issue returned</option><option value="WRONG_SERVICE">Wrong repair</option></select></label>
+        <label>Additional details<textarea name="comment" maxLength={500} disabled={submitting} placeholder="Optional note" /></label>
         {error && <p className="form-error" role="alert">{error}</p>}
         {success && <p className="form-success" role="status">{success}</p>}
-        <button type="submit" disabled={submitting}>{submitting ? 'Recording…' : 'Raise complaint'}</button>
+        <button type="submit" disabled={submitting}>{submitting ? 'Submitting complaint…' : 'Submit complaint'}</button>
       </form>
     </details>
   );
@@ -317,17 +448,22 @@ export function StallWorkspace() {
   const [submitError, setSubmitError] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const [otpByTicket, setOtpByTicket] = useState<Record<string, string>>({});
-  const [otpInputByTicket, setOtpInputByTicket] = useState<Record<string, string>>({});
   const [otpExpiryByTicket, setOtpExpiryByTicket] = useState<Record<string, string>>({});
+  const [otpExpiredByTicket, setOtpExpiredByTicket] = useState<Record<string, boolean>>({});
   const [otpPending, setOtpPending] = useState<Record<string, boolean>>({});
+  const [nowMs, setNowMs] = useState(() => Date.now());
   const idempotencyKey = useRef('');
   useAuthLoss(() => {
     setOtpByTicket({});
-    setOtpInputByTicket({});
     setOtpExpiryByTicket({});
+    setOtpExpiredByTicket({});
     setOtpPending({});
     setSubmitted('');
   });
+  useEffect(() => {
+    const timer = setInterval(() => setNowMs(Date.now()), 1000);
+    return () => clearInterval(timer);
+  }, []);
   const stallScope = profile?.scopes.find((scope) => scope.stall);
   const locationLabel = stallScope
     ? [stallScope.hall?.name, 'Zone ' + stallScope.stall!.zone.code, 'Stall ' + stallScope.stall!.stallCode].filter(Boolean).join(' / ')
@@ -338,13 +474,24 @@ export function StallWorkspace() {
     setOtpPending((current) => ({ ...current, [ticketId]: true }));
     try {
       const response = await apiFetch('/api/tickets/' + ticketId + '/otp', { credentials: 'include', cache: 'no-store' });
-      const result = await response.json() as { otp?: string; expiresAt?: string; message?: string };
-      if (!response.ok || !result.otp) throw new Error(result.message ?? 'OTP is unavailable');
-      setOtpByTicket((current) => ({ ...current, [ticketId]: result.otp! }));
-      if (result.expiresAt) setOtpExpiryByTicket((current) => ({ ...current, [ticketId]: result.expiresAt! }));
+      if (!response.ok) throw new Error(await apiErrorMessage(response, 'Completion code is unavailable'));
+      const result = await response.json() as { otp?: string | null; expiresAt?: string; expired?: boolean };
+      if (result.expired || !result.otp) {
+        setOtpByTicket((current) => {
+          const next = { ...current };
+          delete next[ticketId];
+          return next;
+        });
+        setOtpExpiredByTicket((current) => ({ ...current, [ticketId]: true }));
+        if (result.expiresAt) setOtpExpiryByTicket((current) => ({ ...current, [ticketId]: result.expiresAt! }));
+      } else {
+        setOtpByTicket((current) => ({ ...current, [ticketId]: result.otp! }));
+        setOtpExpiredByTicket((current) => ({ ...current, [ticketId]: false }));
+        if (result.expiresAt) setOtpExpiryByTicket((current) => ({ ...current, [ticketId]: result.expiresAt! }));
+      }
       setSubmitError('');
     } catch (cause) {
-      setSubmitError(cause instanceof Error ? cause.message : 'OTP is unavailable');
+      setSubmitError(cause instanceof Error ? cause.message : 'Completion code is unavailable');
     } finally {
       setOtpPending((current) => ({ ...current, [ticketId]: false }));
     }
@@ -355,47 +502,31 @@ export function StallWorkspace() {
     setOtpPending((current) => ({ ...current, [ticketId]: true }));
     try {
       const response = await apiFetch('/api/tickets/' + ticketId + '/otp/regenerate', { method: 'POST', credentials: 'include' });
-      const result = await response.json() as { message?: string };
-      if (!response.ok) throw new Error(result.message ?? 'OTP could not be regenerated');
+      if (!response.ok) throw new Error(await apiErrorMessage(response, 'Could not generate a new code'));
       setOtpPending((current) => ({ ...current, [ticketId]: false }));
       await loadOtp(ticketId);
     } catch (cause) {
-      setSubmitError(cause instanceof Error ? cause.message : 'OTP could not be regenerated');
+      setSubmitError(cause instanceof Error ? cause.message : 'Could not generate a new code');
       setOtpPending((current) => ({ ...current, [ticketId]: false }));
     }
   }
 
-  async function confirmOtp(ticketId: string) {
-    const otp = (otpInputByTicket[ticketId] ?? '').trim() || otpByTicket[ticketId];
-    if (!otp || otpPending[ticketId]) return;
-    setOtpPending((current) => ({ ...current, [ticketId]: true }));
-    try {
-      const response = await apiFetch('/api/tickets/' + ticketId + '/otp/verify', {
-        method: 'POST',
-        credentials: 'include',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ otp }),
-      });
-      const result = await response.json() as { message?: string };
-      if (!response.ok) throw new Error(result.message ?? (response.status === 400 ? 'Incorrect code. Please try again.' : 'OTP confirmation failed'));
-      setOtpByTicket((current) => {
-        const next = { ...current };
-        delete next[ticketId];
-        return next;
-      });
-      setOtpInputByTicket((current) => {
-        const next = { ...current };
-        delete next[ticketId];
-        return next;
-      });
-      setSubmitError('');
-      await refresh();
-    } catch (cause) {
-      setSubmitError(cause instanceof Error ? cause.message : 'OTP confirmation failed');
-    } finally {
-      setOtpPending((current) => ({ ...current, [ticketId]: false }));
+  useEffect(() => {
+    for (const ticket of items) {
+      if (ticket.status === 'AWAITING_OTP' && !otpByTicket[ticket.id] && !otpExpiredByTicket[ticket.id] && !otpPending[ticket.id]) {
+        void loadOtp(ticket.id);
+      }
+      if (ticket.status !== 'AWAITING_OTP' && otpByTicket[ticket.id]) {
+        setOtpByTicket((current) => {
+          const next = { ...current };
+          delete next[ticket.id];
+          return next;
+        });
+      }
     }
-  }
+    // Auto-fetch once per awaiting ticket; pending/otp maps intentionally omitted to avoid loops.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [items]);
 
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -415,8 +546,9 @@ export function StallWorkspace() {
           idempotencyKey: idempotencyKey.current || (idempotencyKey.current = crypto.randomUUID()),
         }),
       });
-      const result = await response.json() as { publicNo?: string; message?: string };
-      if (!response.ok || !result.publicNo) throw new Error(result.message ?? 'Ticket could not be created');
+      if (!response.ok) throw new Error(await apiErrorMessage(response, 'Ticket could not be created'));
+      const result = await response.json() as { publicNo?: string };
+      if (!result.publicNo) throw new Error('Ticket could not be created');
       setSubmitted(result.publicNo);
       idempotencyKey.current = '';
       await refresh();
@@ -468,8 +600,61 @@ export function StallWorkspace() {
         ) : (
           <>
             <button className="raise" onClick={() => { idempotencyKey.current = crypto.randomUUID(); setShowForm(true); }}><span aria-hidden="true">＋</span> Raise a ticket</button>
-            <section><div className="section-title"><h2>Active requests</h2><span>{total} open</span></div>{submitError && <div className="form-error" role="alert">{submitError}</div>}{loading ? <p className="empty-state">Loading your requests…</p> : loadError ? <p className="form-error">{loadError}</p> : items.length ? (showAll ? items : items.slice(0, 3)).map((ticket) => <div key={ticket.id}><TicketCard ticket={ticket} />{ticket.status === 'AWAITING_OTP' && <div className="otp-panel"><span>Completion requested · staff says the work is complete</span>{otpByTicket[ticket.id] ? <><span>Your verification code · expires {eventTime(otpExpiryByTicket[ticket.id])}</span><strong aria-label="Completion OTP">{otpByTicket[ticket.id]}</strong></> : <button className="primary" disabled={otpPending[ticket.id]} onClick={() => void loadOtp(ticket.id)}>{otpPending[ticket.id] ? 'Loading…' : 'Show verification code'}</button>}<label>Enter verification code<input inputMode="numeric" autoComplete="one-time-code" maxLength={6} pattern="[0-9]{6}" value={otpInputByTicket[ticket.id] ?? ''} onChange={(event) => setOtpInputByTicket((current) => ({ ...current, [ticket.id]: event.target.value.replace(/\D/g, '').slice(0, 6) }))} disabled={otpPending[ticket.id]} /></label><button className="primary" disabled={otpPending[ticket.id] || (otpInputByTicket[ticket.id] ?? '').length !== 6} onClick={() => void confirmOtp(ticket.id)}>Verify completion</button><button disabled={otpPending[ticket.id]} onClick={() => void regenerateOtp(ticket.id)}>Request a new code</button><ComplaintDisclosure ticketId={ticket.id} summary="Work is not satisfactory / Report a problem" onSuccess={refresh} /></div>}</div>) : <p className="empty-state">No active requests for this stall.</p>}</section>
-            <section><div className="section-title"><h2>Recently resolved</h2><button className="link" onClick={() => setShowAll(true)}>View all</button></div>{closedLoading ? <p className="empty-state">Loading resolved requests…</p> : closedItems.length ? closedItems.map((ticket) => <div key={ticket.id}><div className="recent"><Status value="CLOSED" /><strong>{ticket.no} · {ticket.service}</strong><span>{ticket.age} since raised</span></div><ComplaintDisclosure ticketId={ticket.id} summary="Report a problem" onSuccess={refresh} /></div>) : <p className="empty-state">No resolved requests yet.</p>}</section>
+            <section>
+              <div className="section-title"><h2>Active requests</h2><span>{total} open</span></div>
+              {submitError && <div className="form-error" role="alert">{submitError}</div>}
+              {loading ? <p className="empty-state">Loading your requests…</p> : loadError ? <p className="form-error">{loadError}</p> : items.length ? (showAll ? items : items.slice(0, 3)).map((ticket) => (
+                <div key={ticket.id}>
+                  <TicketCard ticket={ticket} audience="stall" />
+                  {ticket.status === 'AWAITING_OTP' && (
+                    <div className="otp-panel otp-display-panel">
+                      <p className="otp-kicker">Staff has requested completion</p>
+                      <p>Check the work before sharing this code.</p>
+                      {(ticket.firstStartedAt || ticket.completionRequestedAt) && (
+                        <div className="otp-milestones">
+                          {ticket.firstStartedAt && <span>Work started · {shortTime(ticket.firstStartedAt) ?? '—'}</span>}
+                          {ticket.completionRequestedAt && <span>Completion requested · {shortTime(ticket.completionRequestedAt) ?? '—'}</span>}
+                        </div>
+                      )}
+                      {otpByTicket[ticket.id] && countdownLabel(otpExpiryByTicket[ticket.id], nowMs) !== '00:00' ? (
+                        <>
+                          <p className="otp-code-label">Completion code</p>
+                          <div aria-label={`Completion code ${otpByTicket[ticket.id].split('').join(' ')}`}>
+                            <OtpDigits value={otpByTicket[ticket.id]} />
+                          </div>
+                          <p className="otp-expiry">Expires in {countdownLabel(otpExpiryByTicket[ticket.id], nowMs)}</p>
+                          <p className="otp-hint">Tell this code to {ticket.assignee} only if the work is complete.</p>
+                          <button type="button" className="secondary-action" disabled={otpPending[ticket.id]} onClick={() => void regenerateOtp(ticket.id)}>
+                            Request new completion code
+                          </button>
+                        </>
+                      ) : otpExpiredByTicket[ticket.id] || (otpByTicket[ticket.id] && countdownLabel(otpExpiryByTicket[ticket.id], nowMs) === '00:00') ? (
+                        <>
+                          <p className="form-error" role="alert">Verification code expired</p>
+                          <button type="button" className="primary" disabled={otpPending[ticket.id]} onClick={() => void regenerateOtp(ticket.id)}>
+                            {otpPending[ticket.id] ? 'Generating…' : 'Generate new code'}
+                          </button>
+                        </>
+                      ) : (
+                        <button type="button" className="primary" disabled={otpPending[ticket.id]} onClick={() => void loadOtp(ticket.id)}>
+                          {otpPending[ticket.id] ? 'Loading code…' : 'Show completion code'}
+                        </button>
+                      )}
+                      <ComplaintDisclosure ticketId={ticket.id} summary="Work is not satisfactory" onSuccess={async () => { setOtpByTicket((current) => { const next = { ...current }; delete next[ticket.id]; return next; }); await refresh(); }} />
+                    </div>
+                  )}
+                </div>
+              )) : <p className="empty-state">No active requests for this stall.</p>}
+            </section>
+            <section>
+              <div className="section-title"><h2>Recently resolved</h2><button className="link" onClick={() => setShowAll(true)}>View all</button></div>
+              {closedLoading ? <p className="empty-state">Loading resolved requests…</p> : closedItems.length ? closedItems.map((ticket) => (
+                <div key={ticket.id}>
+                  <div className="recent"><Status value="CLOSED" audience="stall" /><strong>{ticket.no} · {ticket.service}</strong><span>{ticket.closedAt ? `Closed · ${shortTime(ticket.closedAt)}` : `${ticket.age} since raised`}</span></div>
+                  <ComplaintDisclosure ticketId={ticket.id} summary="Report a problem" onSuccess={refresh} />
+                </div>
+              )) : <p className="empty-state">No resolved requests yet.</p>}
+            </section>
           </>
         )}
         <nav className="bottom-nav" aria-label="Stall navigation"><button onClick={() => { setShowHelp(false); setShowAll(false); }}>Home</button><button onClick={() => { setShowHelp(false); setShowAll(true); }}>My tickets</button><button onClick={() => setShowHelp(true)}>Help</button><LogoutButton /></nav>
@@ -483,16 +668,29 @@ export function StaffWorkspace() {
   const { items, loading, error: loadError, refresh, connection } = useApiTickets('view=active');
   const { items: history } = useApiTickets('view=closed&limit=10');
   const [actionError, setActionError] = useState('');
+  const [otpValue, setOtpValue] = useState('');
+  const [otpError, setOtpError] = useState('');
+  const [otpSuccess, setOtpSuccess] = useState('');
   const [availability, setAvailability] = useState<'ON_DUTY' | 'PAUSED' | 'OFF_DUTY' | 'OFFLINE'>('OFF_DUTY');
   const [workload, setWorkload] = useState({ activeCount: 0, completedToday: 0, capacity: 0 });
   const [actionPending, setActionPending] = useState(false);
+  const [section, setSection] = useState<'task' | 'history' | 'availability'>('task');
   useAuthLoss(() => {
     setAvailability('OFF_DUTY');
     setWorkload({ activeCount: 0, completedToday: 0, capacity: 0 });
     setActionError('Session expired');
     setActionPending(false);
+    setOtpValue('');
+    setOtpError('');
+    setOtpSuccess('');
   });
   const current = items[0];
+
+  useEffect(() => {
+    setOtpValue('');
+    setOtpError('');
+    setOtpSuccess('');
+  }, [current?.id, current?.status]);
 
   const refreshWorkload = useCallback(async () => {
     const response = await apiFetch('/api/workforce/me', { credentials: 'include', cache: 'no-store' });
@@ -503,8 +701,7 @@ export function StaffWorkspace() {
   }, []);
   useEffect(() => { void refreshWorkload(); }, [refreshWorkload]);
 
-  async function toggleAvailability() {
-    const value = availability === 'ON_DUTY' ? 'PAUSED' : 'ON_DUTY';
+  async function setAvailabilityValue(value: 'ON_DUTY' | 'PAUSED' | 'OFF_DUTY') {
     setActionPending(true);
     const response = await apiFetch('/api/workforce/availability', {
       method: 'PATCH',
@@ -513,8 +710,7 @@ export function StaffWorkspace() {
       body: JSON.stringify({ value }),
     });
     if (!response.ok) {
-      const result = await response.json().catch(() => ({})) as { message?: string };
-      setActionError(result.message ?? (response.status === 400 ? 'Availability request was invalid' : 'Availability could not be updated'));
+      setActionError(await apiErrorMessage(response, 'Availability could not be updated'));
       setActionPending(false);
       return;
     }
@@ -537,8 +733,7 @@ export function StaffWorkspace() {
       body: JSON.stringify({ to: next }),
     });
     if (!response.ok) {
-      const result = await response.json() as { message?: string };
-      setActionError(result.message ?? 'Action could not be confirmed');
+      setActionError(await apiErrorMessage(response, next === 'AWAITING_OTP' ? 'Could not request completion. Try again.' : 'Action could not be confirmed'));
       setActionPending(false);
       return;
     }
@@ -553,8 +748,7 @@ export function StaffWorkspace() {
     setActionPending(true);
     const response = await apiFetch('/api/tickets/' + current.id + '/snooze', { method: 'POST', credentials: 'include' });
     if (!response.ok) {
-      const result = await response.json() as { message?: string };
-      setActionError(result.message ?? 'Snooze could not be confirmed');
+      setActionError(await apiErrorMessage(response, 'Snooze could not be confirmed'));
       setActionPending(false);
       return;
     }
@@ -563,18 +757,116 @@ export function StaffWorkspace() {
     setActionPending(false);
   }
 
-  const actionLabel = current?.status === 'ACCEPTED' ? 'Start work' : current?.status === 'IN_PROGRESS' ? 'Request completion' : 'Accept';
+  async function verifyOtp() {
+    if (!current || otpValue.length !== 6 || actionPending) return;
+    setActionPending(true);
+    setOtpError('');
+    const response = await apiFetch('/api/tickets/' + current.id + '/otp/verify', {
+      method: 'POST',
+      credentials: 'include',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ otp: otpValue }),
+    });
+    if (!response.ok) {
+      setOtpError(await apiErrorMessage(response, 'Could not verify the code. Try again.'));
+      setActionPending(false);
+      return;
+    }
+    setOtpSuccess('Ticket completed');
+    setActionError('');
+    await refresh();
+    await refreshWorkload();
+    setActionPending(false);
+  }
+
+  const actionLabel = current?.status === 'ACCEPTED'
+    ? 'Start work'
+    : current?.status === 'IN_PROGRESS'
+      ? 'Request completion'
+      : 'Accept assignment';
+  const loadingLabel = current?.status === 'ACCEPTED'
+    ? 'Starting…'
+    : current?.status === 'IN_PROGRESS'
+      ? 'Requesting completion…'
+      : 'Accepting…';
+  const atCapacity = workload.capacity > 0 && workload.activeCount >= workload.capacity;
+
   return (
     <div className="mobile-page">
       <main className="mobile-shell staff">
-        <header className="mobile-header"><div><span className="eyebrow">{profile?.scopes[0]?.event.name ?? 'Current shift'} · {connection === 'live' ? 'Live' : 'Reconnecting'}</span><h1>{profile?.name ?? 'Service workspace'}</h1></div><button className="duty" disabled={actionPending} onClick={() => void toggleAvailability()}>{availability === 'ON_DUTY' ? 'On duty' : 'Paused'}</button></header>
-        {current && ['ASSIGNED', 'SNOOZED'].includes(current.status) && <div className="alert-line">New assignment · Accept or use the single 10-minute snooze.</div>}
-        {current?.status === 'AWAITING_OTP' && <div className="alert-line">Waiting for stall OTP confirmation. You cannot close this ticket yourself.</div>}
-        {actionError && <div className="form-error" role="alert">{actionError}</div>}
-        {loading ? <p className="empty-state">Loading current task…</p> : loadError ? <p className="form-error">{loadError}</p> : current ? <TicketCard ticket={current} actions={['ASSIGNED', 'SNOOZED', 'ACCEPTED', 'IN_PROGRESS'].includes(current.status)} actionLabel={actionLabel} actionDisabled={actionPending} onAccept={() => void transition()} onSnooze={() => void snooze()} /> : <p className="empty-state">No current assignment.</p>}
-        <section><div className="section-title"><h2>Today</h2></div><div className="stats-row"><div><strong>{workload.completedToday}</strong><span>Completed</span></div><div><strong>{workload.activeCount}</strong><span>Active</span></div><div><strong>{workload.capacity}</strong><span>Capacity</span></div></div></section>
-        <section><div className="section-title"><h2>Recent history</h2></div>{history.length ? history.map((ticket) => <TicketCard key={ticket.id} ticket={ticket} />) : <p className="empty-state">No completed work yet.</p>}</section>
-        <nav className="bottom-nav" aria-label="Staff navigation"><b>Current task</b><span>History</span><button disabled={actionPending} onClick={() => void toggleAvailability()}>Availability</button><LogoutButton /></nav>
+        <header className="mobile-header">
+          <div>
+            <span className="eyebrow">{profile?.scopes[0]?.event.name ?? 'Current shift'} · {connection === 'live' ? 'Live' : 'Reconnecting'}</span>
+            <h1>{profile?.name ?? 'Service workspace'}</h1>
+          </div>
+          <span className={'duty duty-badge ' + availability.toLowerCase()} aria-label={`Availability ${availability.replaceAll('_', ' ')}`}>
+            {availability === 'ON_DUTY' ? 'On duty' : availability === 'PAUSED' ? 'Paused' : 'Off duty'}
+          </span>
+        </header>
+        {section === 'task' && (
+          <>
+            {current && ['ASSIGNED', 'SNOOZED'].includes(current.status) && (
+              <div className="alert-line">
+                <strong>New assignment</strong>
+                <span>Accept this job or snooze once for 10 minutes.</span>
+              </div>
+            )}
+            {actionError && <div className="form-error" role="alert">{actionError}</div>}
+            {loading ? <p className="empty-state">Loading current task…</p> : loadError ? <p className="form-error">{loadError}</p> : current ? (
+              <>
+                <TicketCard
+                  ticket={current}
+                  audience="staff"
+                  actions={['ASSIGNED', 'SNOOZED', 'ACCEPTED', 'IN_PROGRESS'].includes(current.status)}
+                  actionLabel={actionLabel}
+                  actionDisabled={actionPending}
+                  loadingLabel={loadingLabel}
+                  onAccept={() => void transition()}
+                  onSnooze={() => void snooze()}
+                />
+                {current.status === 'AWAITING_OTP' && (
+                  <StaffOtpEntry
+                    value={otpValue}
+                    onChange={(next) => { setOtpValue(next); setOtpError(''); }}
+                    onSubmit={() => void verifyOtp()}
+                    submitting={actionPending}
+                    error={otpError}
+                    success={otpSuccess}
+                  />
+                )}
+              </>
+            ) : <p className="empty-state">No current assignment.</p>}
+            <section>
+              <div className="section-title"><h2>Today</h2></div>
+              <div className="stats-row">
+                <div><strong>{workload.completedToday}</strong><span>Completed</span></div>
+                <div><strong>{workload.activeCount}</strong><span>Active{atCapacity ? ' · At capacity' : ''}</span></div>
+                <div><strong>{workload.capacity}</strong><span>Capacity</span></div>
+              </div>
+            </section>
+          </>
+        )}
+        {section === 'history' && (
+          <section>
+            <div className="section-title"><h2>Recent history</h2></div>
+            {history.length ? history.map((ticket) => <TicketCard key={ticket.id} ticket={ticket} audience="staff" />) : <p className="empty-state">No completed work yet.</p>}
+          </section>
+        )}
+        {section === 'availability' && (
+          <section className="availability-panel">
+            <div className="section-title"><h2>Availability</h2></div>
+            <p>Choose how new work should reach you. Active tickets stay with you until closed or reassigned.</p>
+            <button type="button" className={availability === 'ON_DUTY' ? 'primary' : 'secondary-action'} disabled={actionPending} onClick={() => void setAvailabilityValue('ON_DUTY')}>On duty · ready for new assignments</button>
+            <button type="button" className={availability === 'PAUSED' ? 'primary' : 'secondary-action'} disabled={actionPending} onClick={() => void setAvailabilityValue('PAUSED')}>Paused · finish current work, no new jobs</button>
+            <button type="button" className={availability === 'OFF_DUTY' ? 'primary' : 'secondary-action'} disabled={actionPending} onClick={() => void setAvailabilityValue('OFF_DUTY')}>Off duty · not available</button>
+          </section>
+        )}
+        <nav className="bottom-nav" aria-label="Staff navigation">
+          <button type="button" className={section === 'task' ? 'nav-active' : undefined} onClick={() => setSection('task')}>Current task</button>
+          <button type="button" className={section === 'history' ? 'nav-active' : undefined} onClick={() => setSection('history')}>History</button>
+          <button type="button" className={section === 'availability' ? 'nav-active' : undefined} onClick={() => setSection('availability')}>Availability</button>
+          <LogoutButton />
+        </nav>
       </main>
     </div>
   );
@@ -643,20 +935,20 @@ function TicketDrawer({ ticket, timing, detail, eligibleStaff, onPing, onReassig
   const [pendingAction, setPendingAction] = useState<'ping' | 'reassign' | 'reopen' | 'escalate' | 'override' | 'prioritize' | 'cancel' | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const milestones = [
-    ['Raised', timing?.createdAt ?? detail?.createdAt],
-    ['Assigned', timing?.firstAssignedAt ?? detail?.firstAssignedAt],
-    ['Accepted', timing?.firstAcceptedAt ?? detail?.firstAcceptedAt],
-    ['Work started', timing?.firstStartedAt ?? detail?.firstStartedAt],
-    ['Completion requested', timing?.completionRequestedAt ?? detail?.completionRequestedAt],
-    ['Closed', timing?.closedAt ?? detail?.closedAt],
+    ['Raised', timing?.createdAt ?? detail?.createdAt, null as string | null],
+    ['Assigned', timing?.firstAssignedAt ?? detail?.firstAssignedAt, timing?.raiseToAssignSeconds != null ? duration(timing.raiseToAssignSeconds) + ' after raise' : null],
+    ['Accepted', timing?.firstAcceptedAt ?? detail?.firstAcceptedAt, timing?.assignToAcceptSeconds != null ? duration(timing.assignToAcceptSeconds) + ' after assignment' : null],
+    ['Work started', timing?.firstStartedAt ?? detail?.firstStartedAt, timing?.mobilizationSeconds != null ? duration(timing.mobilizationSeconds) + ' after acceptance' : null],
+    ['Completion requested', timing?.completionRequestedAt ?? detail?.completionRequestedAt, timing?.activeWorkSeconds != null ? duration(timing.activeWorkSeconds) + ' work duration' : null],
+    ['Closed', timing?.closedAt ?? detail?.closedAt, timing?.otpWaitSeconds != null ? duration(timing.otpWaitSeconds) + ' verification wait' : (ticket.status === 'AWAITING_OTP' ? 'Pending verification' : null)],
   ];
   return (
     <aside className="drawer" aria-label={'Ticket ' + ticket.no + ' detail'}>
-      <div className="drawer-head"><div><span className="eyebrow">{ticket.no}</span><h2>{ticket.service}</h2></div><Status value={ticket.status} /></div>
+      <div className="drawer-head"><div><span className="eyebrow">{ticket.no}</span><h2>{ticket.service}</h2></div><Status value={ticket.status} audience="manager" /></div>
       <p className="description">{ticket.description}</p>
-      <div className="drawer-location">{ticket.location}</div>
+      <div className="drawer-location location-emphasis"><span>{ticket.locationParts.hall} · {ticket.locationParts.zone}</span><strong>Stall {ticket.locationParts.stall}</strong></div>
       <div className="timing"><h3>Service timing</h3><div className="timing-strip"><span><b>{duration(timing?.raiseToAssignSeconds)}</b>Dispatch</span><span><b>{duration(timing?.assignToAcceptSeconds)}</b>Response</span><span><b>{duration(timing?.mobilizationSeconds)}</b>Mobilize</span><span><b>{duration(timing?.activeWorkSeconds)}</b>Work</span><span><b>{duration(timing?.otpWaitSeconds)}</b>OTP wait</span><span><b>{duration(timing?.totalResolutionSeconds)}</b>Total</span></div></div>
-      <div className="timeline"><h3>Lifecycle milestones</h3>{milestones.map(([event, time], index) => <div key={event} className="timeline-item"><i className={time ? 'active' : ''}></i><div><strong>{event}</strong><span>{eventTime(time, timing?.eventTimezone)}</span></div><time>{index === 0 ? 'Server time' : ''}</time></div>)}</div>
+      <div className="timeline"><h3>Lifecycle milestones</h3>{milestones.map(([event, time, relative], index) => <div key={event} className="timeline-item"><i className={time ? 'active' : ''}></i><div><strong>{event}</strong><span>{time ? eventTime(time, timing?.eventTimezone) : (event === 'Closed' && ticket.status === 'AWAITING_OTP' ? 'Pending verification' : '—')}</span>{relative && <span>{relative}</span>}</div><time>{index === 0 ? 'Event time' : ''}</time></div>)}</div>
       {!!timing?.workCycles.length && <div className="cycles"><h3>Work cycles</h3>{timing.workCycles.map((cycle) => <div key={cycle.attempt}><strong>Attempt {cycle.attempt}</strong><span>{eventTime(cycle.assignedAt, timing.eventTimezone)} · {cycle.releasedAt ? 'Completed/released' : 'Active'}</span></div>)}</div>}
       {!!detail?.complaints.length && <div className="cycles"><h3>Complaints</h3>{detail.complaints.map((complaint) => <div key={complaint.id}><strong>{complaint.reasonCode.replaceAll('_', ' ')}</strong><span>{complaint.comment || 'No additional note'} · {eventTime(complaint.createdAt, timing?.eventTimezone)}</span></div>)}</div>}
       {!!detail?.events.length && <div className="timeline"><h3>Audit timeline</h3>{detail.events.map((event) => <div className="timeline-item" key={event.id}><i className="active"></i><div><strong>{event.eventType.replaceAll('_', ' ')}</strong><span>{event.actor?.name ?? 'System'} · {eventTime(event.createdAt, timing?.eventTimezone)}</span></div></div>)}</div>}
@@ -727,7 +1019,7 @@ export function ManagementWorkspace({ role }: { role: 'HALL_MANAGER' | 'ADMIN' }
   const [activeSection, setActiveSection] = useState(navByRole[role][0]);
   const [exceptions, setExceptions] = useState<Ticket[]>([]);
   const [auditEvents, setAuditEvents] = useState<Array<{ id: string; eventType: string; createdAt: string; actor: { name: string } | null; ticket: { publicNo: string } }>>([]);
-  const [masters, setMasters] = useState<Array<{ id: string; name: string; halls: Array<{ id: string; name: string; zones: Array<{ id: string; code: string; stalls: Array<{ id: string; stallCode: string }> }> }>; pools: Array<{ id: string; category: string; subtype: string; responseTargetSeconds: number; resolutionTargetSeconds: number; active: boolean }> }>>([]);
+  const [masters, setMasters] = useState<Array<{ id: string; name: string; timezone?: string; halls: Array<{ id: string; name: string; zones: Array<{ id: string; code: string; stalls: Array<{ id: string; stallCode: string }> }> }>; pools: Array<{ id: string; category: string; subtype: string; responseTargetSeconds: number; resolutionTargetSeconds: number; active: boolean }> }>>([]);
   const [exports, setExports] = useState<Array<{ id: string; format: string; status: string; rowCount: number | null; createdAt: string }>>([]);
   useAuthLoss(() => {
     setSelected(null);
@@ -834,8 +1126,7 @@ export function ManagementWorkspace({ role }: { role: 'HALL_MANAGER' | 'ADMIN' }
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify(body),
     });
-    const result = await response.json() as { message?: string };
-    if (!response.ok) { setManagementError(result.message ?? 'Ticket action failed'); return false; }
+    if (!response.ok) { setManagementError(await apiErrorMessage(response, 'Ticket action failed')); return false; }
     setManagementError('');
     await refresh();
     return true;
@@ -854,8 +1145,7 @@ export function ManagementWorkspace({ role }: { role: 'HALL_MANAGER' | 'ADMIN' }
       body: JSON.stringify({ staffId, reason }),
     });
     if (!response.ok) {
-      const result = await response.json() as { message?: string };
-      setManagementError(result.message ?? 'Reassignment failed');
+      setManagementError(await apiErrorMessage(response, 'Reassignment failed'));
       return false;
     }
     setManagementError('');
@@ -939,9 +1229,8 @@ export function ManagementWorkspace({ role }: { role: 'HALL_MANAGER' | 'ADMIN' }
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify(body),
     });
-    const result = await response.json().catch(() => ({})) as { message?: string };
     if (!response.ok) {
-      setPersonFormError(result.message ?? 'Person could not be created');
+      setPersonFormError(await apiErrorMessage(response, 'Person could not be created'));
       setPersonSubmitting(false);
       return;
     }
@@ -960,8 +1249,7 @@ export function ManagementWorkspace({ role }: { role: 'HALL_MANAGER' | 'ADMIN' }
       body: JSON.stringify({ status }),
     });
     if (!response.ok) {
-      const result = await response.json().catch(() => ({})) as { message?: string };
-      setManagementError(result.message ?? 'Person status could not be updated');
+      setManagementError(await apiErrorMessage(response, 'Person status could not be updated'));
       return;
     }
     const list = await apiFetch('/api/workforce', { credentials: 'include', cache: 'no-store' });
@@ -976,8 +1264,7 @@ export function ManagementWorkspace({ role }: { role: 'HALL_MANAGER' | 'ADMIN' }
       body: JSON.stringify({ capacity }),
     });
     if (!response.ok) {
-      const result = await response.json().catch(() => ({})) as { message?: string };
-      setManagementError(result.message ?? 'Capacity could not be updated');
+      setManagementError(await apiErrorMessage(response, 'Capacity could not be updated'));
       return;
     }
     const list = await apiFetch('/api/workforce', { credentials: 'include', cache: 'no-store' });
@@ -1016,7 +1303,7 @@ export function ManagementWorkspace({ role }: { role: 'HALL_MANAGER' | 'ADMIN' }
         {(activeSection === 'Staff' || activeSection === 'Workforce') && <section className="portfolio-list"><div className="section-title"><div><h2>Workforce</h2><p>Create and manage operational identities in your authorized scope. Ticket age is separate and never edited here.</p></div><button onClick={() => { setShowAddPerson((value) => !value); setPersonFormError(''); }}>{showAddPerson ? 'Close form' : 'Add person'}</button></div>{showAddPerson && <form className="authority-action" onSubmit={(event) => void createPerson(event)}><label>Name<input name="name" required minLength={2} /></label><label>Login email<input name="email" type="email" required /></label><label>Phone<input name="phone" /></label><label>Temporary password<input name="password" type="password" required minLength={8} /></label><label>Public person ID (optional)<input name="employeeCode" placeholder="STF-00012" /></label><label>Role<select name="role" required defaultValue="STAFF">{role === 'HALL_MANAGER' ? <option value="STAFF">Service Staff</option> : <><option value="STAFF">Service Staff</option><option value="HALL_MANAGER">Hall Manager</option></>}</select></label><label>Service category<select name="serviceCategory" defaultValue="HOUSE_HELP"><option value="ELECTRICAL">Electrical</option><option value="HOUSE_HELP">House Help</option></select></label><label>Service subtype<select name="serviceSubtype" defaultValue="General"><option value="General">General</option><option value="Lighting">Lighting</option><option value="NCP">NCP</option></select></label><label>Capacity<input name="capacity" type="number" min={1} max={20} defaultValue={1} /></label>{personFormError && <p className="form-error" role="alert">{personFormError}</p>}<button className="primary" type="submit" disabled={personSubmitting}>{personSubmitting ? 'Creating…' : 'Create account'}</button></form>}{workforce.map((membership) => <article key={membership.user.id + membership.pool.category + membership.pool.subtype}><div><strong>{membership.user.name}</strong><span>{membership.user.employeeCode ?? 'No public ID'}{membership.user.email ? ` · ${membership.user.email}` : ''}</span></div><div><span>Service</span><strong>{membership.pool.category} · {membership.pool.subtype}</strong></div><div><span>Availability</span><strong>{membership.availability.replaceAll('_', ' ')}</strong></div><div><span>Load</span><strong>{membership.activeCount ?? 0}/{membership.capacity ?? 1}</strong></div><div><span>Status</span><strong>{membership.user.status ?? 'ACTIVE'}</strong></div><div className="drawer-actions"><button type="button" onClick={() => { const next = Number(window.prompt('Capacity', String(membership.capacity ?? 1))); if (Number.isInteger(next) && next >= 1) void updatePersonCapacity(membership.user.id, next); }}>Edit capacity</button><button type="button" onClick={() => void updatePersonStatus(membership.user.id, membership.user.status === 'DISABLED' ? 'ACTIVE' : 'DISABLED')}>{membership.user.status === 'DISABLED' ? 'Activate' : 'Deactivate'}</button></div></article>)}</section>}
         {activeSection === 'Exceptions' && <section className="portfolio-list"><div className="section-title"><div><h2>Exception inbox</h2><p>Queued, overdue, complaint, reopened, and escalated tickets</p></div></div>{exceptions.length ? exceptions.map((ticket) => <TicketCard key={ticket.id} ticket={ticket} />) : <p className="empty-state">No unresolved exceptions.</p>}</section>}
         {activeSection === 'Audit' && <section className="portfolio-list"><div className="section-title"><div><h2>Audit history</h2><p>Append-only scoped operational events</p></div></div>{auditEvents.map((event) => <article key={event.id}><div><strong>{event.ticket.publicNo}</strong><span>{event.actor?.name ?? 'System'}</span></div><div><span>Action</span><strong>{event.eventType.replaceAll('_', ' ')}</strong></div><div><span>Server time</span><strong>{eventTime(event.createdAt)}</strong></div></article>)}</section>}
-        {(activeSection === 'Masters' || activeSection === 'Halls / Zones / Stalls') && <section className="portfolio-list"><div className="section-title"><div><h2>Event masters</h2><p>Authorized hierarchy and SLA configuration</p></div><div><button onClick={() => void createMaster('hall')}>Add hall</button><button onClick={() => void createMaster('zone')}>Add zone</button><button onClick={() => void createMaster('stall')}>Add stall</button></div></div>{masters.map((event) => <div key={event.id}><article><div><strong>{event.name}</strong><span>Timezone {event.timezone}</span></div><div><span>Halls</span><strong>{event.halls.length}</strong></div><div><span>Zones</span><strong>{event.halls.reduce((sum, hall) => sum + hall.zones.length, 0)}</strong></div><div><span>Stalls</span><strong>{event.halls.reduce((sum, hall) => sum + hall.zones.reduce((zoneSum, zone) => zoneSum + zone.stalls.length, 0), 0)}</strong></div></article>{event.halls.map((hall) => <article key={hall.id}><div><strong>{hall.name}</strong><span>Hall ID: {hall.id}</span></div><div><span>Zones</span><strong>{hall.zones.map((zone) => `${zone.code} (${zone.id})`).join(', ') || 'None'}</strong></div><div><span>Stalls</span><strong>{hall.zones.flatMap((zone) => zone.stalls.map((stall) => `${stall.stallCode} (${stall.id})`)).join(', ') || 'None'}</strong></div></article>)}{event.pools.map((pool) => <article key={pool.id}><div><strong>{pool.category} · {pool.subtype}</strong><span>{pool.active ? 'Active' : 'Inactive'}</span></div><div><span>Response SLA</span><strong>{duration(pool.responseTargetSeconds)}</strong></div><div><span>Resolution SLA</span><strong>{duration(pool.resolutionTargetSeconds)}</strong></div><button onClick={() => void updatePool(pool)}>Edit SLA</button></article>)}</div>)}</section>}
+        {(activeSection === 'Masters' || activeSection === 'Halls / Zones / Stalls') && <section className="portfolio-list"><div className="section-title"><div><h2>Event masters</h2><p>Authorized hierarchy and SLA configuration</p></div><div><button onClick={() => void createMaster('hall')}>Add hall</button><button onClick={() => void createMaster('zone')}>Add zone</button><button onClick={() => void createMaster('stall')}>Add stall</button></div></div>{masters.map((event) => <div key={event.id}><article><div><strong>{event.name}</strong><span>{event.timezone ? `Timezone ${event.timezone}` : 'Event masters'}</span></div><div><span>Halls</span><strong>{event.halls.length}</strong></div><div><span>Zones</span><strong>{event.halls.reduce((sum, hall) => sum + hall.zones.length, 0)}</strong></div><div><span>Stalls</span><strong>{event.halls.reduce((sum, hall) => sum + hall.zones.reduce((zoneSum, zone) => zoneSum + zone.stalls.length, 0), 0)}</strong></div></article>{event.halls.map((hall) => <article key={hall.id}><div><strong>{hall.name}</strong><span>Hall ID: {hall.id}</span></div><div><span>Zones</span><strong>{hall.zones.map((zone) => `${zone.code} (${zone.id})`).join(', ') || 'None'}</strong></div><div><span>Stalls</span><strong>{hall.zones.flatMap((zone) => zone.stalls.map((stall) => `${stall.stallCode} (${stall.id})`)).join(', ') || 'None'}</strong></div></article>)}{event.pools.map((pool) => <article key={pool.id}><div><strong>{pool.category} · {pool.subtype}</strong><span>{pool.active ? 'Active' : 'Inactive'}</span></div><div><span>Response SLA</span><strong>{duration(pool.responseTargetSeconds)}</strong></div><div><span>Resolution SLA</span><strong>{duration(pool.resolutionTargetSeconds)}</strong></div><button onClick={() => void updatePool(pool)}>Edit SLA</button></article>)}</div>)}</section>}
         {(activeSection === 'Reports') && <section className="portfolio-list"><div className="section-title"><div><h2>Export jobs</h2><p>Filter snapshots are re-authorized at generation and download</p></div></div>{exports.length ? exports.map((job) => <article key={job.id}><div><strong>{job.format}</strong><span>{eventTime(job.createdAt)}</span></div><div><span>Status</span><strong>{job.status}</strong></div><div><span>Rows</span><strong>{job.rowCount ?? 'Pending'}</strong></div>{job.status === 'READY' && <a href={'/api/management/exports/' + job.id + '/download'}>Download</a>}</article>) : <p className="empty-state">No export jobs yet.</p>}</section>}
         <section className="workspace">
           <div className="operations">

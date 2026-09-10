@@ -95,8 +95,13 @@ QA and operational stakeholders.
 
 **\[Ticket \#E-1024\] \[Lighting\] \[IN PROGRESS\]  
 Hall 1 \> Zone A \> A102 \| Assigned: Rahul \| Age: 08m  
-Timeline: Raised -\> Assigned -\> Accepted -\> Work started  
-\[Confirm completion / Enter OTP\] \[Not resolved\]**
+Timeline: Raised -\> Assigned -\> Accepted -\> Work started**
+
+**Completion panel (AWAITING_OTP, Stall):** large completion code +
+expiry; \[Work is not satisfactory\]. Stall never enters the OTP.
+
+**Completion panel (AWAITING_OTP, Staff):** segmented 6-digit OTP entry
++ Verify & close ticket.
 
 # 5. Staff interface - simplified mobile UI
 

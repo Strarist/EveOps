@@ -39,6 +39,29 @@ export async function apiFetch(input: RequestInfo | URL, init?: RequestInit) {
   return response;
 }
 
+/** Map Nest/API failures to safe operational copy for field UIs. */
+export async function apiErrorMessage(response: Response, fallback: string) {
+  const payload = await response.json().catch(() => ({})) as { message?: string | string[]; correlationId?: string; requestId?: string };
+  const raw = Array.isArray(payload.message) ? payload.message[0] : payload.message;
+  const reference = payload.correlationId ?? payload.requestId;
+  if (response.status >= 500) {
+    return reference ? `Something went wrong. Try again. Reference: ${reference}` : 'Something went wrong. Try again.';
+  }
+  if (!raw) return fallback;
+  const normalized = raw.toLowerCase();
+  if (normalized.includes('invalid otp')) return 'Incorrect code. Check with the stall and try again.';
+  if (normalized.includes('otp expired') || normalized.includes('unavailable or expired')) {
+    return 'This code has expired. Ask the stall to generate a new code.';
+  }
+  if (normalized.includes('already') && normalized.includes('closed')) return 'This ticket has already been completed.';
+  if (normalized.includes('not assigned') || normalized.includes('access')) return 'You no longer have access to this ticket.';
+  if (normalized.includes('prisma') || normalized.includes('database') || normalized.includes('econn') || normalized.includes('stack')) {
+    return fallback;
+  }
+  if (raw.length > 180) return fallback;
+  return raw;
+}
+
 export function subscribeRealtime(subscriber: RealtimeSubscriber) {
   realtimeSubscribers.add(subscriber);
   if (!eventSource && !authLost) {
