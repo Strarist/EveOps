@@ -10,6 +10,10 @@ const realtimeSubscribers = new Set<RealtimeSubscriber>();
 let eventSource: EventSource | null = null;
 let lastAuthProbeAt = 0;
 
+function notifyRealtimeSubscribers(event: MessageEvent<string>) {
+  realtimeSubscribers.forEach((item) => item.onTicket(event));
+}
+
 export async function apiFetch(input: RequestInfo | URL, init?: RequestInit) {
   if (authLost) throw new Error('Authentication expired');
   const method = (init?.method ?? 'GET').toUpperCase();
@@ -45,7 +49,7 @@ export async function apiErrorMessage(response: Response, fallback: string) {
   const raw = Array.isArray(payload.message) ? payload.message[0] : payload.message;
   const reference = payload.correlationId ?? payload.requestId;
   if (response.status >= 500) {
-    return reference ? `Something went wrong. Try again. Reference: ${reference}` : 'Something went wrong. Try again.';
+    return reference ? `Something went wrong. Please try again. Reference: ${reference}` : 'Something went wrong. Please try again.';
   }
   if (!raw) return fallback;
   const normalized = raw.toLowerCase();
@@ -75,7 +79,10 @@ export function subscribeRealtime(subscriber: RealtimeSubscriber) {
       }
     };
     eventSource.addEventListener('ticket.updated', (event) => {
-      realtimeSubscribers.forEach((item) => item.onTicket(event as MessageEvent<string>));
+      notifyRealtimeSubscribers(event as MessageEvent<string>);
+    });
+    eventSource.addEventListener('workforce.updated', (event) => {
+      notifyRealtimeSubscribers(event as MessageEvent<string>);
     });
   }
   const closeOnAuthLoss = () => {

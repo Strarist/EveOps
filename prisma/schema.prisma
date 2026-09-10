@@ -20,6 +20,12 @@ enum UserStatus {
   DISABLED
 }
 
+enum ApprovalStatus {
+  PENDING_APPROVAL
+  APPROVED
+  REJECTED
+}
+
 enum EventStatus {
   DRAFT
   ACTIVE
@@ -153,8 +159,22 @@ model User {
   email                String                @unique
   phone                String?
   passwordHash         String
+  mustChangePassword   Boolean               @default(false)
   role                 Role
   status               UserStatus            @default(ACTIVE)
+  approvalStatus       ApprovalStatus        @default(APPROVED)
+  requestedById        String?
+  requestedBy          User?                 @relation("StaffRequestedBy", fields: [requestedById], references: [id])
+  approvedById         String?
+  approvedBy           User?                 @relation("StaffApprovedBy", fields: [approvedById], references: [id])
+  approvedAt           DateTime?
+  rejectedById         String?
+  rejectedBy           User?                 @relation("StaffRejectedBy", fields: [rejectedById], references: [id])
+  rejectedAt           DateTime?
+  rejectionReason      String?
+  requestedStaff       User[]                @relation("StaffRequestedBy")
+  approvedStaff        User[]                @relation("StaffApprovedBy")
+  rejectedStaff        User[]                @relation("StaffRejectedBy")
   scopes               UserScope[]
   assignments          Assignment[]
   ticketEvents         TicketEvent[]
@@ -168,6 +188,8 @@ model User {
   managementAuditsAsActor  ManagementAudit[] @relation("ManagementAuditActor")
   managementAuditsAsTarget ManagementAudit[] @relation("ManagementAuditTarget")
   createdAt            DateTime              @default(now())
+
+  @@index([approvalStatus, status])
 }
 
 model UserScope {

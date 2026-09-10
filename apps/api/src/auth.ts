@@ -1,10 +1,10 @@
-import { CanActivate, Controller, ExecutionContext, Get, Injectable, Post, Body, UnauthorizedException, UseGuards, Res, Req, createParamDecorator } from '@nestjs/common';
+import { CanActivate, Controller, ExecutionContext, ForbiddenException, Get, Injectable, Post, Body, UnauthorizedException, BadRequestException, UseGuards, Res, Req, createParamDecorator } from '@nestjs/common';
 import type { Request, Response } from 'express';
 import { createHash, randomBytes } from 'node:crypto';
-import { compare } from 'bcryptjs';
+import { compare, hash } from 'bcryptjs';
 import { Throttle } from '@nestjs/throttler';
 import { Transform } from 'class-transformer';
-import { IsEmail, IsIn, IsOptional, IsString, MinLength } from 'class-validator';
+import { IsEmail, IsIn, IsOptional, IsString, Matches, MinLength } from 'class-validator';
 import type { AuthScope } from '@eveops/contracts';
 import { PrismaService } from './prisma.service';
 import { assertPortalRole } from './domain';
@@ -24,6 +24,26 @@ export class LoginDto {
   @IsIn(['OPERATIONS', 'GOVERNANCE'])
   portal: 'OPERATIONS' | 'GOVERNANCE' = 'OPERATIONS';
 }
+
+export class ChangePasswordDto {
+  @IsString()
+  @MinLength(8)
+  currentPassword!: string;
+
+  @IsString()
+  @MinLength(10)
+  @Matches(/^(?=.*[A-Za-z])(?=.*\d).+$/, {
+    message: 'New password must include at least one letter and one number',
+  })
+  newPassword!: string;
+}
+
+const PASSWORD_CHANGE_ALLOWED_PATHS = new Set([
+  '/api/auth/me',
+  '/api/auth/profile',
+  '/api/auth/change-password',
+  '/api/auth/logout',
+]);
 
 type ScopeShapeUser = {
   organizationId: string;
@@ -80,6 +100,13 @@ export class SessionGuard implements CanActivate {
     });
     if (!session || session.expiresAt <= new Date() || session.user.status !== 'ACTIVE') throw new UnauthorizedException('Session expired');
     assertValidScopeShape(session.user);
+    if (session.user.mustChangePassword) {
+      const rawPath = String(request.originalUrl ?? request.url ?? '').split('?')[0];
+      const path = rawPath.startsWith('/api/') ? rawPath : `/api${rawPath.startsWith('/') ? rawPath : `/${rawPath}`}`;
+      if (!PASSWORD_CHANGE_ALLOWED_PATHS.has(path)) {
+        throw new ForbiddenException('Password change is required before continuing.');
+      }
+    }
     const scopes = session.user.scopes;
     request.sessionId = session.id;
     request.scope = {
@@ -89,7 +116,8 @@ export class SessionGuard implements CanActivate {
       hallIds: scopes.flatMap((item) => item.hallId ? [item.hallId] : []),
       stallId: scopes.find((item) => item.stallId)?.stallId ?? undefined,
       serviceTypes: scopes.flatMap((item) => item.serviceType ? [item.serviceType] : []),
-    } satisfies AuthScope;
+      mustChangePassword: session.user.mustChangePassword,
+    };
     return true;
   }
 }
@@ -105,7 +133,14 @@ export class AuthController {
     @Res({ passthrough: true }) response: Response,
   ) {
     const user = await this.prisma.user.findUnique({ where: { email: body.email } });
-    if (!user || user.status !== 'ACTIVE' || !(await compare(body.password, user.passwordHash))) throw new UnauthorizedException('Invalid credentials');
+    if (!user || !(await compare(body.password, user.passwordHash))) throw new UnauthorizedException('Invalid credentials');
+    if (user.approvalStatus === 'PENDING_APPROVAL') {
+      throw new ForbiddenException('Your staff account is awaiting Admin approval.');
+    }
+    if (user.approvalStatus === 'REJECTED') {
+      throw new ForbiddenException('Your staff account request was rejected.');
+    }
+    if (user.status !== 'ACTIVE') throw new UnauthorizedException('Invalid credentials');
     const portal = body.portal;
     assertPortalRole(user.role, portal);
     await this.prisma.session.deleteMany({ where: { expiresAt: { lte: new Date() } } });
@@ -125,12 +160,18 @@ export class AuthController {
       expires: expiresAt,
       path: '/',
     });
-    return { expiresAt, user: { id: user.id, name: user.name, role: user.role } };
+    return {
+      expiresAt,
+      mustChangePassword: user.mustChangePassword,
+      user: { id: user.id, name: user.name, role: user.role, mustChangePassword: user.mustChangePassword },
+    };
   }
 
   @Get('me')
   @UseGuards(SessionGuard)
-  me(@CurrentScope() scope: AuthScope) { return scope; }
+  me(@CurrentScope() scope: AuthScope & { mustChangePassword?: boolean }) {
+    return scope;
+  }
 
   @Get('profile')
   @UseGuards(SessionGuard)
@@ -141,6 +182,7 @@ export class AuthController {
         id: true,
         name: true,
         role: true,
+        mustChangePassword: true,
         scopes: {
           select: {
             event: { select: { id: true, name: true, timezone: true } },
@@ -157,6 +199,37 @@ export class AuthController {
         },
       },
     });
+  }
+
+  @Post('change-password')
+  @UseGuards(SessionGuard)
+  @Throttle({ default: { limit: 5, ttl: 60000 } })
+  async changePassword(
+    @CurrentScope() scope: AuthScope,
+    @Body() body: ChangePasswordDto,
+    @Req() request: Request & { sessionId?: string },
+  ) {
+    if (body.newPassword === body.currentPassword) {
+      throw new BadRequestException('New password must be different from the current password');
+    }
+    const user = await this.prisma.user.findUniqueOrThrow({ where: { id: scope.userId } });
+    if (!(await compare(body.currentPassword, user.passwordHash))) {
+      throw new UnauthorizedException('Current password is incorrect');
+    }
+    const passwordHash = await hash(body.newPassword, 12);
+    await this.prisma.$transaction(async (tx) => {
+      await tx.user.update({
+        where: { id: user.id },
+        data: { passwordHash, mustChangePassword: false },
+      });
+      await tx.session.deleteMany({
+        where: {
+          userId: user.id,
+          ...(request.sessionId ? { id: { not: request.sessionId } } : {}),
+        },
+      });
+    });
+    return { changed: true, mustChangePassword: false };
   }
 
   @Post('logout')

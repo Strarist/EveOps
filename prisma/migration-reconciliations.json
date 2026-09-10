@@ -23,5 +23,10 @@
     "applied": "0e4e7011d63912cc9897a716f28da579e67716d7c22b4c7a3566a75785a65b8a",
     "current": "e2484a0b88b5896876987ee32a84f8d0b2ad8777f553833123596a48f3b6e091",
     "repairedBy": "20260910133000_workforce_employee_code"
+  },
+  "20260910160000_staff_approval_status": {
+    "applied": "87e5b53915a2eee0c6716816d316af84eec235c5652b3ba93e9c0efef3598072",
+    "current": "107f09951d03f403fe47493ab011dc712c3525d018da448c7fa84d00fd762abe",
+    "repairedBy": "20260910180000_must_change_password"
   }
 }

@@ -29,9 +29,12 @@ jobs:
       - run: npm run db:generate
       - run: npx prisma migrate deploy
       - run: npm run migration:preflight
+      - run: npm run build:packages
+      - run: npm run verify:operations-fresh
       - run: npm run typecheck
       - run: npm run lint
       - run: npm test
       - run: npx playwright install --with-deps chromium
       - run: npm run test:e2e
       - run: npm run build
+      - run: npm run verify:operations-fresh

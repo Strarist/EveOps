@@ -23,6 +23,8 @@ export interface AuthScope {
   hallIds: string[];
   stallId?: string;
   serviceTypes: string[];
+  /** Present when session hydration includes credential state. */
+  mustChangePassword?: boolean;
 }
 
 export interface TicketSummary {

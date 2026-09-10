@@ -29,7 +29,7 @@ export async function routeTicket(database: DatabaseClient, ticketId: string, ac
       where: {
         poolId: requestedTicket.poolId!,
         availability: 'ON_DUTY',
-        user: { role: eligibleRole, status: 'ACTIVE' },
+        user: { role: eligibleRole, status: 'ACTIVE', approvalStatus: 'APPROVED' },
       },
       orderBy: [{ lastAvailableAt: 'asc' }, { userId: 'asc' }],
     });

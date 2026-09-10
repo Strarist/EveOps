@@ -38,7 +38,10 @@ export async function proxy(request: NextRequest) {
       cache: 'no-store',
     });
     if (!response.ok) throw new Error('Session rejected');
-    const scope = (await response.json()) as { role: Role };
+    const scope = (await response.json()) as { role: Role; mustChangePassword?: boolean };
+    if (scope.mustChangePassword && !request.nextUrl.pathname.startsWith('/change-password')) {
+      return NextResponse.redirect(new URL('/change-password', request.url));
+    }
     if (scope.role !== expectedRole) {
       return NextResponse.redirect(new URL(homeByRole[scope.role] ?? '/login', request.url));
     }

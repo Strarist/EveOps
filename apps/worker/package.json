@@ -3,8 +3,11 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
+    "prebuild": "npm run build -w @eveops/operations",
     "build": "tsc -p tsconfig.json",
+    "prestart": "npm run build -w @eveops/operations",
     "start": "node dist/main.js",
+    "prestart:dev": "npm run build -w @eveops/operations",
     "start:dev": "tsx watch src/main.ts"
   },
   "dependencies": {

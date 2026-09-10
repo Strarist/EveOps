@@ -2,6 +2,21 @@ import { BadRequestException, Body, Controller, Get, Injectable, NotFoundExcepti
 import type { AuthScope } from '@eveops/contracts';
 import type { Response } from 'express';
 import { Prisma } from '@prisma/client';
+import { Type } from 'class-transformer';
+import {
+  ArrayMinSize,
+  IsArray,
+  IsBoolean,
+  IsDateString,
+  IsEmail,
+  IsIn,
+  IsInt,
+  IsObject,
+  IsOptional,
+  IsString,
+  Min,
+  MinLength,
+} from 'class-validator';
 import { hash } from 'bcryptjs';
 import { createReadStream, existsSync } from 'node:fs';
 import { basename, resolve } from 'node:path';
@@ -9,13 +24,70 @@ import { CurrentScope, SessionGuard } from './auth';
 import { requireAuthority } from './domain';
 import { PrismaService } from './prisma.service';
 
+export class MetricsQueryDto {
+  @IsOptional() @IsDateString() from?: string;
+  @IsOptional() @IsDateString() to?: string;
+  @IsOptional() @IsIn(['today', 'event', 'custom']) range?: 'today' | 'event' | 'custom';
+}
+
+export class UpdatePoolDto {
+  @Type(() => Number) @IsInt() @Min(1) responseTargetSeconds!: number;
+  @Type(() => Number) @IsInt() @Min(1) resolutionTargetSeconds!: number;
+  @IsOptional() @IsBoolean() active?: boolean;
+}
+
+export class CreateMasterBodyDto {
+  @IsString() @MinLength(1) eventId!: string;
+  @IsOptional() @IsString() @MinLength(1) code?: string;
+  @IsOptional() @IsString() @MinLength(1) name?: string;
+  @IsOptional() @IsString() hallId?: string;
+  @IsOptional() @IsString() zoneId?: string;
+  @IsOptional() @IsString() @MinLength(1) stallCode?: string;
+  @IsOptional() @IsString() @MinLength(1) exhibitorName?: string;
+  @IsOptional() @IsString() contact?: string;
+  @IsOptional() @IsBoolean() active?: boolean;
+  @IsOptional() @IsIn(['ACTIVE', 'INACTIVE']) status?: 'ACTIVE' | 'INACTIVE';
+}
+
+export class CreateAdminDto {
+  @IsString() @MinLength(2) name!: string;
+  @IsEmail() email!: string;
+  @IsString() @MinLength(12) password!: string;
+  @IsArray() @ArrayMinSize(1) @IsString({ each: true }) eventIds!: string[];
+}
+
+export class CreateExportDto {
+  @IsIn(['CSV', 'XLSX', 'csv', 'xlsx']) format!: string;
+  @IsOptional() @IsObject() filters?: Record<string, unknown>;
+  @IsOptional() columns?: unknown;
+}
+
+export class AuditQueryDto {
+  @IsOptional() @IsString() action?: string;
+  @IsOptional() @IsString() ticket?: string;
+}
+
 @Injectable()
 export class ManagementService {
   constructor(private readonly prisma: PrismaService) {}
 
-  async metrics(scope: AuthScope) {
+  async metrics(scope: AuthScope, query: MetricsQueryDto = {}) {
     requireAuthority(scope.role, 'HALL_MANAGER');
-    const where = { eventId: { in: scope.eventIds }, ...(scope.role === 'HALL_MANAGER' ? { hallId: { in: scope.hallIds } } : {}) };
+    const where: Prisma.TicketWhereInput = {
+      eventId: { in: scope.eventIds },
+      ...(scope.role === 'HALL_MANAGER' ? { hallId: { in: scope.hallIds } } : {}),
+    };
+    if (query.from || query.to || query.range === 'today') {
+      const createdAt: Prisma.DateTimeFilter = {};
+      if (query.range === 'today') {
+        const start = new Date();
+        start.setHours(0, 0, 0, 0);
+        createdAt.gte = start;
+      }
+      if (query.from) createdAt.gte = new Date(query.from);
+      if (query.to) createdAt.lte = new Date(query.to);
+      where.createdAt = createdAt;
+    }
     const [openTickets, queued, overdue, escalated, complaints, closedCandidates, statusGroups] = await Promise.all([
       this.prisma.ticket.findMany({
         where: { ...where, status: { notIn: ['CLOSED', 'CANCELLED'] } },
@@ -232,7 +304,7 @@ export class ManagementService {
 
   async audit(scope: AuthScope, query: { action?: string; ticket?: string }) {
     requireAuthority(scope.role, 'HALL_MANAGER');
-    return this.prisma.ticketEvent.findMany({
+    const ticketEvents = await this.prisma.ticketEvent.findMany({
       where: {
         eventId: { in: scope.eventIds },
         AND: [
@@ -245,6 +317,42 @@ export class ManagementService {
       orderBy: { createdAt: 'desc' },
       take: 200,
     });
+    if (!['ADMIN', 'SUPER_ADMIN'].includes(scope.role)) return ticketEvents;
+    const managementAudits = await this.prisma.managementAudit.findMany({
+      where: {
+        OR: [
+          { eventId: { in: scope.eventIds } },
+          { eventId: null, organizationId: (await this.prisma.user.findUniqueOrThrow({ where: { id: scope.userId }, select: { organizationId: true } })).organizationId },
+        ],
+        ...(query.action ? { action: { contains: query.action, mode: 'insensitive' as const } } : {}),
+      },
+      include: {
+        actor: { select: { name: true, role: true } },
+        targetUser: { select: { name: true, employeeCode: true } },
+      },
+      orderBy: { createdAt: 'desc' },
+      take: 100,
+    });
+    return [
+      ...ticketEvents.map((event) => ({
+        id: event.id,
+        kind: 'ticket' as const,
+        eventType: event.eventType,
+        createdAt: event.createdAt,
+        actor: event.actor,
+        ticket: event.ticket,
+        target: null as null,
+      })),
+      ...managementAudits.map((event) => ({
+        id: event.id,
+        kind: 'workforce' as const,
+        eventType: event.action,
+        createdAt: event.createdAt,
+        actor: event.actor,
+        ticket: { publicNo: event.targetUser?.employeeCode ?? 'Workforce' },
+        target: event.targetUser,
+      })),
+    ].sort((left, right) => right.createdAt.getTime() - left.createdAt.getTime()).slice(0, 200);
   }
 
   async masters(scope: AuthScope) {
@@ -260,11 +368,8 @@ export class ManagementService {
     return events;
   }
 
-  async updatePool(scope: AuthScope, id: string, body: { responseTargetSeconds: number; resolutionTargetSeconds: number; active?: boolean }) {
+  async updatePool(scope: AuthScope, id: string, body: UpdatePoolDto) {
     requireAuthority(scope.role, 'ADMIN');
-    if (!Number.isInteger(body.responseTargetSeconds) || body.responseTargetSeconds <= 0 || !Number.isInteger(body.resolutionTargetSeconds) || body.resolutionTargetSeconds <= 0) {
-      throw new BadRequestException('SLA targets must be positive whole seconds');
-    }
     const pool = await this.prisma.servicePool.findUniqueOrThrow({ where: { id } });
     if (!scope.eventIds.includes(pool.eventId)) throw new NotFoundException('Service pool is unavailable');
     return this.prisma.$transaction(async (tx) => {
@@ -285,32 +390,48 @@ export class ManagementService {
     });
   }
 
-  async createMaster(scope: AuthScope, type: 'hall' | 'zone' | 'stall', body: Record<string, unknown>) {
+  async createMaster(scope: AuthScope, type: 'hall' | 'zone' | 'stall', body: CreateMasterBodyDto) {
     requireAuthority(scope.role, 'ADMIN');
-    const eventId = String(body.eventId ?? '');
+    const eventId = body.eventId;
     if (!scope.eventIds.includes(eventId)) throw new NotFoundException('Event is unavailable');
     return this.prisma.$transaction(async (tx) => {
       const event = await tx.event.findUnique({ where: { id: eventId }, select: { status: true } });
       if (!event || ['CLOSED', 'ARCHIVED'].includes(event.status)) throw new BadRequestException('Master data cannot be added to a completed event');
       let created: object & { id: string };
       if (type === 'hall') {
-        const code = String(body.code ?? '').trim();
-        const name = String(body.name ?? '').trim();
+        const code = (body.code ?? '').trim();
+        const name = (body.name ?? '').trim();
         if (!code || !name) throw new BadRequestException('Hall code and name are required');
-        created = await tx.hall.create({ data: { eventId, code, name } });
+        created = await tx.hall.create({
+          data: {
+            eventId,
+            code,
+            name,
+            active: body.status !== 'INACTIVE',
+          },
+        });
       } else if (type === 'zone') {
-        const hallId = String(body.hallId ?? '');
-        const code = String(body.code ?? '').trim();
+        const hallId = body.hallId ?? '';
+        const code = (body.code ?? '').trim();
         const hall = await tx.hall.findFirst({ where: { id: hallId, eventId, active: true } });
         if (!hall || !code) throw new BadRequestException('Valid hall and zone code are required');
         created = await tx.zone.create({ data: { eventId, hallId, code } });
       } else {
-        const zoneId = String(body.zoneId ?? '');
-        const stallCode = String(body.stallCode ?? '').trim();
-        const exhibitorName = String(body.exhibitorName ?? '').trim();
+        const zoneId = body.zoneId ?? '';
+        const stallCode = (body.stallCode ?? '').trim();
+        const exhibitorName = (body.exhibitorName ?? '').trim();
         const zone = await tx.zone.findFirst({ where: { id: zoneId, eventId, active: true, hall: { active: true } } });
         if (!zone || !stallCode || !exhibitorName) throw new BadRequestException('Valid zone, stall code, and exhibitor name are required');
-        created = await tx.stall.create({ data: { eventId, zoneId, stallCode, exhibitorName, contact: typeof body.contact === 'string' ? body.contact : null } });
+        created = await tx.stall.create({
+          data: {
+            eventId,
+            zoneId,
+            stallCode,
+            exhibitorName,
+            contact: body.contact?.trim() || null,
+            active: body.active !== false,
+          },
+        });
       }
       await tx.outboxEvent.create({
         data: {
@@ -334,12 +455,9 @@ export class ManagementService {
     });
   }
 
-  async createAdmin(scope: AuthScope, body: { name: string; email: string; password: string; eventIds: string[] }) {
+  async createAdmin(scope: AuthScope, body: CreateAdminDto) {
     requireAuthority(scope.role, 'SUPER_ADMIN');
-    const eventIds = Array.isArray(body.eventIds) ? [...new Set(body.eventIds)] : [];
-    if (!body.name?.trim() || !body.email?.trim() || body.password?.length < 12 || !eventIds.length) {
-      throw new BadRequestException('Name, email, 12-character password, and at least one event are required');
-    }
+    const eventIds = [...new Set(body.eventIds)];
     if (eventIds.some((eventId) => !scope.eventIds.includes(eventId))) throw new NotFoundException('Admin event scope is unavailable');
     const actor = await this.prisma.user.findUniqueOrThrow({ where: { id: scope.userId }, select: { organizationId: true } });
     const validEventCount = await this.prisma.event.count({ where: { id: { in: eventIds }, organizationId: actor.organizationId } });
@@ -351,10 +469,11 @@ export class ManagementService {
           name: body.name.trim(),
           email: body.email.trim().toLowerCase(),
           passwordHash: await hash(body.password, 12),
+          mustChangePassword: true,
           role: 'ADMIN',
           scopes: { create: eventIds.map((eventId) => ({ eventId })) },
         },
-        select: { id: true, name: true, email: true, status: true },
+        select: { id: true, name: true, email: true, status: true, mustChangePassword: true },
       });
       await tx.outboxEvent.createMany({
         data: eventIds.map((eventId) => ({
@@ -446,21 +565,21 @@ export class ManagementService {
 @Controller('management')
 export class ManagementController {
   constructor(private readonly service: ManagementService) {}
-  @Get('metrics') metrics(@CurrentScope() scope: AuthScope) { return this.service.metrics(scope); }
+  @Get('metrics') metrics(@CurrentScope() scope: AuthScope, @Query() query: MetricsQueryDto) { return this.service.metrics(scope, query); }
   @Get('timing') timing(@CurrentScope() scope: AuthScope) { return this.service.timing(scope); }
   @Get('portfolio') portfolio(@CurrentScope() scope: AuthScope) { return this.service.portfolio(scope); }
   @Get('exceptions') exceptions(@CurrentScope() scope: AuthScope) { return this.service.exceptions(scope); }
-  @Get('audit') audit(@CurrentScope() scope: AuthScope, @Query() query: { action?: string; ticket?: string }) { return this.service.audit(scope, query); }
+  @Get('audit') audit(@CurrentScope() scope: AuthScope, @Query() query: AuditQueryDto) { return this.service.audit(scope, query); }
   @Get('masters') masters(@CurrentScope() scope: AuthScope) { return this.service.masters(scope); }
-  @Patch('masters/pools/:id') updatePool(@Param('id') id: string, @CurrentScope() scope: AuthScope, @Body() body: { responseTargetSeconds: number; resolutionTargetSeconds: number; active?: boolean }) { return this.service.updatePool(scope, id, body); }
-  @Post('masters/:type') createMaster(@Param('type') type: 'hall' | 'zone' | 'stall', @CurrentScope() scope: AuthScope, @Body() body: Record<string, unknown>) {
+  @Patch('masters/pools/:id') updatePool(@Param('id') id: string, @CurrentScope() scope: AuthScope, @Body() body: UpdatePoolDto) { return this.service.updatePool(scope, id, body); }
+  @Post('masters/:type') createMaster(@Param('type') type: 'hall' | 'zone' | 'stall', @CurrentScope() scope: AuthScope, @Body() body: CreateMasterBodyDto) {
     if (!['hall', 'zone', 'stall'].includes(type)) throw new BadRequestException('Unsupported master type');
     return this.service.createMaster(scope, type, body);
   }
   @Get('admins') admins(@CurrentScope() scope: AuthScope) { return this.service.admins(scope); }
-  @Post('admins') createAdmin(@CurrentScope() scope: AuthScope, @Body() body: { name: string; email: string; password: string; eventIds: string[] }) { return this.service.createAdmin(scope, body); }
+  @Post('admins') createAdmin(@CurrentScope() scope: AuthScope, @Body() body: CreateAdminDto) { return this.service.createAdmin(scope, body); }
   @Get('exports') exports(@CurrentScope() scope: AuthScope) { return this.service.exports(scope); }
-  @Post('exports') export(@CurrentScope() scope: AuthScope, @Body() body: { format: string; filters: unknown; columns: unknown }) { return this.service.createExport(scope, body.format, body.filters, body.columns); }
+  @Post('exports') export(@CurrentScope() scope: AuthScope, @Body() body: CreateExportDto) { return this.service.createExport(scope, body.format, body.filters, body.columns); }
   @Get('exports/:id/download')
   async download(
     @Param('id') id: string,

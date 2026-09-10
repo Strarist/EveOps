@@ -24,8 +24,13 @@ export class SystemController {
       ]);
       const heartbeat = heartbeats[0];
       const workerAgeSeconds = heartbeat ? Math.floor((Date.now() - heartbeat.lastSeenAt.getTime()) / 1000) : null;
-      return {
-        status: workerAgeSeconds != null && workerAgeSeconds <= 30 && deadLetteredOutbox === 0 && failedExports === 0 ? 'ready' : 'degraded',
+      const ready =
+        workerAgeSeconds != null
+        && workerAgeSeconds <= 30
+        && deadLetteredOutbox === 0
+        && failedExports === 0;
+      const body = {
+        status: ready ? 'ready' : 'degraded',
         build: process.env.BUILD_SHA ?? 'development',
         processId: process.pid,
         database: 'connected',
@@ -35,7 +40,10 @@ export class SystemController {
         deadLetteredOutbox,
         failedExports,
       };
-    } catch {
+      if (!ready) throw new ServiceUnavailableException(body);
+      return body;
+    } catch (error) {
+      if (error instanceof ServiceUnavailableException) throw error;
       throw new ServiceUnavailableException('Database is unavailable');
     }
   }

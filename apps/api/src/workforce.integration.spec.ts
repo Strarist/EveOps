@@ -166,7 +166,7 @@ describe('workforce identity management', () => {
     await prisma.$disconnect();
   });
 
-  it('allows Hall Manager to create House Help staff in own hall', async () => {
+  it('allows Hall Manager to create House Help staff in own hall as pending approval', async () => {
     const created = await workforce.createPerson(managerScope, {
       name: 'House Helper',
       email: `${key}-house@example.test`,
@@ -176,17 +176,18 @@ describe('workforce identity management', () => {
       hallId: ids.hall,
       serviceCategory: 'HOUSE_HELP',
       serviceSubtype: 'General',
-      employeeCode: 'STF-HOUSE-T1',
+      employeeCode: 'HELP-HOUSE-T1',
     } as CreatePersonDto);
     createdUserIds.push(created.id);
     expect(created.role).toBe('STAFF');
-    expect(created.employeeCode).toBe('STF-HOUSE-T1');
+    expect(created.employeeCode).toBe('HELP-HOUSE-T1');
+    expect(created.approvalStatus).toBe('PENDING_APPROVAL');
     const membership = await prisma.workforceMembership.findFirst({
       where: { userId: created.id, poolId: ids.housePool },
     });
     expect(membership).toBeTruthy();
     const audit = await prisma.managementAudit.findFirst({
-      where: { targetUserId: created.id, action: 'USER_CREATED' },
+      where: { targetUserId: created.id, action: 'STAFF_APPROVAL_REQUESTED' },
     });
     expect(audit).toBeTruthy();
   });
@@ -218,7 +219,20 @@ describe('workforce identity management', () => {
     ).rejects.toBeInstanceOf(ForbiddenException);
   });
 
-  it('allows Admin to create staff', async () => {
+  it('forbids Hall Manager from creating HALL_MANAGER', async () => {
+    await expect(
+      workforce.createPerson(managerScope, {
+        name: 'Should Fail Manager',
+        email: `${key}-bad-hm@example.test`,
+        password,
+        role: 'HALL_MANAGER',
+        eventId: ids.event,
+        hallId: ids.hall,
+      } as CreatePersonDto),
+    ).rejects.toBeInstanceOf(ForbiddenException);
+  });
+
+  it('allows Admin to create approved staff immediately', async () => {
     const created = await workforce.createPerson(adminScope, {
       name: 'Admin Created Staff',
       email: `${key}-admin-staff@example.test`,
@@ -230,9 +244,68 @@ describe('workforce identity management', () => {
       serviceSubtype: 'General',
     } as CreatePersonDto);
     createdUserIds.push(created.id);
-    expect(created.employeeCode).toMatch(/^STF-\d{5}$/);
+    expect(created.approvalStatus).toBe('APPROVED');
+    expect(created.employeeCode).toMatch(/^HELP-\d{4}$/);
     const scope = await prisma.userScope.findFirst({ where: { userId: created.id } });
     expect(scope?.hallId).toBe(ids.otherHall);
+  });
+
+  it('lets Admin approve Hall Manager pending staff and blocks routing while pending', async () => {
+    const created = await workforce.createPerson(managerScope, {
+      name: 'Pending Electrician',
+      email: `${key}-pending-elec@example.test`,
+      password,
+      role: 'STAFF',
+      eventId: ids.event,
+      hallId: ids.hall,
+      serviceCategory: 'ELECTRICAL',
+      serviceSubtype: 'Lighting',
+      employeeCode: 'ELEC-101',
+    } as CreatePersonDto);
+    createdUserIds.push(created.id);
+    expect(created.approvalStatus).toBe('PENDING_APPROVAL');
+    const pending = await workforce.listPending(adminScope);
+    expect(pending.some((person) => person.id === created.id)).toBe(true);
+    const approved = await workforce.approvePerson(adminScope, created.id);
+    expect(approved.approvalStatus).toBe('APPROVED');
+    await expect(workforce.approvePerson(adminScope, created.id)).rejects.toThrow(/already been reviewed/i);
+  });
+
+  it('lets Admin reject pending staff with a reason', async () => {
+    const created = await workforce.createPerson(managerScope, {
+      name: 'Rejected Helper',
+      email: `${key}-rejected@example.test`,
+      password,
+      role: 'STAFF',
+      eventId: ids.event,
+      hallId: ids.hall,
+      serviceCategory: 'HOUSE_HELP',
+      serviceSubtype: 'General',
+      employeeCode: 'HELP-REJ-01',
+    } as CreatePersonDto);
+    createdUserIds.push(created.id);
+    const rejected = await workforce.rejectPerson(adminScope, created.id, 'Incomplete paperwork');
+    expect(rejected.approvalStatus).toBe('REJECTED');
+    expect(rejected.rejectionReason).toBe('Incomplete paperwork');
+  });
+
+  it('denies pending approval login with a clear message', async () => {
+    const created = await workforce.createPerson(managerScope, {
+      name: 'Pending Login',
+      email: `${key}-pending-login@example.test`,
+      password,
+      role: 'STAFF',
+      eventId: ids.event,
+      hallId: ids.hall,
+      serviceCategory: 'ELECTRICAL',
+      serviceSubtype: 'Lighting',
+      employeeCode: 'ELEC-LOGIN-1',
+    } as CreatePersonDto);
+    createdUserIds.push(created.id);
+    const response = { cookie: jest.fn(), clearCookie: jest.fn() };
+    await expect(
+      auth.login({ email: `${key}-pending-login@example.test`, password, portal: 'OPERATIONS' }, response as never),
+    ).rejects.toThrow(/awaiting Admin approval/i);
   });
 
   it('forbids Staff from creating users', async () => {
@@ -292,6 +365,37 @@ describe('workforce identity management', () => {
     expect(paused.availability).toBe('PAUSED');
     expect(await prisma.assignment.count({ where: { ticketId, status: 'ACTIVE' } })).toBe(1);
   });
+
+  it('forces password rotation before operations after staff create', async () => {
+    const created = await workforce.createPerson(adminScope, {
+      name: 'Rotate Me',
+      email: `${key}-rotate@example.test`,
+      password,
+      role: 'STAFF',
+      eventId: ids.event,
+      hallId: ids.hall,
+      serviceCategory: 'HOUSE_HELP',
+      serviceSubtype: 'General',
+      employeeCode: 'HELP-ROTATE-1',
+    } as CreatePersonDto);
+    createdUserIds.push(created.id);
+    const user = await prisma.user.findUniqueOrThrow({ where: { id: created.id } });
+    expect(user.mustChangePassword).toBe(true);
+    expect(user.approvalStatus).toBe('APPROVED');
+    const response = { cookie: jest.fn(), clearCookie: jest.fn() };
+    const loginResult = await auth.login(
+      { email: `${key}-rotate@example.test`, password, portal: 'OPERATIONS' },
+      response as never,
+    );
+    expect(loginResult.mustChangePassword).toBe(true);
+    const changed = await auth.changePassword(
+      { userId: created.id, role: 'STAFF', eventIds: [ids.event], hallIds: [ids.hall], serviceTypes: ['HOUSE_HELP'] },
+      { currentPassword: password, newPassword: `${password}New1` },
+      { sessionId: undefined } as never,
+    );
+    expect(changed.mustChangePassword).toBe(false);
+    expect((await prisma.user.findUniqueOrThrow({ where: { id: created.id } })).mustChangePassword).toBe(false);
+  }, 20000);
 
   it('prevents DISABLED staff from logging in', async () => {
     await workforce.updatePerson(managerScope, ids.staffUser, { status: 'DISABLED' });

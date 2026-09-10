@@ -200,6 +200,15 @@ async function closeWithOtp(stall: BrowserContext, staff: BrowserContext, ticket
 
 test.describe.serial('isolated multi-role operational acceptance', () => {
   test.beforeAll(async () => {
+    await expect.poll(async () => {
+      try {
+        const health = await fetch('http://localhost:4000/api/system/health');
+        const loginPage = await fetch('http://localhost:3000/login');
+        return health.ok && loginPage.ok;
+      } catch {
+        return false;
+      }
+    }, { timeout: 120_000 }).toBe(true);
     await prisma.$connect();
     await prepareFixture();
   });
@@ -389,8 +398,9 @@ test.describe.serial('isolated multi-role operational acceptance', () => {
     expect((await page.request.get('/api/management/portfolio')).status()).toBe(200);
   });
 
-  test('11 Hall Manager creates House Help worker and can deactivate them', async ({ browser }) => {
+  test('11 Hall Manager creates House Help worker pending Admin approval', async ({ browser }) => {
     const manager = await login(browser, emails.manager);
+    const admin = await login(browser, emails.admin);
     const create = await manager.request.post('/api/workforce/people', {
       data: {
         name: 'Test House Help',
@@ -402,12 +412,13 @@ test.describe.serial('isolated multi-role operational acceptance', () => {
         serviceCategory: 'HOUSE_HELP',
         serviceSubtype: 'General',
         capacity: 1,
-        employeeCode: 'STF-E2E-NEW',
+        employeeCode: 'HELP-E2E-NEW',
       },
     });
     expect(create.status(), await create.text()).toBe(201);
-    const person = await create.json() as { id: string; employeeCode: string };
-    expect(person.employeeCode).toBe('STF-E2E-NEW');
+    const person = await create.json() as { id: string; employeeCode: string; approvalStatus: string };
+    expect(person.employeeCode).toBe('HELP-E2E-NEW');
+    expect(person.approvalStatus).toBe('PENDING_APPROVAL');
     const forbidAdmin = await manager.request.post('/api/workforce/people', {
       data: {
         name: 'Bad Admin',
@@ -418,13 +429,22 @@ test.describe.serial('isolated multi-role operational acceptance', () => {
       },
     });
     expect(forbidAdmin.status()).toBe(403);
+    const pendingLogin = await manager.request.post('/api/auth/login', {
+      data: { email: `${runKey}.created-house@eveops.test`, password, portal: 'OPERATIONS' },
+    });
+    expect(pendingLogin.status()).toBe(403);
+    const pending = await admin.request.get('/api/workforce/pending');
+    expect(pending.status()).toBe(200);
+    expect((await pending.json() as Array<{ id: string }>).some((item) => item.id === person.id)).toBe(true);
+    const approve = await admin.request.post(`/api/workforce/people/${person.id}/approve`);
+    expect(approve.status(), await approve.text()).toBe(201);
     const deactivate = await manager.request.patch(`/api/workforce/people/${person.id}`, { data: { status: 'DISABLED' } });
     expect(deactivate.status()).toBe(200);
     const loginAttempt = await manager.request.post('/api/auth/login', {
       data: { email: `${runKey}.created-house@eveops.test`, password, portal: 'OPERATIONS' },
     });
     expect(loginAttempt.status()).toBe(401);
-    await manager.close();
+    await Promise.all([manager.close(), admin.close()]);
   });
 
   test('12 House Help OTP flow closes and frees capacity', async ({ browser }) => {
@@ -455,6 +475,7 @@ test.describe.serial('isolated multi-role operational acceptance', () => {
     const staff = await login(browser, emails.staff);
     const house = await login(browser, emails.houseStaff);
     const manager = await login(browser, emails.manager);
+    const admin = await login(browser, emails.admin);
     await house.request.patch('/api/workforce/availability', { data: { value: 'ON_DUTY' } });
     const ticket = await createTicket(stall);
     expect(ticket.status).toBe('ASSIGNED');
@@ -478,6 +499,8 @@ test.describe.serial('isolated multi-role operational acceptance', () => {
     });
     expect(second.status(), await second.text()).toBe(201);
     const secondPerson = await second.json() as { id: string };
+    const approveSecond = await admin.request.post(`/api/workforce/people/${secondPerson.id}/approve`);
+    expect(approveSecond.status(), await approveSecond.text()).toBe(201);
     await prisma.workforceMembership.updateMany({ where: { userId: secondPerson.id }, data: { availability: 'ON_DUTY' } });
     const reassign = await manager.request.patch(`/api/workforce/tickets/${ticket.id}/reassign`, {
       data: { staffId: secondPerson.id, reason: 'Original staff delayed' },
@@ -488,7 +511,7 @@ test.describe.serial('isolated multi-role operational acceptance', () => {
     expect(assignments.some((item) => item.status === 'RELEASED')).toBe(true);
     expect(assignments.some((item) => item.staffId === secondPerson.id && ['ACTIVE', 'ACCEPTED'].includes(item.status))).toBe(true);
     await manager.request.patch(`/api/workforce/people/${secondPerson.id}`, { data: { status: 'DISABLED' } });
-    await Promise.all([stall.close(), staff.close(), house.close(), manager.close()]);
+    await Promise.all([stall.close(), staff.close(), house.close(), manager.close(), admin.close()]);
   });
 
   test('14 Staff availability pause blocks new routing but keeps active work', async ({ browser }) => {
@@ -529,5 +552,52 @@ test.describe.serial('isolated multi-role operational acceptance', () => {
     await closeWithOtp(stall, staff, ticket.id);
     expect((await (await stall.request.get(`/api/tickets/${ticket.id}`)).json()).status).toBe('CLOSED');
     await Promise.all([stall.close(), staff.close()]);
+  });
+
+  test('16 pending Hall Manager staff is not route-eligible until Admin approves', async ({ browser }) => {
+    const stall = await login(browser, emails.stall);
+    const manager = await login(browser, emails.manager);
+    const admin = await login(browser, emails.admin);
+    await prisma.workforceMembership.updateMany({
+      where: { poolId: ids.electricalPool },
+      data: { availability: 'OFF_DUTY' },
+    });
+    const create = await manager.request.post('/api/workforce/people', {
+      data: {
+        name: 'Pending Route Electrician',
+        email: `${runKey}.pending-route@eveops.test`,
+        password,
+        role: 'STAFF',
+        eventId: ids.event,
+        hallId: ids.hall,
+        serviceCategory: 'ELECTRICAL',
+        serviceSubtype: 'Lighting',
+        capacity: 1,
+        employeeCode: 'ELEC-ROUTE-1',
+      },
+    });
+    expect(create.status(), await create.text()).toBe(201);
+    const person = await create.json() as { id: string };
+    await prisma.workforceMembership.updateMany({ where: { userId: person.id }, data: { availability: 'ON_DUTY' } });
+    const ticket = await createTicket(stall);
+    expect(ticket.status).toBe('QUEUED');
+    const approve = await admin.request.post(`/api/workforce/people/${person.id}/approve`);
+    expect(approve.status()).toBe(201);
+    const pendingStaff = await login(browser, `${runKey}.pending-route@eveops.test`);
+    const blocked = await pendingStaff.request.patch('/api/workforce/availability', { data: { value: 'ON_DUTY' } });
+    expect(blocked.status()).toBe(403);
+    expect(String((await blocked.json()).message)).toMatch(/password change/i);
+    const rotated = await pendingStaff.request.post('/api/auth/change-password', {
+      data: { currentPassword: password, newPassword: `${password}Rot1` },
+    });
+    expect(rotated.status(), await rotated.text()).toBe(201);
+    const duty = await pendingStaff.request.patch('/api/workforce/availability', { data: { value: 'ON_DUTY' } });
+    expect(duty.status(), await duty.text()).toBe(200);
+    await expect.poll(async () => (await (await stall.request.get(`/api/tickets/${ticket.id}`)).json()).status).toBe('ASSIGNED');
+    const activeAssignment = await prisma.assignment.findFirst({
+      where: { ticketId: ticket.id, status: { in: ['ACTIVE', 'ACCEPTED'] } },
+    });
+    expect(activeAssignment?.staffId).toBe(person.id);
+    await Promise.all([stall.close(), manager.close(), admin.close(), pendingStaff.close()]);
   });
 });

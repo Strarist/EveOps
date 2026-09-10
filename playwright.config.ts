@@ -14,9 +14,10 @@ export default defineConfig({
   },
   projects: [{ name: 'chromium', use: { ...devices['Desktop Chrome'] } }],
   webServer: {
+    // Wait for API health (not only the Next login page) so ticket APIs are ready.
     command: 'npm run dev',
-    url: 'http://localhost:3000/login',
+    url: 'http://localhost:4000/api/system/health',
     reuseExistingServer: !process.env.CI,
-    timeout: 120_000,
+    timeout: 180_000,
   },
 });

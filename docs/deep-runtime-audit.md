@@ -256,3 +256,214 @@ Forced password rotation, management body DTO standardization, venue-scale load/
 
 ### 17. Pilot readiness
 **YES** for controlled local pilot: Staff → Stall display → Staff verify → close works end-to-end with capacity release.
+
+---
+
+## FINAL ADMIN + HALL MANAGER MVP COMPLETION
+
+Date: 10 September 2026
+
+### Dummy-data audit (pre-implementation)
+
+| Location | File | Dummy/static value | Why it exists | Replace with | Severity |
+|---|---|---|---|---|---|
+| Seed scripts | `prisma/seed.ts` | Meena Singh, Priya Mehra, EV-0000x, Auto Expo | Dev/test bootstrap | Keep in seed only | SEED-ONLY |
+| Form UX | `apps/web/src/components/role-views.tsx` | `placeholder="Search ticket or stall"` etc. | Input hints | Keep | UI LABEL |
+| Status/nav copy | role views / contracts | status labels, role names | Product vocabulary | Keep | SAFE CONSTANT |
+| Production UI | Admin/HM workspaces | No hardcoded operational rows found | N/A | API-backed metrics/lists | — |
+
+Hardcoded operational names/ticket numbers were **not** present in production UI source. Seed names remain test-only.
+
+### Final dummy-data check
+Re-scanned `apps/web` and `apps/api` for `Meena`, `Priya`, `EV-0000`, `Auto Expo`, `dummy`, `mockData`. No production operational hardcoding. Remaining `placeholder=` attributes are form hints only.
+
+### 1. Dummy data removed
+No fake runtime operational arrays required deletion. Masters now prefer hall/zone/stall codes over raw UUIDs in primary display. Metrics show `—` on API failure instead of false zeros for combined exception counts.
+
+### 2. Admin pages completed
+| Page | Status |
+|---|---|
+| Command Center | Complete — live `/management/metrics` |
+| Tickets / Live operations | Complete — scoped list, filters, search, pagination, drawer actions |
+| Halls / Zones / Stalls | Complete — masters hierarchy from API |
+| Workforce | Complete — list, filters, create, activate/deactivate, capacity |
+| Pending Approvals | Complete — `/workforce/pending` + approve/reject |
+| Reports | Complete — live metrics + CSV export queue/download |
+| Masters | Complete — halls/zones/stalls + SLA edit |
+| Audit | Complete — ticket events + workforce management audit |
+| Exports | Complete — queue CSV from Reports/Live ops |
+| Notifications | Complete — panel + mark read; includes staff approval types |
+
+### 3. Hall Manager pages completed
+| Page | Status |
+|---|---|
+| Hall Overview | Complete — hall-scoped metrics |
+| Live Tickets | Complete — hall-scoped tickets + filters/search |
+| Staff | Complete — hall-scoped workforce |
+| Create Staff | Complete — Electrical / House Help → Pending approval |
+| Pending Staff tracking | Complete — approval filter + rejection reason |
+| Exceptions | Complete — API exception inbox |
+| Search | Complete — shared live search |
+| Ticket actions | Complete — ping/reassign/escalate/etc. per capabilities |
+| Notifications | Complete — approval outcome notifications |
+
+### 4. Staff creation workflow
+Hall Manager may create **STAFF** only for **ELECTRICAL** / **HOUSE_HELP** in authorized halls. Accounts start `PENDING_APPROVAL`. Employee codes use `ELEC-####` / `HELP-####` (or manual unique code). Admin may create Staff/Hall Manager as `APPROVED` immediately.
+
+### 5. Approval workflow
+Admin `GET /workforce/pending`, `POST .../approve`, `POST .../reject` (reason required). CAS via `updateMany` where still `PENDING_APPROVAL`. Duplicate approve returns “Staff request has already been reviewed”. Audit + notifications + `workforce.updated` realtime.
+
+### 6. Permission matrix
+| Action | Hall Manager | Admin |
+|---|---|---|
+| Create Electrical/House Help | Yes → Pending | Yes → Approved |
+| Create Admin / Hall Manager / SuperAdmin | No | HM yes; Admin/SA no for HM actor |
+| Approve / Reject | No | Yes |
+| Edit pending staff (allowed fields) | Yes | Yes |
+| Change approved staff service/hall | No (Admin required) | Yes |
+| Cross-hall create/view | No | Event-wide |
+
+### 7. Database changes
+Migration `20260910160000_staff_approval_status`: enum `ApprovalStatus` (`PENDING_APPROVAL`, `APPROVED`, `REJECTED`) + User fields `approvalStatus`, `requestedById`, `approvedById`, `approvedAt`, `rejectedById`, `rejectedAt`, `rejectionReason`. Existing users default `APPROVED`. Schema up to date locally.
+
+### 8. Routing eligibility changes
+`@eveops/operations` `routeTicket` requires `user.status = ACTIVE` **and** `approvalStatus = APPROVED`, plus ON_DUTY, pool match, below capacity. Pending/Rejected never receive tickets.
+
+### 9. Realtime approval behavior
+Create/approve/reject write Workforce outbox (`workforce.updated`) and publish via `RealtimeService`. Web SSE listens for `workforce.updated` and reconciles workforce panels with ticket updates.
+
+### 10. Reports/metrics status
+`/management/metrics` returns scoped aggregates (`open`, `queued`, `overdue`, `escalated`, `complaints`, `closedToday`, `slaBreached`, `avgResponseSeconds`, status counts). Reports page mirrors live metrics; CSV export uses filter snapshot. Advanced historical chart analytics remain thin but are not fake.
+
+### 11. Audit behavior
+Workforce actions write `ManagementAudit` (`STAFF_APPROVAL_REQUESTED`, `STAFF_CREATED`, `STAFF_APPROVED`, `STAFF_REJECTED`, updates). Admin audit merges ticket + management events. OTP plaintext / secrets never exposed.
+
+### 12. Tests added/updated
+- Workforce integration: HM pending create, privilege blocks, Admin direct approve, approve race, reject, pending login denial (**11 passed**)
+- Operations integration: **23 passed**
+- Playwright: tests 11 (pending→approve), 13 (approve before reassign), 16 (pending not routed until approve + ON_DUTY)
+
+### 13. Playwright results
+**16/16 passed** (includes pending approval, Admin approve, routing exclusion until approve + ON_DUTY).
+
+### 14. Typecheck
+Passed (`npm run typecheck`).
+
+### 15. Lint
+Passed (`npm run lint`).
+
+### 16. Build
+Passed (`npm run build`).
+
+### 17. Migration status
+`prisma migrate status`: Database schema is up to date (13 migrations).
+
+### 18. Remaining known limitations
+- Masters create still uses prompt dialogs (functional, not polished).
+- Ticket detail `GET` does not yet mirror list `currentAssignee` shaping (list/drawer remain authoritative for assignee display).
+- Reports are live operational metrics + exports, not a full BI history product.
+- Forced password rotation and venue-scale HTTPS drill still deferred.
+- Nest API must consume rebuilt `@eveops/operations` dist after routing eligibility changes.
+
+### 19. MVP readiness
+**YES** for Admin + Hall Manager MVP governance: real management data, workforce create→pending→Admin approve/reject, pending staff blocked from login and routing, audited actions, management pages no longer shells with dummy operational data.
+
+---
+
+## FINAL MVP HARDENING / PRODUCTION-CANDIDATE REVIEW
+
+Date: 10 September 2026  
+Previous gate: Admin + Hall Manager MVP YES (controlled pilot)  
+This pass: production-candidate hardening without MVP scope expansion
+
+### 1. Masters UX changes
+Replaced all `window.prompt` management flows with labeled `authority-action` forms:
+- Hall / Zone / Stall create (selects for parent hall/zone, required markers, cancel/loading/error)
+- SLA edit (response/resolution seconds)
+- Staff reject reason
+- Capacity edit
+- SuperAdmin create admin
+
+### 2. Ticket detail consistency
+Centralized `projectTicketView()` for list + detail:
+- `currentAssignee` (ACTIVE/ACCEPTED only; null when closed)
+- `lastAssignee`, `queueState`, `slaState`, `capabilities`, `nextAction`
+- Detail also returns assignment history, complaints, OTP metadata **without** plaintext/ciphertext
+- UI closed tickets show “Last handled by …” instead of “Waiting for staff”
+
+### 3. DTO / validation changes
+Management mutations now use class-validator DTOs (`CreateMasterBodyDto`, `UpdatePoolDto`, `CreateAdminDto`, `CreateExportDto`, `MetricsQueryDto`, `AuditQueryDto`) under the global ValidationPipe.
+
+### 4. 5xx sanitization
+- Server: `SanitizedExceptionFilter` logs technical detail with `correlationId`; clients receive generic Internal server error + `correlationId`
+- Client: `apiErrorMessage` maps ≥500 to “Something went wrong. Please try again.” (+ Reference when present)
+- Domain 4xx messages remain specific
+
+### 5. Password rotation status
+**Implemented.** `User.mustChangePassword` (migration `20260910180000_must_change_password`):
+- Set on staff/admin create and password reset by managers
+- Login returns flag; proxy redirects to `/change-password`
+- SessionGuard blocks operational APIs until change
+- `POST /api/auth/change-password` validates current password, policy (letter+number, ≥10), revokes other sessions
+- Independent of approval/account/availability axes
+- Covered by workforce integration + Playwright scenario 16
+
+### 6. Deployment / build-package hardening
+- API/worker `prebuild` / `prestart` / `prestart:dev` rebuild `@eveops/operations` (+ contracts for API)
+- `npm run build:packages` and `npm run verify:operations-fresh`
+- CI runs package build + freshness check before and after full build
+- Readiness returns **503** when degraded (not 200 + `degraded`)
+
+### 7. Realtime resilience
+Unchanged architecture (SSE invalidate → REST reconcile). Existing Playwright offline/realtime scenarios remain green. Duplicate/out-of-order events continue to invalidate rather than mutate.
+
+### 8. Concurrency results
+Prior integration coverage retained (approve race, routing eligibility). No new flaky failures after password-rotation gating in scenario 16.
+
+### 9. Performance / load results
+No new venue-scale claim. Existing smoke remains the evidence ceiling; not re-marketed as production capacity proof.
+
+### 10. Security regression
+- Pending staff blocked from login; pending/rejected not routed
+- Password-change required before availability/ops for newly created staff (scenario 16)
+- OTP plaintext never in detail/export
+- Production secrets still fail-fast; OTP ≠ SESSION
+
+### 11. Backup / restore result
+Procedure documented in `docs/pilot-runbook.md`. Isolated restore rehearsal remains an environment operator task (not executed against a live production database in this session).
+
+### 12. Dummy-data scan
+No `window.prompt`, no hardcoded Meena/Priya/EV-0000/mock operational rows in `apps/web/src`. Seed/fixtures only.
+
+### 13. Dead-control scan
+Masters/workforce/admin create actions wired to API forms; reject/capacity/SLA no longer decorative prompts.
+
+### 14. Tests
+Jest: **51 passed** (includes forced password rotation integration case).
+
+### 15. Playwright
+**16/16 passed** (includes approve + forced password rotation before ON_DUTY routing).
+
+### 16. Typecheck
+Passed.
+
+### 17. Lint
+Passed.
+
+### 18. Build
+Passed (`npm run build`, includes `/change-password` route).
+
+### 19. Migration
+14 migrations applied; preflight passed (including documented `staff_approval_status` reconciliation repaired by `must_change_password`).
+
+### 20. Remaining limitations
+- Reports remain MVP operational metrics (live / created-today ranges + CSV), not enterprise BI
+- Venue-scale load and production HTTPS/proxy drill are environment-specific
+- Backup/restore must be rehearsed in the target cloud account before go-live
+- Representative multi-thousand-ticket management p95 profiling not re-run in this pass
+
+### 21. Final readiness classification
+**PRODUCTION-CANDIDATE MVP**
+
+Suitable to deploy to a controlled production environment after operator completion of: production secrets, HTTPS cookie policy, backup/restore rehearsal, and venue-volume soak. Not an unconditional “production ready” claim without those environment gates.
+

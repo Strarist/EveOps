@@ -3,6 +3,7 @@ import { NestFactory } from '@nestjs/core';
 import cookieParser from 'cookie-parser';
 import helmet from 'helmet';
 import { AppModule } from './app.module';
+import { SanitizedExceptionFilter } from './http-exception.filter';
 import { requestContext } from './request-context';
 
 async function bootstrap() {
@@ -21,6 +22,8 @@ async function bootstrap() {
     if ((process.env.SESSION_SECRET?.length ?? 0) < 32) {
       throw new Error('SESSION_SECRET must be at least 32 characters');
     }
+  } else if (process.env.SESSION_SECRET && process.env.SESSION_SECRET.includes('replace-with')) {
+    throw new Error('SESSION_SECRET still contains a placeholder value');
   }
   const app = await NestFactory.create(AppModule);
   app.setGlobalPrefix('api');
@@ -29,6 +32,7 @@ async function bootstrap() {
   app.use(cookieParser());
   app.enableCors({ origin: process.env.WEB_ORIGIN ?? 'http://localhost:3000', credentials: true });
   app.useGlobalPipes(new ValidationPipe({ whitelist: true, forbidNonWhitelisted: true, transform: true }));
+  app.useGlobalFilters(new SanitizedExceptionFilter());
   app.enableShutdownHooks();
   await app.listen(process.env.PORT ?? 4000);
 }

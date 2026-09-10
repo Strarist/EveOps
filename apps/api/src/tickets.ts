@@ -104,6 +104,46 @@ async function createLifecycleNotifications(
   });
 }
 
+type TicketProjectionInput = {
+  status: string;
+  createdAt: Date;
+  pool?: { category?: string | null; responseTargetSeconds?: number | null; resolutionTargetSeconds?: number | null } | null;
+  assignments: Array<{
+    status: string;
+    staffId: string;
+    responseOverdueAt?: Date | null;
+    staff: { id: string; name: string };
+  }>;
+};
+
+/** Canonical assignee / queue / SLA / capability projection for list and detail. */
+export function projectTicketView(ticket: TicketProjectionInput, scope: AuthScope) {
+  const latest = ticket.assignments[0];
+  const current = latest && ['ACTIVE', 'ACCEPTED'].includes(latest.status) ? latest : undefined;
+  const resolutionBreached = !TERMINAL_TICKET_STATUSES.includes(ticket.status as TicketStatus)
+    && Date.now() - ticket.createdAt.getTime() > (ticket.pool?.resolutionTargetSeconds ?? 3600) * 1000;
+  return {
+    currentAssignee: current?.staff ?? null,
+    lastAssignee: latest?.staff ?? null,
+    queueState: ticket.status === 'QUEUED' ? 'QUEUED' : current ? 'ASSIGNED' : 'NONE',
+    slaState: resolutionBreached ? 'SLA_BREACHED' : latest?.responseOverdueAt ? 'RESPONSE_OVERDUE' : 'ON_TRACK',
+    capabilities: {
+      advanceHallManagerWork: scope.role === 'HALL_MANAGER'
+        && current?.staffId === scope.userId
+        && ticket.pool?.category === 'HALL_MANAGER',
+      emergencyClose: ['ADMIN', 'SUPER_ADMIN'].includes(scope.role)
+        && ['AWAITING_OTP', 'ESCALATED'].includes(ticket.status),
+    },
+    nextAction: TERMINAL_TICKET_STATUSES.includes(ticket.status as TicketStatus)
+      ? 'NONE'
+      : ticket.status === 'QUEUED'
+        ? 'WAIT_FOR_ASSIGNMENT'
+        : ticket.status === 'AWAITING_OTP'
+          ? 'STAFF_VERIFY_OTP'
+          : current ? 'ASSIGNEE_ACTION' : 'ROUTE',
+  };
+}
+
 @Injectable()
 export class TicketService {
   constructor(private readonly prisma: PrismaService) {}
@@ -174,33 +214,10 @@ export class TicketService {
     const hasMore = rows.length > query.limit;
     const items = hasMore ? rows.slice(0, query.limit) : rows;
     return {
-      items: items.map((ticket) => {
-        const latest = ticket.assignments[0];
-        const current = latest && ['ACTIVE', 'ACCEPTED'].includes(latest.status) ? latest : undefined;
-        const resolutionBreached = !TERMINAL_TICKET_STATUSES.includes(ticket.status as TicketStatus)
-          && Date.now() - ticket.createdAt.getTime() > (ticket.pool?.resolutionTargetSeconds ?? 3600) * 1000;
-        return {
-          ...ticket,
-          currentAssignee: current?.staff ?? null,
-          lastAssignee: latest?.staff ?? null,
-          queueState: ticket.status === 'QUEUED' ? 'QUEUED' : current ? 'ASSIGNED' : 'NONE',
-          slaState: resolutionBreached ? 'SLA_BREACHED' : latest?.responseOverdueAt ? 'RESPONSE_OVERDUE' : 'ON_TRACK',
-          capabilities: {
-            advanceHallManagerWork: scope.role === 'HALL_MANAGER'
-              && current?.staffId === scope.userId
-              && ticket.pool?.category === 'HALL_MANAGER',
-            emergencyClose: ['ADMIN', 'SUPER_ADMIN'].includes(scope.role)
-              && ['AWAITING_OTP', 'ESCALATED'].includes(ticket.status),
-          },
-          nextAction: TERMINAL_TICKET_STATUSES.includes(ticket.status as TicketStatus)
-            ? 'NONE'
-            : ticket.status === 'QUEUED'
-              ? 'WAIT_FOR_ASSIGNMENT'
-              : ticket.status === 'AWAITING_OTP'
-                ? 'STAFF_VERIFY_OTP'
-                : current ? 'ASSIGNEE_ACTION' : 'ROUTE',
-        };
-      }),
+      items: items.map((ticket) => ({
+        ...ticket,
+        ...projectTicketView(ticket, scope),
+      })),
       total,
       nextCursor: hasMore ? items.at(-1)?.id : null,
     };
@@ -209,14 +226,44 @@ export class TicketService {
   async detail(id: string, scope: AuthScope) {
     const ticket = await this.prisma.ticket.findUnique({
       where: { id },
-      include: { stall: true, hall: true, zone: true, events: { orderBy: { createdAt: 'asc' }, include: { actor: { select: { name: true } } } }, assignments: { orderBy: { assignedAt: 'asc' }, include: { staff: { select: { name: true } } } }, complaints: true },
+      include: {
+        pool: { select: { category: true, responseTargetSeconds: true, resolutionTargetSeconds: true } },
+        stall: true,
+        hall: true,
+        zone: true,
+        event: { select: { id: true, name: true, timezone: true } },
+        events: { orderBy: { createdAt: 'asc' }, include: { actor: { select: { name: true } } } },
+        assignments: {
+          orderBy: { assignedAt: 'desc' },
+          include: { staff: { select: { id: true, name: true, employeeCode: true } } },
+        },
+        complaints: { orderBy: { createdAt: 'asc' } },
+        otpChallenges: {
+          orderBy: { createdAt: 'desc' },
+          take: 5,
+          select: {
+            id: true,
+            createdAt: true,
+            expiresAt: true,
+            verifiedAt: true,
+            attempts: true,
+            // Never expose ciphertext / plaintext OTP
+          },
+        },
+      },
     });
     if (!ticket) throw new BadRequestException('Ticket not found');
     assertScope(scope, ticket);
     if (scope.role === 'STAFF' && !ticket.assignments.some((assignment) => assignment.staffId === scope.userId)) {
       throw new BadRequestException('Ticket is not assigned to this staff account');
     }
-    return ticket;
+    const assignmentHistory = [...ticket.assignments].reverse();
+    return {
+      ...ticket,
+      ...projectTicketView(ticket, scope),
+      assignmentHistory,
+      otpChallenges: ticket.otpChallenges,
+    };
   }
 
   async create(dto: CreateTicketDto, scope: AuthScope) {

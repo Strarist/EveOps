@@ -35,12 +35,21 @@ export default function LoginPage() {
       });
       if (!response.ok) {
         if (response.status === 401) throw new Error('Incorrect email or password');
+        if (response.status === 403) {
+          const payload = await response.json().catch(() => null) as { message?: string | string[] } | null;
+          const message = Array.isArray(payload?.message) ? payload?.message[0] : payload?.message;
+          throw new Error(message || 'Sign-in is not allowed for this account');
+        }
         if (response.status === 429) throw new Error('Too many sign-in attempts. Please wait and try again.');
         if (response.status >= 500) throw new Error('EveOps is temporarily unavailable. Please try again shortly.');
         throw new Error('Sign-in request could not be accepted');
       }
-      const result = (await response.json()) as { user: { role: Role } };
-      router.replace(homeByRole[result.user.role]);
+      const result = (await response.json()) as { user: { role: Role; mustChangePassword?: boolean }; mustChangePassword?: boolean };
+      if (result.mustChangePassword || result.user.mustChangePassword) {
+        router.replace('/change-password');
+      } else {
+        router.replace(homeByRole[result.user.role]);
+      }
       router.refresh();
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : 'Unable to reach EveOps');
