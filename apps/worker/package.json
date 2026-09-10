@@ -1,0 +1,20 @@
+{
+  "name": "@eveops/worker",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/main.js",
+    "start:dev": "tsx watch src/main.ts"
+  },
+  "dependencies": {
+    "@eveops/operations": "*",
+    "@prisma/client": "6.12.0",
+    "exceljs": "4.4.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.3.0",
+    "tsx": "^4.20.5",
+    "typescript": "^5.9.2"
+  }
+}

@@ -1,0 +1,1121 @@
+'use client';
+
+import type { Role, TicketStatus } from '@eveops/contracts';
+import { FormEvent, useCallback, useEffect, useRef, useState } from 'react';
+import { useRouter } from 'next/navigation';
+import { apiFetch, AUTH_LOST_EVENT, subscribeRealtime } from '../lib/api-client';
+
+type Ticket = {
+  id: string;
+  no: string;
+  service: string;
+  location: string;
+  status: TicketStatus;
+  age: string;
+  assignee: string;
+  ownerId?: string;
+  description: string;
+  priority?: boolean;
+  slaState: 'On track' | 'Response overdue' | 'SLA breached';
+  capabilities: {
+    advanceHallManagerWork: boolean;
+    emergencyClose: boolean;
+  };
+};
+
+type ApiTicket = {
+  id: string;
+  publicNo: string;
+  category: string;
+  subtype: string;
+  status: TicketStatus;
+  priority: 'NORMAL' | 'URGENT';
+  description: string;
+  createdAt: string;
+  firstAcceptedAt?: string | null;
+  firstAssignedAt?: string | null;
+  firstStartedAt?: string | null;
+  completionRequestedAt?: string | null;
+  closedAt?: string | null;
+  pool?: { responseTargetSeconds: number; resolutionTargetSeconds: number } | null;
+  hall: { code: string };
+  zone?: { code: string };
+  stall: { stallCode: string };
+  assignments: Array<{ status: string; staff: { name: string } }>;
+  currentAssignee: { id: string; name: string } | null;
+  lastAssignee: { id: string; name: string } | null;
+  queueState: 'QUEUED' | 'ASSIGNED' | 'NONE';
+  nextAction: 'NONE' | 'WAIT_FOR_ASSIGNMENT' | 'STALL_VERIFY_OTP' | 'ASSIGNEE_ACTION' | 'ROUTE';
+  slaState: 'ON_TRACK' | 'RESPONSE_OVERDUE' | 'SLA_BREACHED';
+  capabilities: {
+    advanceHallManagerWork: boolean;
+    emergencyClose: boolean;
+  };
+};
+
+function formatTicketAge(createdAt: string) {
+  const ageSeconds = Math.max(0, Math.floor((Date.now() - new Date(createdAt).getTime()) / 1000));
+  if (ageSeconds < 60) return ageSeconds + 's';
+  const days = Math.floor(ageSeconds / 86400);
+  const hours = Math.floor((ageSeconds % 86400) / 3600);
+  const minutes = Math.floor((ageSeconds % 3600) / 60);
+  if (days > 0) return days + 'd ' + hours + 'h';
+  if (hours > 0) return hours + 'h ' + String(minutes).padStart(2, '0') + 'm';
+  return String(minutes).padStart(2, '0') + 'm';
+}
+
+function mapTicket(ticket: ApiTicket): Ticket {
+  return {
+    id: ticket.id,
+    no: ticket.publicNo,
+    service: ticket.category.replaceAll('_', ' ') + ' · ' + ticket.subtype,
+    location: [ticket.hall.code, ticket.zone?.code, ticket.stall.stallCode].filter(Boolean).join(' · '),
+    status: ticket.status,
+    age: formatTicketAge(ticket.createdAt),
+    assignee: ticket.currentAssignee?.name
+      ?? (ticket.status === 'CLOSED' && ticket.lastAssignee ? `Resolved by ${ticket.lastAssignee.name}` : undefined)
+      ?? ticket.assignments[0]?.staff.name
+      ?? (ticket.queueState === 'QUEUED' || ticket.status === 'QUEUED' ? 'Waiting in FIFO queue' : 'Not currently assigned'),
+    ownerId: ticket.currentAssignee?.id,
+    description: ticket.description,
+    priority: ticket.priority === 'URGENT',
+    slaState: ticket.slaState === 'SLA_BREACHED' ? 'SLA breached' : ticket.slaState === 'RESPONSE_OVERDUE' ? 'Response overdue' : 'On track',
+    capabilities: ticket.capabilities ?? { advanceHallManagerWork: false, emergencyClose: false },
+  };
+}
+
+function useApiTickets(query = '') {
+  const [items, setItems] = useState<Ticket[]>([]);
+  const [total, setTotal] = useState(0);
+  const [nextCursor, setNextCursor] = useState<string | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState('');
+  const [connection, setConnection] = useState<'connecting' | 'live' | 'reconnecting'>('connecting');
+  const [lastUpdatedAt, setLastUpdatedAt] = useState(0);
+  const refreshTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const seenEventIds = useRef(new Set<string>());
+  const seenTicketVersions = useRef(new Map<string, number>());
+  const requestSequence = useRef(0);
+  const requestController = useRef<AbortController | null>(null);
+  const refresh = useCallback(async (cursor?: string, append = false) => {
+    const sequence = ++requestSequence.current;
+    requestController.current?.abort();
+    const controller = new AbortController();
+    requestController.current = controller;
+    if (!append) setLoading(true);
+    try {
+      const parameters = new URLSearchParams(query);
+      if (cursor) parameters.set('cursor', cursor);
+      const response = await apiFetch('/api/tickets?' + parameters.toString(), { credentials: 'include', cache: 'no-store', signal: controller.signal });
+      if (!response.ok) throw new Error('Live tickets could not be loaded');
+      const result = await response.json() as { items: ApiTicket[]; total: number; nextCursor: string | null };
+      if (sequence !== requestSequence.current) return;
+      const mapped = result.items.map(mapTicket);
+      setItems((current) => append ? [...current, ...mapped] : mapped);
+      setTotal(result.total);
+      setNextCursor(result.nextCursor);
+      setLastUpdatedAt(Date.now());
+      setError('');
+    } catch (cause) {
+      if (controller.signal.aborted) return;
+      setError(cause instanceof Error ? cause.message : 'Live tickets could not be loaded');
+    } finally {
+      if (sequence === requestSequence.current) setLoading(false);
+    }
+  }, [query]);
+  useEffect(() => { void refresh(); }, [refresh]);
+  useEffect(() => {
+    const unsubscribe = subscribeRealtime({
+      onConnection: (state) => {
+        setConnection(state);
+        if (state === 'live') void refresh();
+      },
+      onTicket: (event) => {
+      if (event.lastEventId) {
+        if (seenEventIds.current.has(event.lastEventId)) return;
+        seenEventIds.current.add(event.lastEventId);
+        if (seenEventIds.current.size > 500) {
+          const oldest = seenEventIds.current.values().next().value;
+          if (oldest) seenEventIds.current.delete(oldest);
+        }
+      }
+      try {
+        const data = JSON.parse(event.data) as { ticketId?: string; version?: number };
+        if (data.ticketId && typeof data.version === 'number') {
+          const previous = seenTicketVersions.current.get(data.ticketId) ?? -1;
+          if (data.version <= previous) return;
+          seenTicketVersions.current.set(data.ticketId, data.version);
+        }
+      } catch {
+        // Reconcile unknown event payloads from authoritative REST state.
+      }
+      if (refreshTimer.current) clearTimeout(refreshTimer.current);
+      refreshTimer.current = setTimeout(() => void refresh(), 250);
+      },
+    });
+    const reconcile = () => { if (document.visibilityState === 'visible') void refresh(); };
+    const authLost = () => {
+      setItems([]);
+      setTotal(0);
+      setNextCursor(null);
+      setError('Session expired');
+    };
+    document.addEventListener('visibilitychange', reconcile);
+    window.addEventListener(AUTH_LOST_EVENT, authLost);
+    return () => {
+      if (refreshTimer.current) clearTimeout(refreshTimer.current);
+      document.removeEventListener('visibilitychange', reconcile);
+      window.removeEventListener(AUTH_LOST_EVENT, authLost);
+      unsubscribe();
+      requestController.current?.abort();
+    };
+  }, [refresh]);
+  return { items, total, nextCursor, loading, error, refresh, loadMore: () => nextCursor ? refresh(nextCursor, true) : Promise.resolve(), connection, lastUpdatedAt };
+}
+
+type Profile = {
+  id: string;
+  name: string;
+  role: Role;
+  scopes: Array<{
+    event: { id: string; name: string; timezone: string };
+    hall: { id: string; code: string; name: string } | null;
+    stall: { id?: string; stallCode: string; zone: { code: string } } | null;
+    serviceType: string | null;
+  }>;
+};
+
+function useProfile() {
+  const [profile, setProfile] = useState<Profile | null>(null);
+  useEffect(() => {
+    void apiFetch('/api/auth/profile', { credentials: 'include', cache: 'no-store' })
+      .then((response) => response.ok ? response.json() as Promise<Profile> : null)
+      .then(setProfile);
+    const authLost = () => setProfile(null);
+    window.addEventListener(AUTH_LOST_EVENT, authLost);
+    return () => window.removeEventListener(AUTH_LOST_EVENT, authLost);
+  }, []);
+  return profile;
+}
+
+function useAuthLoss(clear: () => void) {
+  const clearRef = useRef(clear);
+  clearRef.current = clear;
+  useEffect(() => {
+    const listener = () => clearRef.current();
+    window.addEventListener(AUTH_LOST_EVENT, listener);
+    return () => window.removeEventListener(AUTH_LOST_EVENT, listener);
+  }, []);
+}
+
+const statusLabels: Record<TicketStatus, string> = {
+  NEW: 'Request received',
+  QUEUED: 'Waiting for staff',
+  ASSIGNED: 'Staff assigned',
+  SNOOZED: 'Response pending',
+  ACCEPTED: 'Staff accepted',
+  IN_PROGRESS: 'Work in progress',
+  AWAITING_OTP: 'Awaiting stall OTP',
+  CLOSED: 'Closed · OTP verified',
+  COMPLAINT_RAISED: 'Issue reported',
+  REOPENED: 'Reopened',
+  ESCALATED: 'Escalated',
+  CANCELLED: 'Cancelled',
+};
+
+function Status({ value }: { value: TicketStatus }) {
+  return <span className={'status status-' + value.toLowerCase()}>{statusLabels[value]}</span>;
+}
+
+function LogoutButton() {
+  const router = useRouter();
+  async function logout() {
+    await globalThis.fetch('/api/auth/logout', { method: 'POST', credentials: 'include' });
+    router.replace('/login');
+    router.refresh();
+  }
+  return <button className="logout" onClick={logout}>Sign out</button>;
+}
+
+function TicketCard({ ticket, actions = false, actionLabel = 'Accept', actionDisabled = false, onAccept, onSnooze }: { ticket: Ticket; actions?: boolean; actionLabel?: string; actionDisabled?: boolean; onAccept?: () => void; onSnooze?: () => void }) {
+  return (
+    <article className="ticket-card">
+      <div className="ticket-top"><span className="ticket-no">{ticket.no}</span><Status value={ticket.status} /></div>
+      <h3>{ticket.service}</h3>
+      <p className="description">{ticket.description}</p>
+      <div className="location">{ticket.location}</div>
+      <div className="ticket-meta">
+        <span>Age <strong>{ticket.age}</strong></span>
+        <span>Owner <strong>{ticket.assignee}</strong></span>
+      </div>
+      {actions && <div className="ticket-actions"><button className="primary" disabled={actionDisabled} onClick={onAccept}>{actionLabel}</button>{ticket.status === 'ASSIGNED' && <button disabled={actionDisabled} onClick={onSnooze}>Snooze 10 min</button>}</div>}
+    </article>
+  );
+}
+
+function ComplaintDisclosure({ ticketId, summary, onSuccess }: { ticketId: string; summary: string; onSuccess: () => Promise<unknown> }) {
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState('');
+  const [success, setSuccess] = useState('');
+  const idempotencyKey = useRef(crypto.randomUUID());
+
+  async function submitComplaint(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (submitting) return;
+    setSubmitting(true);
+    setError('');
+    setSuccess('');
+    const form = event.currentTarget;
+    const values = new FormData(form);
+    try {
+      const response = await apiFetch('/api/tickets/' + ticketId + '/complaints', {
+        method: 'POST',
+        credentials: 'include',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          reasonCode: values.get('reasonCode'),
+          comment: values.get('comment'),
+          idempotencyKey: idempotencyKey.current,
+        }),
+      });
+      const result = await response.json() as { message?: string };
+      if (!response.ok) throw new Error(result.message ?? 'Complaint could not be raised');
+      idempotencyKey.current = crypto.randomUUID();
+      form.reset();
+      setSuccess('Complaint recorded. This ticket is active again.');
+      await onSuccess();
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : 'Complaint could not be raised');
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  return (
+    <details className="complaint-disclosure">
+      <summary>{summary}</summary>
+      <form onSubmit={(event) => void submitComplaint(event)}>
+        <label>Reason<select name="reasonCode" required disabled={submitting}><option value="">Choose reason</option><option value="WORK_INCOMPLETE">Work incomplete</option><option value="WORK_QUALITY">Quality issue</option><option value="WRONG_SERVICE">Wrong service/person</option></select></label>
+        <label>Note<textarea name="comment" maxLength={500} disabled={submitting} /></label>
+        {error && <p className="form-error" role="alert">{error}</p>}
+        {success && <p className="form-success" role="status">{success}</p>}
+        <button type="submit" disabled={submitting}>{submitting ? 'Recording…' : 'Raise complaint'}</button>
+      </form>
+    </details>
+  );
+}
+
+export function StallWorkspace() {
+  const profile = useProfile();
+  const { items, total, loading, error: loadError, refresh, connection } = useApiTickets('view=active');
+  const { items: closedItems, loading: closedLoading } = useApiTickets('view=closed&limit=5');
+  const [showForm, setShowForm] = useState(false);
+  const [showAll, setShowAll] = useState(false);
+  const [showHelp, setShowHelp] = useState(false);
+  const [submitted, setSubmitted] = useState('');
+  const [category, setCategory] = useState('');
+  const [submitError, setSubmitError] = useState('');
+  const [submitting, setSubmitting] = useState(false);
+  const [otpByTicket, setOtpByTicket] = useState<Record<string, string>>({});
+  const [otpInputByTicket, setOtpInputByTicket] = useState<Record<string, string>>({});
+  const [otpExpiryByTicket, setOtpExpiryByTicket] = useState<Record<string, string>>({});
+  const [otpPending, setOtpPending] = useState<Record<string, boolean>>({});
+  const idempotencyKey = useRef('');
+  useAuthLoss(() => {
+    setOtpByTicket({});
+    setOtpInputByTicket({});
+    setOtpExpiryByTicket({});
+    setOtpPending({});
+    setSubmitted('');
+  });
+  const stallScope = profile?.scopes.find((scope) => scope.stall);
+  const locationLabel = stallScope
+    ? [stallScope.hall?.name, 'Zone ' + stallScope.stall!.zone.code, 'Stall ' + stallScope.stall!.stallCode].filter(Boolean).join(' / ')
+    : 'Loading assigned location…';
+
+  async function loadOtp(ticketId: string) {
+    if (otpPending[ticketId]) return;
+    setOtpPending((current) => ({ ...current, [ticketId]: true }));
+    try {
+      const response = await apiFetch('/api/tickets/' + ticketId + '/otp', { credentials: 'include', cache: 'no-store' });
+      const result = await response.json() as { otp?: string; expiresAt?: string; message?: string };
+      if (!response.ok || !result.otp) throw new Error(result.message ?? 'OTP is unavailable');
+      setOtpByTicket((current) => ({ ...current, [ticketId]: result.otp! }));
+      if (result.expiresAt) setOtpExpiryByTicket((current) => ({ ...current, [ticketId]: result.expiresAt! }));
+      setSubmitError('');
+    } catch (cause) {
+      setSubmitError(cause instanceof Error ? cause.message : 'OTP is unavailable');
+    } finally {
+      setOtpPending((current) => ({ ...current, [ticketId]: false }));
+    }
+  }
+
+  async function regenerateOtp(ticketId: string) {
+    if (otpPending[ticketId]) return;
+    setOtpPending((current) => ({ ...current, [ticketId]: true }));
+    try {
+      const response = await apiFetch('/api/tickets/' + ticketId + '/otp/regenerate', { method: 'POST', credentials: 'include' });
+      const result = await response.json() as { message?: string };
+      if (!response.ok) throw new Error(result.message ?? 'OTP could not be regenerated');
+      setOtpPending((current) => ({ ...current, [ticketId]: false }));
+      await loadOtp(ticketId);
+    } catch (cause) {
+      setSubmitError(cause instanceof Error ? cause.message : 'OTP could not be regenerated');
+      setOtpPending((current) => ({ ...current, [ticketId]: false }));
+    }
+  }
+
+  async function confirmOtp(ticketId: string) {
+    const otp = (otpInputByTicket[ticketId] ?? '').trim() || otpByTicket[ticketId];
+    if (!otp || otpPending[ticketId]) return;
+    setOtpPending((current) => ({ ...current, [ticketId]: true }));
+    try {
+      const response = await apiFetch('/api/tickets/' + ticketId + '/otp/verify', {
+        method: 'POST',
+        credentials: 'include',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ otp }),
+      });
+      const result = await response.json() as { message?: string };
+      if (!response.ok) throw new Error(result.message ?? (response.status === 400 ? 'Incorrect code. Please try again.' : 'OTP confirmation failed'));
+      setOtpByTicket((current) => {
+        const next = { ...current };
+        delete next[ticketId];
+        return next;
+      });
+      setOtpInputByTicket((current) => {
+        const next = { ...current };
+        delete next[ticketId];
+        return next;
+      });
+      setSubmitError('');
+      await refresh();
+    } catch (cause) {
+      setSubmitError(cause instanceof Error ? cause.message : 'OTP confirmation failed');
+    } finally {
+      setOtpPending((current) => ({ ...current, [ticketId]: false }));
+    }
+  }
+
+  async function submit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setSubmitting(true);
+    setSubmitError('');
+    const form = new FormData(event.currentTarget);
+    try {
+      const response = await apiFetch('/api/tickets', {
+        method: 'POST',
+        credentials: 'include',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          category,
+          subtype: category === 'ELECTRICAL' ? String(form.get('subtype') ?? '') : 'General',
+          description: String(form.get('description') ?? ''),
+          priority: form.get('urgent') ? 'URGENT' : 'NORMAL',
+          idempotencyKey: idempotencyKey.current || (idempotencyKey.current = crypto.randomUUID()),
+        }),
+      });
+      const result = await response.json() as { publicNo?: string; message?: string };
+      if (!response.ok || !result.publicNo) throw new Error(result.message ?? 'Ticket could not be created');
+      setSubmitted(result.publicNo);
+      idempotencyKey.current = '';
+      await refresh();
+    } catch (cause) {
+      setSubmitError(cause instanceof Error ? cause.message : 'Ticket could not be created');
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  return (
+    <div className="mobile-page">
+      <main className="mobile-shell">
+        <header className="mobile-header">
+          <div><span className="eyebrow">{stallScope?.event.name ?? 'EveOps event'}</span><h1>{stallScope?.stall ? 'Stall ' + stallScope.stall.stallCode : 'Your stall'}</h1></div>
+          <span className="online">{connection === 'live' ? 'Live' : connection === 'reconnecting' ? 'Reconnecting…' : 'Connecting…'}</span>
+        </header>
+        {submitted ? (
+          <section className="success-panel">
+            <span className="success-mark" aria-hidden="true">✓</span>
+            <h2>Ticket {submitted} confirmed</h2>
+            <p>The server confirmed your ticket. Hall Manager notified; waiting for assignment.</p>
+            <button onClick={() => { setSubmitted(''); setShowForm(false); }}>View ticket</button>
+          </section>
+        ) : showForm ? (
+          <form className="raise-form" onSubmit={submit}>
+            <button type="button" className="back" onClick={() => setShowForm(false)}>← Back</button>
+            <span className="eyebrow">Locked location · {locationLabel}</span>
+            <h2>What do you need?</h2>
+            <fieldset className="service-grid">
+              <legend>Service category</legend>
+              <label><input type="radio" name="service" required value="ELECTRICAL" onChange={() => setCategory('ELECTRICAL')} />Electrical</label>
+              <label><input type="radio" name="service" value="HOUSE_HELP" onChange={() => setCategory('HOUSE_HELP')} />House Help</label>
+              <label><input type="radio" name="service" value="HALL_MANAGER" onChange={() => setCategory('HALL_MANAGER')} />Hall Manager</label>
+            </fieldset>
+            {category === 'ELECTRICAL' && <label className="field">Electrical subtype<select name="subtype" required><option value="">Choose subtype</option><option value="NCP">NCP</option><option value="Lighting">Lighting</option></select></label>}
+            <label className="field">Brief description<textarea name="description" required minLength={3} maxLength={500} placeholder="Tell us what needs attention" /></label>
+            <label className="urgent"><input type="checkbox" name="urgent" /> Mark as urgent</label>
+            {submitError && <div className="form-error" role="alert">{submitError}</div>}
+            <button className="primary full-width" type="submit" disabled={submitting || !category}>{submitting ? 'Confirming…' : 'Raise ticket'}</button>
+          </form>
+        ) : showHelp ? (
+          <section className="success-panel">
+            <h2>Need operational help?</h2>
+            <p>Raise a Hall Manager ticket for event assistance. For an existing request, include the ticket number when speaking with your Hall Manager.</p>
+            <button className="primary" onClick={() => { idempotencyKey.current = crypto.randomUUID(); setShowHelp(false); setShowForm(true); }}>Raise a help ticket</button>
+            <button onClick={() => setShowHelp(false)}>Back to tickets</button>
+          </section>
+        ) : (
+          <>
+            <button className="raise" onClick={() => { idempotencyKey.current = crypto.randomUUID(); setShowForm(true); }}><span aria-hidden="true">＋</span> Raise a ticket</button>
+            <section><div className="section-title"><h2>Active requests</h2><span>{total} open</span></div>{submitError && <div className="form-error" role="alert">{submitError}</div>}{loading ? <p className="empty-state">Loading your requests…</p> : loadError ? <p className="form-error">{loadError}</p> : items.length ? (showAll ? items : items.slice(0, 3)).map((ticket) => <div key={ticket.id}><TicketCard ticket={ticket} />{ticket.status === 'AWAITING_OTP' && <div className="otp-panel"><span>Completion requested · staff says the work is complete</span>{otpByTicket[ticket.id] ? <><span>Your verification code · expires {eventTime(otpExpiryByTicket[ticket.id])}</span><strong aria-label="Completion OTP">{otpByTicket[ticket.id]}</strong></> : <button className="primary" disabled={otpPending[ticket.id]} onClick={() => void loadOtp(ticket.id)}>{otpPending[ticket.id] ? 'Loading…' : 'Show verification code'}</button>}<label>Enter verification code<input inputMode="numeric" autoComplete="one-time-code" maxLength={6} pattern="[0-9]{6}" value={otpInputByTicket[ticket.id] ?? ''} onChange={(event) => setOtpInputByTicket((current) => ({ ...current, [ticket.id]: event.target.value.replace(/\D/g, '').slice(0, 6) }))} disabled={otpPending[ticket.id]} /></label><button className="primary" disabled={otpPending[ticket.id] || (otpInputByTicket[ticket.id] ?? '').length !== 6} onClick={() => void confirmOtp(ticket.id)}>Verify completion</button><button disabled={otpPending[ticket.id]} onClick={() => void regenerateOtp(ticket.id)}>Request a new code</button><ComplaintDisclosure ticketId={ticket.id} summary="Work is not satisfactory / Report a problem" onSuccess={refresh} /></div>}</div>) : <p className="empty-state">No active requests for this stall.</p>}</section>
+            <section><div className="section-title"><h2>Recently resolved</h2><button className="link" onClick={() => setShowAll(true)}>View all</button></div>{closedLoading ? <p className="empty-state">Loading resolved requests…</p> : closedItems.length ? closedItems.map((ticket) => <div key={ticket.id}><div className="recent"><Status value="CLOSED" /><strong>{ticket.no} · {ticket.service}</strong><span>{ticket.age} since raised</span></div><ComplaintDisclosure ticketId={ticket.id} summary="Report a problem" onSuccess={refresh} /></div>) : <p className="empty-state">No resolved requests yet.</p>}</section>
+          </>
+        )}
+        <nav className="bottom-nav" aria-label="Stall navigation"><button onClick={() => { setShowHelp(false); setShowAll(false); }}>Home</button><button onClick={() => { setShowHelp(false); setShowAll(true); }}>My tickets</button><button onClick={() => setShowHelp(true)}>Help</button><LogoutButton /></nav>
+      </main>
+    </div>
+  );
+}
+
+export function StaffWorkspace() {
+  const profile = useProfile();
+  const { items, loading, error: loadError, refresh, connection } = useApiTickets('view=active');
+  const { items: history } = useApiTickets('view=closed&limit=10');
+  const [actionError, setActionError] = useState('');
+  const [availability, setAvailability] = useState<'ON_DUTY' | 'PAUSED' | 'OFF_DUTY' | 'OFFLINE'>('OFF_DUTY');
+  const [workload, setWorkload] = useState({ activeCount: 0, completedToday: 0, capacity: 0 });
+  const [actionPending, setActionPending] = useState(false);
+  useAuthLoss(() => {
+    setAvailability('OFF_DUTY');
+    setWorkload({ activeCount: 0, completedToday: 0, capacity: 0 });
+    setActionError('Session expired');
+    setActionPending(false);
+  });
+  const current = items[0];
+
+  const refreshWorkload = useCallback(async () => {
+    const response = await apiFetch('/api/workforce/me', { credentials: 'include', cache: 'no-store' });
+    if (!response.ok) return;
+    const result = await response.json() as typeof workload & { availability: typeof availability };
+    setAvailability(result.availability);
+    setWorkload(result);
+  }, []);
+  useEffect(() => { void refreshWorkload(); }, [refreshWorkload]);
+
+  async function toggleAvailability() {
+    const value = availability === 'ON_DUTY' ? 'PAUSED' : 'ON_DUTY';
+    setActionPending(true);
+    const response = await apiFetch('/api/workforce/availability', {
+      method: 'PATCH',
+      credentials: 'include',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ value }),
+    });
+    if (!response.ok) {
+      const result = await response.json().catch(() => ({})) as { message?: string };
+      setActionError(result.message ?? (response.status === 400 ? 'Availability request was invalid' : 'Availability could not be updated'));
+      setActionPending(false);
+      return;
+    }
+    setActionError('');
+    setAvailability(value);
+    await refreshWorkload();
+    await refresh();
+    setActionPending(false);
+  }
+
+  async function transition() {
+    if (!current) return;
+    if (!['ASSIGNED', 'SNOOZED', 'ACCEPTED', 'IN_PROGRESS'].includes(current.status)) return;
+    setActionPending(true);
+    const next = current.status === 'ACCEPTED' ? 'IN_PROGRESS' : current.status === 'IN_PROGRESS' ? 'AWAITING_OTP' : 'ACCEPTED';
+    const response = await apiFetch('/api/tickets/' + current.id + '/transition', {
+      method: 'POST',
+      credentials: 'include',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ to: next }),
+    });
+    if (!response.ok) {
+      const result = await response.json() as { message?: string };
+      setActionError(result.message ?? 'Action could not be confirmed');
+      setActionPending(false);
+      return;
+    }
+    setActionError('');
+    await refresh();
+    await refreshWorkload();
+    setActionPending(false);
+  }
+
+  async function snooze() {
+    if (!current) return;
+    setActionPending(true);
+    const response = await apiFetch('/api/tickets/' + current.id + '/snooze', { method: 'POST', credentials: 'include' });
+    if (!response.ok) {
+      const result = await response.json() as { message?: string };
+      setActionError(result.message ?? 'Snooze could not be confirmed');
+      setActionPending(false);
+      return;
+    }
+    setActionError('');
+    await refresh();
+    setActionPending(false);
+  }
+
+  const actionLabel = current?.status === 'ACCEPTED' ? 'Start work' : current?.status === 'IN_PROGRESS' ? 'Request completion' : 'Accept';
+  return (
+    <div className="mobile-page">
+      <main className="mobile-shell staff">
+        <header className="mobile-header"><div><span className="eyebrow">{profile?.scopes[0]?.event.name ?? 'Current shift'} · {connection === 'live' ? 'Live' : 'Reconnecting'}</span><h1>{profile?.name ?? 'Service workspace'}</h1></div><button className="duty" disabled={actionPending} onClick={() => void toggleAvailability()}>{availability === 'ON_DUTY' ? 'On duty' : 'Paused'}</button></header>
+        {current && ['ASSIGNED', 'SNOOZED'].includes(current.status) && <div className="alert-line">New assignment · Accept or use the single 10-minute snooze.</div>}
+        {current?.status === 'AWAITING_OTP' && <div className="alert-line">Waiting for stall OTP confirmation. You cannot close this ticket yourself.</div>}
+        {actionError && <div className="form-error" role="alert">{actionError}</div>}
+        {loading ? <p className="empty-state">Loading current task…</p> : loadError ? <p className="form-error">{loadError}</p> : current ? <TicketCard ticket={current} actions={['ASSIGNED', 'SNOOZED', 'ACCEPTED', 'IN_PROGRESS'].includes(current.status)} actionLabel={actionLabel} actionDisabled={actionPending} onAccept={() => void transition()} onSnooze={() => void snooze()} /> : <p className="empty-state">No current assignment.</p>}
+        <section><div className="section-title"><h2>Today</h2></div><div className="stats-row"><div><strong>{workload.completedToday}</strong><span>Completed</span></div><div><strong>{workload.activeCount}</strong><span>Active</span></div><div><strong>{workload.capacity}</strong><span>Capacity</span></div></div></section>
+        <section><div className="section-title"><h2>Recent history</h2></div>{history.length ? history.map((ticket) => <TicketCard key={ticket.id} ticket={ticket} />) : <p className="empty-state">No completed work yet.</p>}</section>
+        <nav className="bottom-nav" aria-label="Staff navigation"><b>Current task</b><span>History</span><button disabled={actionPending} onClick={() => void toggleAvailability()}>Availability</button><LogoutButton /></nav>
+      </main>
+    </div>
+  );
+}
+
+const navByRole: Record<'HALL_MANAGER' | 'ADMIN', string[]> = {
+  HALL_MANAGER: ['Hall overview', 'Live tickets', 'Staff', 'Exceptions', 'Search'],
+  ADMIN: ['Command center', 'Tickets', 'Halls / Zones / Stalls', 'Workforce', 'Reports', 'Masters', 'Audit'],
+};
+
+type TimingRecord = {
+  id: string;
+  eventTimezone: string;
+  createdAt: string;
+  firstAssignedAt: string | null;
+  firstAcceptedAt: string | null;
+  firstStartedAt: string | null;
+  completionRequestedAt: string | null;
+  closedAt: string | null;
+  raiseToAssignSeconds: number | null;
+  assignToAcceptSeconds: number | null;
+  mobilizationSeconds: number | null;
+  activeWorkSeconds: number | null;
+  otpWaitSeconds: number | null;
+  totalResolutionSeconds: number | null;
+  workCycles: Array<{ attempt: number; assignedAt: string; acceptedAt: string | null; startedAt: string | null; completionRequestedAt: string | null; releasedAt: string | null }>;
+};
+
+type TicketDetail = ApiTicket & {
+  firstAssignedAt?: string | null;
+  firstStartedAt?: string | null;
+  completionRequestedAt?: string | null;
+  events: Array<{ id: string; eventType: string; fromStatus: TicketStatus | null; toStatus: TicketStatus | null; metadata: unknown; createdAt: string; actor: { name: string } | null }>;
+  assignments: Array<{ id: string; assignedAt: string; acceptedAt: string | null; startedAt: string | null; completionRequestedAt: string | null; releasedAt: string | null; releaseReason: string | null; staff: { id?: string; name: string } }>;
+  complaints: Array<{ id: string; reasonCode: string; comment: string | null; createdAt: string; resolution: string | null }>;
+};
+
+function duration(value: number | null | undefined) {
+  if (value == null) return 'Pending';
+  if (value < 60) return value + 's';
+  return Math.floor(value / 60) + 'm ' + String(value % 60).padStart(2, '0') + 's';
+}
+
+function eventTime(value: string | null | undefined, timezone = 'UTC') {
+  if (!value) return 'Pending';
+  return new Intl.DateTimeFormat('en-IN', { timeZone: timezone, dateStyle: 'medium', timeStyle: 'short' }).format(new Date(value));
+}
+
+function TicketDrawer({ ticket, timing, detail, eligibleStaff, onPing, onReassign, onReopen, onEscalate, onOverrideClose, onAdvance, onPrioritize, onCancel, canAdmin, canAdvance, canEmergencyClose }: {
+  ticket: Ticket;
+  timing?: TimingRecord;
+  detail?: TicketDetail;
+  eligibleStaff: Array<{ user: { id: string; name: string }; pool: { category: string; subtype: string } }>;
+  onPing: (message: string) => Promise<unknown>;
+  onReassign: (staffId: string, reason: string) => Promise<unknown>;
+  onReopen: (reason: string) => Promise<unknown>;
+  onEscalate: (reason: string) => Promise<unknown>;
+  onOverrideClose: (reason: string) => Promise<unknown>;
+  onAdvance?: () => void;
+  onPrioritize: (reason: string) => Promise<unknown>;
+  onCancel: (reason: string) => Promise<unknown>;
+  canAdmin: boolean;
+  canAdvance: boolean;
+  canEmergencyClose: boolean;
+}) {
+  const [pendingAction, setPendingAction] = useState<'ping' | 'reassign' | 'reopen' | 'escalate' | 'override' | 'prioritize' | 'cancel' | null>(null);
+  const [submitting, setSubmitting] = useState(false);
+  const milestones = [
+    ['Raised', timing?.createdAt ?? detail?.createdAt],
+    ['Assigned', timing?.firstAssignedAt ?? detail?.firstAssignedAt],
+    ['Accepted', timing?.firstAcceptedAt ?? detail?.firstAcceptedAt],
+    ['Work started', timing?.firstStartedAt ?? detail?.firstStartedAt],
+    ['Completion requested', timing?.completionRequestedAt ?? detail?.completionRequestedAt],
+    ['Closed', timing?.closedAt ?? detail?.closedAt],
+  ];
+  return (
+    <aside className="drawer" aria-label={'Ticket ' + ticket.no + ' detail'}>
+      <div className="drawer-head"><div><span className="eyebrow">{ticket.no}</span><h2>{ticket.service}</h2></div><Status value={ticket.status} /></div>
+      <p className="description">{ticket.description}</p>
+      <div className="drawer-location">{ticket.location}</div>
+      <div className="timing"><h3>Service timing</h3><div className="timing-strip"><span><b>{duration(timing?.raiseToAssignSeconds)}</b>Dispatch</span><span><b>{duration(timing?.assignToAcceptSeconds)}</b>Response</span><span><b>{duration(timing?.mobilizationSeconds)}</b>Mobilize</span><span><b>{duration(timing?.activeWorkSeconds)}</b>Work</span><span><b>{duration(timing?.otpWaitSeconds)}</b>OTP wait</span><span><b>{duration(timing?.totalResolutionSeconds)}</b>Total</span></div></div>
+      <div className="timeline"><h3>Lifecycle milestones</h3>{milestones.map(([event, time], index) => <div key={event} className="timeline-item"><i className={time ? 'active' : ''}></i><div><strong>{event}</strong><span>{eventTime(time, timing?.eventTimezone)}</span></div><time>{index === 0 ? 'Server time' : ''}</time></div>)}</div>
+      {!!timing?.workCycles.length && <div className="cycles"><h3>Work cycles</h3>{timing.workCycles.map((cycle) => <div key={cycle.attempt}><strong>Attempt {cycle.attempt}</strong><span>{eventTime(cycle.assignedAt, timing.eventTimezone)} · {cycle.releasedAt ? 'Completed/released' : 'Active'}</span></div>)}</div>}
+      {!!detail?.complaints.length && <div className="cycles"><h3>Complaints</h3>{detail.complaints.map((complaint) => <div key={complaint.id}><strong>{complaint.reasonCode.replaceAll('_', ' ')}</strong><span>{complaint.comment || 'No additional note'} · {eventTime(complaint.createdAt, timing?.eventTimezone)}</span></div>)}</div>}
+      {!!detail?.events.length && <div className="timeline"><h3>Audit timeline</h3>{detail.events.map((event) => <div className="timeline-item" key={event.id}><i className="active"></i><div><strong>{event.eventType.replaceAll('_', ' ')}</strong><span>{event.actor?.name ?? 'System'} · {eventTime(event.createdAt, timing?.eventTimezone)}</span></div></div>)}</div>}
+      <div className="drawer-actions">
+        {canAdvance && ticket.service.startsWith('HALL MANAGER') && ['ASSIGNED', 'SNOOZED', 'ACCEPTED', 'IN_PROGRESS'].includes(ticket.status) && <button className="primary" onClick={onAdvance}>{ticket.status === 'ACCEPTED' ? 'Start work' : ticket.status === 'IN_PROGRESS' ? 'Request completion' : 'Accept'}</button>}
+        {['ASSIGNED', 'SNOOZED', 'ACCEPTED'].includes(ticket.status) && <><button onClick={() => setPendingAction('ping')}>Ping staff</button><button onClick={() => setPendingAction('reassign')}>Reassign</button></>}
+        {['CLOSED', 'COMPLAINT_RAISED'].includes(ticket.status) && <button onClick={() => setPendingAction('reopen')}>Reopen</button>}
+        {ticket.status === 'QUEUED' && <button onClick={() => setPendingAction('prioritize')}>Prioritize</button>}
+        {['SNOOZED', 'IN_PROGRESS', 'COMPLAINT_RAISED'].includes(ticket.status) && <button className="critical-button" onClick={() => setPendingAction('escalate')}>Escalate</button>}
+        {canEmergencyClose && ['AWAITING_OTP', 'ESCALATED'].includes(ticket.status) && <button className="critical-button" onClick={() => setPendingAction('override')}>Emergency close</button>}
+        {canAdmin && ['NEW', 'QUEUED'].includes(ticket.status) && <button className="critical-button" onClick={() => setPendingAction('cancel')}>Cancel</button>}
+      </div>
+      {pendingAction && <form className="authority-action" onSubmit={(event) => {
+        event.preventDefault();
+        if (submitting) return;
+        const values = new FormData(event.currentTarget);
+        const reason = String(values.get('reason') ?? '').trim();
+        const staffId = String(values.get('staffId') ?? '');
+        setSubmitting(true);
+        const action = pendingAction === 'ping' ? onPing(reason)
+          : pendingAction === 'reassign' ? onReassign(staffId, reason)
+            : pendingAction === 'reopen' ? onReopen(reason)
+              : pendingAction === 'escalate' ? onEscalate(reason)
+                : pendingAction === 'override' ? onOverrideClose(reason)
+                  : pendingAction === 'prioritize' ? onPrioritize(reason)
+                    : onCancel(reason);
+        void Promise.resolve(action)
+          .then((result) => { if (result !== false) setPendingAction(null); })
+          .catch(() => undefined)
+          .finally(() => setSubmitting(false));
+      }}>
+        {pendingAction === 'reassign' && <label>Eligible worker<select name="staffId" required disabled={submitting}><option value="">Choose worker</option>{eligibleStaff.map((membership) => <option key={membership.user.id} value={membership.user.id}>{membership.user.name} · {membership.pool.category} {membership.pool.subtype}</option>)}</select></label>}
+        <label>{pendingAction === 'ping' ? 'Message' : 'Required reason'}<textarea name="reason" required minLength={3} maxLength={500} disabled={submitting} /></label>
+        <div><button type="button" disabled={submitting} onClick={() => setPendingAction(null)}>Back</button><button className={['override', 'cancel'].includes(pendingAction) ? 'critical-button' : 'primary'} type="submit" disabled={submitting}>{submitting ? 'Confirming…' : 'Confirm action'}</button></div>
+      </form>}
+    </aside>
+  );
+}
+
+export function ManagementWorkspace({ role }: { role: 'HALL_MANAGER' | 'ADMIN' }) {
+  const profile = useProfile();
+  const [selected, setSelected] = useState<Ticket | null>(null);
+  const [statusFilter, setStatusFilter] = useState('');
+  const [categoryFilter, setCategoryFilter] = useState('');
+  const [search, setSearch] = useState('');
+  const [debouncedSearch, setDebouncedSearch] = useState('');
+  useEffect(() => {
+    const timer = setTimeout(() => setDebouncedSearch(search.trim()), 300);
+    return () => clearTimeout(timer);
+  }, [search]);
+  const ticketQuery = new URLSearchParams({
+    view: 'all',
+    ...(statusFilter ? { status: statusFilter } : {}),
+    ...(categoryFilter ? { category: categoryFilter } : {}),
+    ...(debouncedSearch ? { search: debouncedSearch } : {}),
+  }).toString();
+  const { items, total, nextCursor, loading, error: loadError, refresh, loadMore, connection, lastUpdatedAt } = useApiTickets(ticketQuery);
+  const [timings, setTimings] = useState<Record<string, TimingRecord>>({});
+  const [liveMetrics, setLiveMetrics] = useState<Record<string, number>>({});
+  const [detail, setDetail] = useState<TicketDetail>();
+  const [managementError, setManagementError] = useState('');
+  const [notifications, setNotifications] = useState<Array<{ id: string; type: string; readAt: string | null; sentAt: string }>>([]);
+  const [showNotifications, setShowNotifications] = useState(false);
+  const [workforce, setWorkforce] = useState<Array<{ id?: string; user: { id: string; name: string; email?: string; employeeCode?: string | null; status?: string; role?: string }; availability: string; capacity?: number; activeCount?: number; pool: { id?: string; category: string; subtype: string; hallId?: string | null } }>>([]);
+  const [showAddPerson, setShowAddPerson] = useState(false);
+  const [personFormError, setPersonFormError] = useState('');
+  const [personSubmitting, setPersonSubmitting] = useState(false);
+  const [activeSection, setActiveSection] = useState(navByRole[role][0]);
+  const [exceptions, setExceptions] = useState<Ticket[]>([]);
+  const [auditEvents, setAuditEvents] = useState<Array<{ id: string; eventType: string; createdAt: string; actor: { name: string } | null; ticket: { publicNo: string } }>>([]);
+  const [masters, setMasters] = useState<Array<{ id: string; name: string; halls: Array<{ id: string; name: string; zones: Array<{ id: string; code: string; stalls: Array<{ id: string; stallCode: string }> }> }>; pools: Array<{ id: string; category: string; subtype: string; responseTargetSeconds: number; resolutionTargetSeconds: number; active: boolean }> }>>([]);
+  const [exports, setExports] = useState<Array<{ id: string; format: string; status: string; rowCount: number | null; createdAt: string }>>([]);
+  useAuthLoss(() => {
+    setSelected(null);
+    setTimings({});
+    setLiveMetrics({});
+    setDetail(undefined);
+    setNotifications([]);
+    setWorkforce([]);
+    setExceptions([]);
+    setAuditEvents([]);
+    setMasters([]);
+    setExports([]);
+  });
+  const title = role === 'HALL_MANAGER' ? (profile?.scopes[0]?.hall?.name ?? 'Hall') + ' operations' : 'Event command center';
+  const metrics = [
+    { label: 'Open now', value: String(liveMetrics.open ?? '—') },
+    { label: 'Queued', value: String(liveMetrics.queued ?? '—') },
+    { label: 'Response overdue', value: String(liveMetrics.overdue ?? '—'), critical: true },
+    { label: 'Escalated & complaints', value: String((liveMetrics.escalated ?? 0) + (liveMetrics.complaints ?? 0)), critical: true },
+    { label: 'Closed today', value: String(liveMetrics.closedToday ?? '—') },
+    { label: 'SLA breached', value: String(liveMetrics.slaBreached ?? '—'), critical: true },
+    { label: 'Avg. response', value: duration(liveMetrics.avgResponseSeconds) },
+  ];
+
+  useEffect(() => {
+    setSelected((current) => current ? items.find((ticket) => ticket.id === current.id) ?? null : items[0] ?? null);
+  }, [items]);
+
+  const loadManagement = useCallback(async () => {
+    try {
+      const [metricResponse, timingResponse] = await Promise.all([
+      apiFetch('/api/management/metrics', { credentials: 'include', cache: 'no-store' }),
+      apiFetch('/api/management/timing', { credentials: 'include', cache: 'no-store' }),
+      ]);
+      const errors: string[] = [];
+      if (metricResponse.ok) {
+        setLiveMetrics(await metricResponse.json() as Record<string, number>);
+      } else {
+        setLiveMetrics({});
+        errors.push('Live metrics are unavailable');
+      }
+      if (timingResponse.ok) {
+        const values = await timingResponse.json() as TimingRecord[];
+        setTimings(Object.fromEntries(values.map((value) => [value.id, value])));
+      } else {
+        setTimings({});
+        errors.push('Timing data is unavailable');
+      }
+      setManagementError(errors.join('. '));
+    } catch {
+      setLiveMetrics({});
+      setTimings({});
+      setManagementError('Management APIs are unavailable');
+    }
+  }, []);
+  useEffect(() => { void loadManagement(); }, [loadManagement, lastUpdatedAt]);
+
+  useEffect(() => {
+    async function loadOperationalPanels() {
+      const requests = [
+        apiFetch('/api/workforce', { credentials: 'include', cache: 'no-store' }),
+        apiFetch('/api/management/exceptions', { credentials: 'include', cache: 'no-store' }),
+        apiFetch('/api/management/audit', { credentials: 'include', cache: 'no-store' }),
+      ];
+      const responses = await Promise.all(requests);
+      if (responses[0].ok) setWorkforce(await responses[0].json() as typeof workforce);
+      if (responses[1].ok) setExceptions(((await responses[1].json()) as ApiTicket[]).map(mapTicket));
+      if (responses[2].ok) setAuditEvents(await responses[2].json() as typeof auditEvents);
+    }
+    void loadOperationalPanels().catch(() => setManagementError('Operational panels could not be loaded'));
+  }, [lastUpdatedAt]);
+
+  useEffect(() => {
+    if (role !== 'ADMIN') return;
+    void Promise.all([
+      apiFetch('/api/management/masters', { credentials: 'include', cache: 'no-store' }),
+      apiFetch('/api/management/exports', { credentials: 'include', cache: 'no-store' }),
+    ]).then(async ([mastersResponse, exportsResponse]) => {
+      if (mastersResponse.ok) setMasters(await mastersResponse.json() as typeof masters);
+      if (exportsResponse.ok) setExports(await exportsResponse.json() as typeof exports);
+    }).catch(() => setManagementError('Administration data could not be loaded'));
+  }, [role]);
+
+  useEffect(() => {
+    if (!selected) { setDetail(undefined); return; }
+    void apiFetch('/api/tickets/' + selected.id, { credentials: 'include', cache: 'no-store' })
+      .then((response) => response.ok ? response.json() as Promise<TicketDetail> : undefined)
+      .then(setDetail)
+      .catch(() => setManagementError('Ticket detail could not be loaded'));
+  }, [selected, lastUpdatedAt]);
+
+  async function loadNotifications() {
+    const response = await apiFetch('/api/notifications', { credentials: 'include', cache: 'no-store' });
+    if (!response.ok) { setManagementError('Notifications could not be loaded'); return; }
+    setNotifications(await response.json() as typeof notifications);
+    setShowNotifications((value) => !value);
+  }
+
+  async function runTicketAction(path: string, body: object) {
+    if (!selected) return;
+    const response = await apiFetch('/api/tickets/' + selected.id + path, {
+      method: 'POST',
+      credentials: 'include',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const result = await response.json() as { message?: string };
+    if (!response.ok) { setManagementError(result.message ?? 'Ticket action failed'); return false; }
+    setManagementError('');
+    await refresh();
+    return true;
+  }
+
+  async function transitionSelected(to: TicketStatus, reason: string) {
+    return runTicketAction('/transition', { to, reason });
+  }
+
+  async function reassignSelected(staffId: string, reason: string) {
+    if (!selected) return false;
+    const response = await apiFetch('/api/workforce/tickets/' + selected.id + '/reassign', {
+      method: 'PATCH',
+      credentials: 'include',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ staffId, reason }),
+    });
+    if (!response.ok) {
+      const result = await response.json() as { message?: string };
+      setManagementError(result.message ?? 'Reassignment failed');
+      return false;
+    }
+    setManagementError('');
+    await refresh();
+    return true;
+  }
+
+  async function exportView() {
+    const response = await apiFetch('/api/management/exports', {
+      method: 'POST',
+      credentials: 'include',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ format: 'CSV', filters: { status: statusFilter || undefined, category: categoryFilter || undefined, search: search || undefined }, columns: [] }),
+    });
+    setManagementError(response.ok ? 'Export queued. It will appear in Reports when ready.' : 'Export could not be queued');
+  }
+
+  async function createMaster(type: 'hall' | 'zone' | 'stall') {
+    const eventId = profile?.scopes[0]?.event.id;
+    if (!eventId) return;
+    let body: Record<string, string> = { eventId };
+    if (type === 'hall') {
+      const code = window.prompt('Hall code');
+      const name = code ? window.prompt('Hall name') : null;
+      if (!code || !name) return;
+      body = { ...body, code, name };
+    } else if (type === 'zone') {
+      const hallId = window.prompt('Parent hall ID');
+      const code = hallId ? window.prompt('Zone code') : null;
+      if (!hallId || !code) return;
+      body = { ...body, hallId, code };
+    } else {
+      const zoneId = window.prompt('Parent zone ID');
+      const stallCode = zoneId ? window.prompt('Stall code') : null;
+      const exhibitorName = stallCode ? window.prompt('Exhibitor name') : null;
+      if (!zoneId || !stallCode || !exhibitorName) return;
+      body = { ...body, zoneId, stallCode, exhibitorName };
+    }
+    const response = await apiFetch('/api/management/masters/' + type, {
+      method: 'POST',
+      credentials: 'include',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (!response.ok) { setManagementError('Master record could not be created'); return; }
+    window.location.reload();
+  }
+
+  async function createPerson(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (personSubmitting) return;
+    setPersonSubmitting(true);
+    setPersonFormError('');
+    const values = new FormData(event.currentTarget);
+    const eventId = profile?.scopes[0]?.event.id;
+    const hallId = profile?.scopes.find((scope) => scope.hall)?.hall?.id ?? profile?.scopes[0]?.hall?.id;
+    if (!eventId) {
+      setPersonFormError('Event scope is required to create a person');
+      setPersonSubmitting(false);
+      return;
+    }
+    const role = String(values.get('role') ?? 'STAFF');
+    const body: Record<string, unknown> = {
+      name: String(values.get('name') ?? '').trim(),
+      email: String(values.get('email') ?? '').trim().toLowerCase(),
+      phone: String(values.get('phone') ?? '').trim() || undefined,
+      password: String(values.get('password') ?? ''),
+      role,
+      eventId,
+      hallId: role === 'ADMIN' ? undefined : (hallId || String(values.get('hallId') ?? '') || undefined),
+      capacity: Number(values.get('capacity') || 1),
+      employeeCode: String(values.get('employeeCode') ?? '').trim().toUpperCase() || undefined,
+    };
+    if (role === 'STAFF') {
+      body.serviceCategory = String(values.get('serviceCategory') ?? '');
+      body.serviceSubtype = String(values.get('serviceSubtype') ?? '');
+    }
+    const response = await apiFetch('/api/workforce/people', {
+      method: 'POST',
+      credentials: 'include',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const result = await response.json().catch(() => ({})) as { message?: string };
+    if (!response.ok) {
+      setPersonFormError(result.message ?? 'Person could not be created');
+      setPersonSubmitting(false);
+      return;
+    }
+    setShowAddPerson(false);
+    setPersonSubmitting(false);
+    setManagementError(`Created account for ${body.name as string}`);
+    const list = await apiFetch('/api/workforce', { credentials: 'include', cache: 'no-store' });
+    if (list.ok) setWorkforce(await list.json() as typeof workforce);
+  }
+
+  async function updatePersonStatus(userId: string, status: 'ACTIVE' | 'DISABLED') {
+    const response = await apiFetch('/api/workforce/people/' + userId, {
+      method: 'PATCH',
+      credentials: 'include',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ status }),
+    });
+    if (!response.ok) {
+      const result = await response.json().catch(() => ({})) as { message?: string };
+      setManagementError(result.message ?? 'Person status could not be updated');
+      return;
+    }
+    const list = await apiFetch('/api/workforce', { credentials: 'include', cache: 'no-store' });
+    if (list.ok) setWorkforce(await list.json() as typeof workforce);
+  }
+
+  async function updatePersonCapacity(userId: string, capacity: number) {
+    const response = await apiFetch('/api/workforce/people/' + userId, {
+      method: 'PATCH',
+      credentials: 'include',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ capacity }),
+    });
+    if (!response.ok) {
+      const result = await response.json().catch(() => ({})) as { message?: string };
+      setManagementError(result.message ?? 'Capacity could not be updated');
+      return;
+    }
+    const list = await apiFetch('/api/workforce', { credentials: 'include', cache: 'no-store' });
+    if (list.ok) setWorkforce(await list.json() as typeof workforce);
+  }
+
+  async function updatePool(pool: { id: string; responseTargetSeconds: number; resolutionTargetSeconds: number; active: boolean }) {
+    const responseTargetSeconds = Number(window.prompt('Response SLA in seconds', String(pool.responseTargetSeconds)));
+    const resolutionTargetSeconds = Number(window.prompt('Resolution SLA in seconds', String(pool.resolutionTargetSeconds)));
+    if (!Number.isInteger(responseTargetSeconds) || !Number.isInteger(resolutionTargetSeconds)) return;
+    const response = await apiFetch('/api/management/masters/pools/' + pool.id, {
+      method: 'PATCH',
+      credentials: 'include',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ responseTargetSeconds, resolutionTargetSeconds, active: pool.active }),
+    });
+    if (!response.ok) { setManagementError('Service pool could not be updated'); return; }
+    window.location.reload();
+  }
+
+  return (
+    <div className="app-shell">
+      <aside className="sidebar">
+        <div className="brand"><span>E</span>EveOps</div>
+        <nav aria-label={role === 'ADMIN' ? 'Admin navigation' : 'Hall Manager navigation'}>
+          {navByRole[role].map((item) => <button className={activeSection === item ? 'active' : ''} onClick={() => setActiveSection(item)} key={item}>{item}{item === 'Live tickets' && <i>{liveMetrics.open ?? 0}</i>}{item === 'Exceptions' && <i>{(liveMetrics.overdue ?? 0) + (liveMetrics.escalated ?? 0) + (liveMetrics.complaints ?? 0)}</i>}</button>)}
+        </nav>
+        <div className="user"><span>{role === 'ADMIN' ? 'AD' : 'HM'}</span><div><strong>{profile?.name ?? (role === 'ADMIN' ? 'Event Admin' : 'Hall Manager')}</strong><small>{role.replace('_', ' ')}</small></div></div>
+        <LogoutButton />
+      </aside>
+      <main className="management">
+        <header className="topbar"><div><span className="eyebrow">{profile?.scopes[0]?.event.name ?? 'EveOps event'} · {connection === 'live' ? 'Live' : 'Reconnecting'}</span><h1>{title}</h1></div><div className="top-actions"><span>{profile?.scopes[0]?.hall?.name ?? 'All scoped halls'}</span><button onClick={() => void loadNotifications()}>Notifications · {notifications.filter((notification) => !notification.readAt).length}</button></div></header>
+        {managementError && <div className={managementError.startsWith('Export queued') || managementError.startsWith('Created account') ? 'alert-line' : 'form-error'} role="status">{managementError}</div>}
+        {showNotifications && <section className="notification-panel">{notifications.length ? notifications.slice(0, 10).map((notification) => <button key={notification.id} onClick={() => void apiFetch('/api/notifications/' + notification.id + '/read', { method: 'PATCH', credentials: 'include' }).then(() => loadNotifications())}><strong>{notification.type.replaceAll('_', ' ')}</strong><span>{eventTime(notification.sentAt)}</span></button>) : <p className="empty-state">No notifications.</p>}</section>}
+        <section className="metric-grid" aria-label="Operational metrics">{metrics.map((metric) => <article key={metric.label} className={metric.critical ? 'metric critical' : 'metric'}><span>{metric.label}</span><strong>{metric.value}</strong><small>Updated live</small></article>)}</section>
+        {(activeSection === 'Staff' || activeSection === 'Workforce') && <section className="portfolio-list"><div className="section-title"><div><h2>Workforce</h2><p>Create and manage operational identities in your authorized scope. Ticket age is separate and never edited here.</p></div><button onClick={() => { setShowAddPerson((value) => !value); setPersonFormError(''); }}>{showAddPerson ? 'Close form' : 'Add person'}</button></div>{showAddPerson && <form className="authority-action" onSubmit={(event) => void createPerson(event)}><label>Name<input name="name" required minLength={2} /></label><label>Login email<input name="email" type="email" required /></label><label>Phone<input name="phone" /></label><label>Temporary password<input name="password" type="password" required minLength={8} /></label><label>Public person ID (optional)<input name="employeeCode" placeholder="STF-00012" /></label><label>Role<select name="role" required defaultValue="STAFF">{role === 'HALL_MANAGER' ? <option value="STAFF">Service Staff</option> : <><option value="STAFF">Service Staff</option><option value="HALL_MANAGER">Hall Manager</option></>}</select></label><label>Service category<select name="serviceCategory" defaultValue="HOUSE_HELP"><option value="ELECTRICAL">Electrical</option><option value="HOUSE_HELP">House Help</option></select></label><label>Service subtype<select name="serviceSubtype" defaultValue="General"><option value="General">General</option><option value="Lighting">Lighting</option><option value="NCP">NCP</option></select></label><label>Capacity<input name="capacity" type="number" min={1} max={20} defaultValue={1} /></label>{personFormError && <p className="form-error" role="alert">{personFormError}</p>}<button className="primary" type="submit" disabled={personSubmitting}>{personSubmitting ? 'Creating…' : 'Create account'}</button></form>}{workforce.map((membership) => <article key={membership.user.id + membership.pool.category + membership.pool.subtype}><div><strong>{membership.user.name}</strong><span>{membership.user.employeeCode ?? 'No public ID'} · {membership.user.email ?? membership.user.id}</span></div><div><span>Service</span><strong>{membership.pool.category} · {membership.pool.subtype}</strong></div><div><span>Availability</span><strong>{membership.availability.replaceAll('_', ' ')}</strong></div><div><span>Load</span><strong>{membership.activeCount ?? 0}/{membership.capacity ?? 1}</strong></div><div><span>Status</span><strong>{membership.user.status ?? 'ACTIVE'}</strong></div><div className="drawer-actions"><button type="button" onClick={() => { const next = Number(window.prompt('Capacity', String(membership.capacity ?? 1))); if (Number.isInteger(next) && next >= 1) void updatePersonCapacity(membership.user.id, next); }}>Edit capacity</button><button type="button" onClick={() => void updatePersonStatus(membership.user.id, membership.user.status === 'DISABLED' ? 'ACTIVE' : 'DISABLED')}>{membership.user.status === 'DISABLED' ? 'Activate' : 'Deactivate'}</button></div></article>)}</section>}
+        {activeSection === 'Exceptions' && <section className="portfolio-list"><div className="section-title"><div><h2>Exception inbox</h2><p>Queued, overdue, complaint, reopened, and escalated tickets</p></div></div>{exceptions.length ? exceptions.map((ticket) => <TicketCard key={ticket.id} ticket={ticket} />) : <p className="empty-state">No unresolved exceptions.</p>}</section>}
+        {activeSection === 'Audit' && <section className="portfolio-list"><div className="section-title"><div><h2>Audit history</h2><p>Append-only scoped operational events</p></div></div>{auditEvents.map((event) => <article key={event.id}><div><strong>{event.ticket.publicNo}</strong><span>{event.actor?.name ?? 'System'}</span></div><div><span>Action</span><strong>{event.eventType.replaceAll('_', ' ')}</strong></div><div><span>Server time</span><strong>{eventTime(event.createdAt)}</strong></div></article>)}</section>}
+        {(activeSection === 'Masters' || activeSection === 'Halls / Zones / Stalls') && <section className="portfolio-list"><div className="section-title"><div><h2>Event masters</h2><p>Authorized hierarchy and SLA configuration</p></div><div><button onClick={() => void createMaster('hall')}>Add hall</button><button onClick={() => void createMaster('zone')}>Add zone</button><button onClick={() => void createMaster('stall')}>Add stall</button></div></div>{masters.map((event) => <div key={event.id}><article><div><strong>{event.name}</strong><span>Event ID: {event.id}</span></div><div><span>Halls</span><strong>{event.halls.length}</strong></div><div><span>Zones</span><strong>{event.halls.reduce((sum, hall) => sum + hall.zones.length, 0)}</strong></div><div><span>Stalls</span><strong>{event.halls.reduce((sum, hall) => sum + hall.zones.reduce((zoneSum, zone) => zoneSum + zone.stalls.length, 0), 0)}</strong></div></article>{event.halls.map((hall) => <article key={hall.id}><div><strong>{hall.name}</strong><span>Hall ID: {hall.id}</span></div><div><span>Zones</span><strong>{hall.zones.map((zone) => `${zone.code} (${zone.id})`).join(', ') || 'None'}</strong></div><div><span>Stalls</span><strong>{hall.zones.flatMap((zone) => zone.stalls.map((stall) => `${stall.stallCode} (${stall.id})`)).join(', ') || 'None'}</strong></div></article>)}{event.pools.map((pool) => <article key={pool.id}><div><strong>{pool.category} · {pool.subtype}</strong><span>{pool.active ? 'Active' : 'Inactive'}</span></div><div><span>Response SLA</span><strong>{duration(pool.responseTargetSeconds)}</strong></div><div><span>Resolution SLA</span><strong>{duration(pool.resolutionTargetSeconds)}</strong></div><button onClick={() => void updatePool(pool)}>Edit SLA</button></article>)}</div>)}</section>}
+        {(activeSection === 'Reports') && <section className="portfolio-list"><div className="section-title"><div><h2>Export jobs</h2><p>Filter snapshots are re-authorized at generation and download</p></div></div>{exports.length ? exports.map((job) => <article key={job.id}><div><strong>{job.format}</strong><span>{eventTime(job.createdAt)}</span></div><div><span>Status</span><strong>{job.status}</strong></div><div><span>Rows</span><strong>{job.rowCount ?? 'Pending'}</strong></div>{job.status === 'READY' && <a href={'/api/management/exports/' + job.id + '/download'}>Download</a>}</article>) : <p className="empty-state">No export jobs yet.</p>}</section>}
+        <section className="workspace">
+          <div className="operations">
+            <div className="section-title"><div><h2>Live operations</h2><p>{total} scoped tickets · server-authoritative status</p></div>{role === 'ADMIN' && <button onClick={() => void exportView()}>Export view</button>}</div>
+            <div className="filters"><select aria-label="Status filter" value={statusFilter} onChange={(event) => setStatusFilter(event.target.value)}><option value="">All statuses</option>{Object.keys(statusLabels).map((status) => <option key={status} value={status}>{statusLabels[status as TicketStatus]}</option>)}</select><select aria-label="Service filter" value={categoryFilter} onChange={(event) => setCategoryFilter(event.target.value)}><option value="">All services</option><option value="ELECTRICAL">Electrical</option><option value="HOUSE_HELP">House Help</option><option value="HALL_MANAGER">Hall Manager</option></select><label className="sr-only" htmlFor="ticket-search">Search tickets</label><input id="ticket-search" value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search ticket or stall" /></div>
+            {loading ? <p className="empty-state">Loading live operations…</p> : loadError ? <p className="form-error">{loadError}</p> : !items.length ? <p className="empty-state">No tickets match the current scope. Clear filters to see all tickets.</p> : <><div className="table-wrap"><table><thead><tr><th>Ticket</th><th>Location / issue</th><th>Status</th><th>Age</th><th>Assignee</th><th>SLA</th></tr></thead><tbody>{items.map((ticket) => <tr key={ticket.no} tabIndex={0} className={selected?.no === ticket.no ? 'selected' : ''} onClick={() => setSelected(ticket)} onKeyDown={(event) => { if (event.key === 'Enter') setSelected(ticket); }}><td><strong>{ticket.no}</strong><small>{ticket.service}</small></td><td><strong>{ticket.location}</strong><small>{ticket.description}</small></td><td><Status value={ticket.status} /></td><td className={ticket.priority ? 'red' : ''}>{ticket.age}</td><td>{ticket.assignee}</td><td><span className={ticket.slaState === 'On track' ? 'sla' : 'sla breach'}>{ticket.slaState}</span></td></tr>)}</tbody></table></div>{nextCursor && <button onClick={() => void loadMore()}>Load more</button>}</>}
+          </div>
+          {selected && <TicketDrawer ticket={selected} timing={timings[selected.id]} detail={detail} canAdmin={role === 'ADMIN'} canEmergencyClose={selected.capabilities.emergencyClose} canAdvance={selected.capabilities.advanceHallManagerWork} eligibleStaff={workforce.filter((membership) => membership.availability === 'ON_DUTY')} onAdvance={() => void runTicketAction('/transition', { to: selected.status === 'ACCEPTED' ? 'IN_PROGRESS' : selected.status === 'IN_PROGRESS' ? 'AWAITING_OTP' : 'ACCEPTED' })} onPing={(message) => runTicketAction('/ping', { message })} onReassign={reassignSelected} onReopen={(reason) => transitionSelected('REOPENED', reason)} onEscalate={(reason) => transitionSelected('ESCALATED', reason)} onPrioritize={(reason) => runTicketAction('/prioritize', { reason })} onCancel={(reason) => transitionSelected('CANCELLED', reason)} onOverrideClose={(reason) => runTicketAction('/override-close', { reason })} />}
+        </section>
+      </main>
+    </div>
+  );
+}
+
+type PortfolioEvent = { id: string; event: string; venue: string; open: number; exceptions: number; avgResponseSeconds: number | null; medianResponseSeconds: number | null; portfolioMedianResponseSeconds: number | null };
+
+export function SuperAdminWorkspace() {
+  const profile = useProfile();
+  const [activeSection, setActiveSection] = useState('Portfolio overview');
+  const [portfolio, setPortfolio] = useState<PortfolioEvent[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState('');
+  const [selectedEvent, setSelectedEvent] = useState('');
+  const [admins, setAdmins] = useState<Array<{ id: string; name: string; email: string; status: string; scopes: Array<{ event: { name: string } }> }>>([]);
+  const [governanceAudit, setGovernanceAudit] = useState<Array<{ id: string; eventType: string; createdAt: string; ticket: { publicNo: string }; actor: { name: string } | null }>>([]);
+  const [governanceExports, setGovernanceExports] = useState<Array<{ id: string; format: string; status: string; rowCount: number | null; createdAt: string }>>([]);
+  useAuthLoss(() => {
+    setPortfolio([]);
+    setAdmins([]);
+    setGovernanceAudit([]);
+    setGovernanceExports([]);
+    setSelectedEvent('');
+  });
+  const { items: eventTickets, total: eventTicketTotal } = useApiTickets(selectedEvent ? 'eventId=' + encodeURIComponent(selectedEvent) + '&view=all' : 'view=all&limit=20');
+  useEffect(() => {
+    void apiFetch('/api/management/portfolio', { credentials: 'include', cache: 'no-store' })
+      .then((response) => {
+        if (!response.ok) throw new Error('Portfolio could not be loaded');
+        return response.json() as Promise<PortfolioEvent[]>;
+      })
+      .then((values: PortfolioEvent[]) => setPortfolio(values))
+      .catch((cause) => setError(cause instanceof Error ? cause.message : 'Portfolio could not be loaded'))
+      .finally(() => setLoading(false));
+  }, []);
+  useEffect(() => {
+    void Promise.all([
+      apiFetch('/api/management/admins', { credentials: 'include', cache: 'no-store' }),
+      apiFetch('/api/management/audit', { credentials: 'include', cache: 'no-store' }),
+      apiFetch('/api/management/exports', { credentials: 'include', cache: 'no-store' }),
+    ]).then(async ([adminResponse, auditResponse, exportResponse]) => {
+      if (adminResponse.ok) setAdmins(await adminResponse.json() as typeof admins);
+      if (auditResponse.ok) setGovernanceAudit(await auditResponse.json() as typeof governanceAudit);
+      if (exportResponse.ok) setGovernanceExports(await exportResponse.json() as typeof governanceExports);
+    }).catch(() => setError('Governance data could not be loaded'));
+  }, []);
+  const totalOpen = portfolio.reduce((sum, event) => sum + event.open, 0);
+  const totalExceptions = portfolio.reduce((sum, event) => sum + event.exceptions, 0);
+  const medianResponse = portfolio[0]?.portfolioMedianResponseSeconds == null ? '—' : duration(portfolio[0].portfolioMedianResponseSeconds);
+  async function exportPortfolio() {
+    const response = await apiFetch('/api/management/exports', {
+      method: 'POST',
+      credentials: 'include',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ format: 'CSV', filters: selectedEvent ? { eventId: selectedEvent } : {}, columns: [] }),
+    });
+    setError(response.ok ? 'Portfolio export queued.' : 'Portfolio export could not be queued.');
+  }
+  async function createAdmin() {
+    const name = window.prompt('Admin name');
+    const email = name ? window.prompt('Admin email') : null;
+    const password = email ? window.prompt('Temporary password (minimum 12 characters)') : null;
+    const eventIds = password ? window.prompt('Authorized event IDs, comma separated', selectedEvent || portfolio.map((event) => event.id).join(',')) : null;
+    if (!name || !email || !password || !eventIds) return;
+    const response = await apiFetch('/api/management/admins', {
+      method: 'POST',
+      credentials: 'include',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ name, email, password, eventIds: eventIds.split(',').map((value) => value.trim()).filter(Boolean) }),
+    });
+    setError(response.ok ? 'Admin account created.' : 'Admin account could not be created.');
+  }
+  return (
+    <div className="app-shell super-shell">
+      <aside className="sidebar">
+        <div className="brand"><span>E</span>EveOps</div>
+        <nav aria-label="SuperAdmin navigation">{['Portfolio overview', 'Events', 'Tickets', 'Analytics', 'Exports', 'Configuration', 'Admins', 'Audit'].map((item) => <button className={activeSection === item ? 'active' : ''} onClick={() => setActiveSection(item)} key={item}>{item}</button>)}</nav>
+        <div className="user"><span>SA</span><div><strong>{profile?.name ?? 'Organization owner'}</strong><small>SUPER ADMIN</small></div></div>
+        <LogoutButton />
+      </aside>
+      <main className="management">
+        <header className="topbar"><div><span className="eyebrow">Organization governance</span><h1>Portfolio overview</h1></div><div className="top-actions"><select aria-label="Event" value={selectedEvent} onChange={(event) => setSelectedEvent(event.target.value)}><option value="">All authorized events</option>{portfolio.map((event) => <option key={event.id} value={event.id}>{event.event}</option>)}</select><button>Exceptions · {totalExceptions}</button></div></header>
+        {error && <div className={error.endsWith('queued.') ? 'alert-line' : 'form-error'}>{error}</div>}
+        <section className="portfolio-hero"><div><span>Authorized events</span><strong>{portfolio.length}</strong></div><div><span>Open tickets</span><strong>{totalOpen}</strong></div><div><span>Cross-event exceptions</span><strong className="red">{totalExceptions}</strong></div><div><span>Median response</span><strong>{medianResponse}</strong></div></section>
+        <section className="portfolio-list"><div className="section-title"><div><h2>Event performance</h2><p>Cross-event operational comparison</p></div><button onClick={() => void exportPortfolio()}>Export portfolio</button></div>{loading ? <p className="empty-state">Loading authorized events…</p> : portfolio.length ? portfolio.map((event) => <article key={event.id}><div><strong>{event.event}</strong><span>{event.venue}</span></div><div><span>Open</span><strong>{event.open}</strong></div><div><span>Exceptions</span><strong className="red">{event.exceptions}</strong></div><div><span>Avg. response</span><strong>{duration(event.avgResponseSeconds)}</strong></div><button onClick={() => setSelectedEvent(event.id)}>Open event</button></article>) : <p className="empty-state">No events are assigned to this governance account.</p>}</section>
+        <section className="portfolio-list"><div className="section-title"><div><h2>{selectedEvent ? 'Selected event tickets' : 'Cross-event ticket explorer'}</h2><p>{eventTicketTotal} authorized tickets</p></div></div>{eventTickets.slice(0, 20).map((ticket) => <article key={ticket.id}><div><strong>{ticket.no}</strong><span>{ticket.location}</span></div><div><span>Status</span><Status value={ticket.status} /></div><div><span>Service</span><strong>{ticket.service}</strong></div><div><span>Age</span><strong>{ticket.age}</strong></div></article>)}</section>
+        {activeSection === 'Admins' && <section className="portfolio-list"><div className="section-title"><div><h2>Organization admins</h2><p>Event-scoped operational administrators</p></div><button onClick={() => void createAdmin()}>Add admin</button></div>{admins.map((admin) => <article key={admin.id}><div><strong>{admin.name}</strong><span>{admin.email}</span></div><div><span>Status</span><strong>{admin.status}</strong></div><div><span>Events</span><strong>{admin.scopes.map((scope) => scope.event.name).join(', ')}</strong></div></article>)}</section>}
+        {activeSection === 'Audit' && <section className="portfolio-list"><div className="section-title"><div><h2>Cross-event audit</h2><p>Immutable ticket lifecycle activity</p></div></div>{governanceAudit.map((event) => <article key={event.id}><div><strong>{event.ticket.publicNo}</strong><span>{event.actor?.name ?? 'System'}</span></div><div><span>Action</span><strong>{event.eventType.replaceAll('_', ' ')}</strong></div><div><span>Time</span><strong>{eventTime(event.createdAt)}</strong></div></article>)}</section>}
+        {activeSection === 'Exports' && <section className="portfolio-list"><div className="section-title"><div><h2>Export center</h2><p>Authorized cross-event reports</p></div></div>{governanceExports.map((job) => <article key={job.id}><div><strong>{job.format}</strong><span>{eventTime(job.createdAt)}</span></div><div><span>Status</span><strong>{job.status}</strong></div><div><span>Rows</span><strong>{job.rowCount ?? 'Pending'}</strong></div>{job.status === 'READY' && <a href={'/api/management/exports/' + job.id + '/download'}>Download</a>}</article>)}</section>}
+      </main>
+    </div>
+  );
+}

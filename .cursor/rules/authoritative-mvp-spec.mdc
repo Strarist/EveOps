@@ -1,0 +1,27 @@
+---
+description: Treat the four EveOps MVP specifications as authoritative for every implementation decision
+alwaysApply: true
+---
+
+# EveOps authoritative MVP specification
+
+Before proposing architecture, changing models, implementing workflows, or altering permissions, read in order:
+
+1. `01-product-plan.md`
+2. `02-workflow.md`
+3. `03-ui-ux-spec.md`
+4. `04-rules-permissions.md`
+
+In the implementation plan, cite the relevant document sections before editing.
+
+- The Ticket is the permanent identity and single history for assignment, status, notification, OTP, complaint, reopen, escalation, and export activity.
+- Preserve Organization → Event → Hall → Zone → Stall and carry `eventId` on operational records.
+- Derive Stall location from authenticated scope.
+- Use server UTC timestamps; render in the Event timezone.
+- Preserve every assignment/reopen work cycle and expose raw milestones plus derived durations.
+- Keep compatible-pool queues FIFO unless a Hall Manager/Admin records a reasoned priority override.
+- Enforce one active assignee. Staff may Accept or Snooze once; they cannot reject or transfer.
+- Close normally only through stall-verified OTP. Record emergency closure as a separate reasoned override.
+- Keep audit events append-only and enforce role plus object scope in the API.
+
+If code conflicts with the specifications, the specifications win unless the user explicitly changes a requirement. Do not invent business rules already defined there.

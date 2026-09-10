@@ -1,0 +1,444 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Role {
+  STALL
+  STAFF
+  HALL_MANAGER
+  ADMIN
+  SUPER_ADMIN
+}
+
+enum UserStatus {
+  ACTIVE
+  DISABLED
+}
+
+enum EventStatus {
+  DRAFT
+  ACTIVE
+  CLOSED
+  ARCHIVED
+}
+
+enum Availability {
+  ON_DUTY
+  PAUSED
+  OFF_DUTY
+  OFFLINE
+}
+
+enum TicketPriority {
+  NORMAL
+  URGENT
+}
+
+enum TicketStatus {
+  NEW
+  ASSIGNED
+  SNOOZED
+  QUEUED
+  ACCEPTED
+  IN_PROGRESS
+  AWAITING_OTP
+  CLOSED
+  COMPLAINT_RAISED
+  REOPENED
+  ESCALATED
+  CANCELLED
+}
+
+enum AssignmentStatus {
+  ACTIVE
+  ACCEPTED
+  RELEASED
+}
+
+enum ExportStatus {
+  PENDING
+  PROCESSING
+  READY
+  FAILED
+  EXPIRED
+}
+
+model Organization {
+  id                String            @id @default(cuid())
+  name              String
+  events            Event[]
+  users             User[]
+  managementAudits  ManagementAudit[]
+  createdAt         DateTime          @default(now())
+}
+
+model Event {
+  id             String        @id @default(cuid())
+  organizationId String
+  organization   Organization  @relation(fields: [organizationId], references: [id])
+  name           String
+  venue          String
+  timezone       String        @default("Asia/Kolkata")
+  startsAt       DateTime
+  endsAt         DateTime
+  status         EventStatus   @default(DRAFT)
+  ticketSequence Int           @default(0)
+  halls          Hall[]
+  scopes         UserScope[]
+  tickets        Ticket[]
+  pools          ServicePool[]
+  createdAt      DateTime      @default(now())
+
+  @@index([organizationId, status])
+}
+
+model Hall {
+  id      String        @id @default(cuid())
+  eventId String
+  event   Event         @relation(fields: [eventId], references: [id])
+  code    String
+  name    String
+  active  Boolean       @default(true)
+  zones   Zone[]
+  scopes  UserScope[]
+  tickets Ticket[]
+  pools   ServicePool[]
+
+  @@unique([eventId, code])
+}
+
+model Zone {
+  id      String   @id @default(cuid())
+  eventId String
+  hallId  String
+  hall    Hall     @relation(fields: [hallId], references: [id])
+  code    String
+  active  Boolean  @default(true)
+  stalls  Stall[]
+  tickets Ticket[]
+
+  @@unique([hallId, code])
+  @@index([eventId])
+}
+
+model Stall {
+  id            String      @id @default(cuid())
+  eventId       String
+  zoneId        String
+  zone          Zone        @relation(fields: [zoneId], references: [id])
+  stallCode     String
+  exhibitorName String
+  contact       String?
+  active        Boolean     @default(true)
+  scopes        UserScope[]
+  tickets       Ticket[]
+
+  @@unique([zoneId, stallCode])
+  @@index([eventId])
+}
+
+/// Person age is not an MVP operational field (ticket age is separate and server-derived).
+model User {
+  id                   String                @id @default(cuid())
+  organizationId       String
+  organization         Organization          @relation(fields: [organizationId], references: [id])
+  /// Public optional display ID (e.g. STF-00012); not the database primary key.
+  employeeCode         String?               @unique
+  name                 String
+  email                String                @unique
+  phone                String?
+  passwordHash         String
+  role                 Role
+  status               UserStatus            @default(ACTIVE)
+  scopes               UserScope[]
+  assignments          Assignment[]
+  ticketEvents         TicketEvent[]
+  sessions             Session[]
+  notifications        Notification[]
+  exportJobs           ExportJob[]
+  workforceMemberships WorkforceMembership[]
+  createdTickets       Ticket[]              @relation("TicketCreator")
+  verifiedOtps         OtpChallenge[]        @relation("OtpVerifier")
+  createdComplaints    Complaint[]           @relation("ComplaintCreator")
+  managementAuditsAsActor  ManagementAudit[] @relation("ManagementAuditActor")
+  managementAuditsAsTarget ManagementAudit[] @relation("ManagementAuditTarget")
+  createdAt            DateTime              @default(now())
+}
+
+model UserScope {
+  id          String  @id @default(cuid())
+  userId      String
+  user        User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  eventId     String
+  event       Event   @relation(fields: [eventId], references: [id])
+  hallId      String?
+  hall        Hall?   @relation(fields: [hallId], references: [id])
+  stallId     String?
+  stall       Stall?  @relation(fields: [stallId], references: [id])
+  serviceType String?
+
+  @@index([userId, eventId])
+  @@index([eventId, hallId])
+  @@index([eventId, stallId])
+}
+
+model Session {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tokenHash String   @unique
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+
+  @@index([expiresAt])
+}
+
+model ServicePool {
+  id                      String                @id @default(cuid())
+  eventId                 String
+  event                   Event                 @relation(fields: [eventId], references: [id])
+  hallId                  String?
+  hall                    Hall?                 @relation(fields: [hallId], references: [id])
+  category                String
+  subtype                 String
+  responseTargetSeconds   Int                   @default(600)
+  resolutionTargetSeconds Int                   @default(3600)
+  active                  Boolean               @default(true)
+  workforce               WorkforceMembership[]
+  tickets                 Ticket[]
+
+  @@unique([eventId, hallId, category, subtype])
+}
+
+model WorkforceMembership {
+  id              String       @id @default(cuid())
+  eventId         String
+  poolId          String
+  pool            ServicePool  @relation(fields: [poolId], references: [id])
+  userId          String
+  user            User         @relation(fields: [userId], references: [id])
+  availability    Availability @default(OFF_DUTY)
+  capacity        Int          @default(1)
+  lastAvailableAt DateTime     @default(now())
+
+  @@unique([poolId, userId])
+  @@index([eventId])
+  @@index([availability, lastAvailableAt])
+  @@index([poolId, availability, lastAvailableAt])
+}
+
+model Ticket {
+  id                      String         @id @default(cuid())
+  publicNo                String
+  eventId                 String
+  event                   Event          @relation(fields: [eventId], references: [id])
+  hallId                  String
+  hall                    Hall           @relation(fields: [hallId], references: [id])
+  zoneId                  String
+  zone                    Zone           @relation(fields: [zoneId], references: [id])
+  stallId                 String
+  stall                   Stall          @relation(fields: [stallId], references: [id])
+  poolId                  String?
+  pool                    ServicePool?   @relation(fields: [poolId], references: [id])
+  category                String
+  subtype                 String
+  description             String
+  priority                TicketPriority @default(NORMAL)
+  status                  TicketStatus   @default(NEW)
+  createdById             String
+  createdBy               User           @relation("TicketCreator", fields: [createdById], references: [id])
+  idempotencyKey          String
+  queuedAt                DateTime?
+  firstAssignedAt         DateTime?
+  firstAcceptedAt         DateTime?
+  firstStartedAt          DateTime?
+  completionRequestedAt   DateTime?
+  closedAt                DateTime?
+  reopenCount             Int            @default(0)
+  escalationLevel         Int            @default(0)
+  queuePriorityOverrideAt DateTime?
+  version                 Int            @default(0)
+  createdAt               DateTime       @default(now())
+  updatedAt               DateTime       @updatedAt
+  assignments             Assignment[]
+  events                  TicketEvent[]
+  otpChallenges           OtpChallenge[]
+  complaints              Complaint[]
+  notifications           Notification[]
+
+  @@unique([eventId, publicNo])
+  @@unique([createdById, idempotencyKey])
+  @@index([eventId, hallId, status, createdAt])
+  @@index([poolId, status, createdAt])
+  @@index([poolId, status, queuePriorityOverrideAt, createdAt])
+  @@index([eventId, status, priority, createdAt])
+  @@index([stallId, status, createdAt])
+}
+
+model Assignment {
+  id                    String           @id @default(cuid())
+  eventId               String
+  ticketId              String
+  ticket                Ticket           @relation(fields: [ticketId], references: [id])
+  staffId               String
+  staff                 User             @relation(fields: [staffId], references: [id])
+  status                AssignmentStatus @default(ACTIVE)
+  activeTicketKey       String?          @unique
+  assignedAt            DateTime         @default(now())
+  acceptedAt            DateTime?
+  startedAt             DateTime?
+  snoozedUntil          DateTime?
+  completionRequestedAt DateTime?
+  releasedAt            DateTime?
+  releaseReason         String?
+  responseOverdueAt     DateTime?
+
+  @@index([staffId, status])
+  @@index([eventId])
+  @@index([ticketId, status])
+  @@index([status, responseOverdueAt, snoozedUntil, assignedAt])
+}
+
+model TicketEvent {
+  id            String        @id @default(cuid())
+  eventId       String
+  ticketId      String
+  ticket        Ticket        @relation(fields: [ticketId], references: [id])
+  eventType     String
+  actorId       String?
+  actor         User?         @relation(fields: [actorId], references: [id])
+  fromStatus    TicketStatus?
+  toStatus      TicketStatus?
+  metadata      Json?
+  correlationId String
+  createdAt     DateTime      @default(now())
+
+  @@index([ticketId, createdAt])
+  @@index([eventId, createdAt])
+}
+
+model OtpChallenge {
+  id              String    @id @default(cuid())
+  eventId         String
+  ticketId        String
+  ticket          Ticket    @relation(fields: [ticketId], references: [id])
+  otpHash         String
+  otpCiphertext   String
+  activeTicketKey String?   @unique
+  expiresAt       DateTime
+  attempts        Int       @default(0)
+  invalidatedAt   DateTime?
+  verifiedAt      DateTime?
+  verifiedBy      String?
+  verifier        User?     @relation("OtpVerifier", fields: [verifiedBy], references: [id])
+  createdAt       DateTime  @default(now())
+
+  @@index([ticketId, expiresAt])
+  @@index([eventId])
+}
+
+model Complaint {
+  id             String   @id @default(cuid())
+  eventId        String
+  ticketId       String
+  ticket         Ticket   @relation(fields: [ticketId], references: [id])
+  reasonCode     String
+  comment        String?
+  createdBy      String
+  idempotencyKey String?
+  creator        User     @relation("ComplaintCreator", fields: [createdBy], references: [id])
+  resolution     String?
+  createdAt      DateTime @default(now())
+
+  @@unique([createdBy, idempotencyKey])
+  @@index([eventId, createdAt])
+}
+
+model Notification {
+  id          String    @id @default(cuid())
+  eventId     String
+  recipientId String
+  recipient   User      @relation(fields: [recipientId], references: [id])
+  ticketId    String?
+  ticket      Ticket?   @relation(fields: [ticketId], references: [id])
+  type        String
+  dedupeKey   String    @unique
+  payload     Json?
+  readAt      DateTime?
+  sentAt      DateTime  @default(now())
+
+  @@index([recipientId, readAt, sentAt])
+  @@index([eventId, sentAt])
+}
+
+model OutboxEvent {
+  id             String    @id @default(cuid())
+  eventId        String
+  aggregateType  String
+  aggregateId    String
+  eventType      String
+  payload        Json
+  createdAt      DateTime  @default(now())
+  processedAt    DateTime?
+  attempts       Int       @default(0)
+  lockedAt       DateTime?
+  lockOwner      String?
+  lastError      String?
+  nextAttemptAt  DateTime?
+  deadLetteredAt DateTime?
+
+  @@index([processedAt, createdAt])
+  @@index([eventId, createdAt])
+  @@index([processedAt, lockedAt, createdAt])
+  @@index([processedAt, deadLetteredAt, nextAttemptAt, createdAt])
+}
+
+model ExportJob {
+  id                  String       @id @default(cuid())
+  requestedById       String
+  requestedBy         User         @relation(fields: [requestedById], references: [id])
+  eventIds            String[]
+  format              String
+  status              ExportStatus @default(PENDING)
+  filterSnapshot      Json
+  visibleColumns      Json
+  rowCount            Int?
+  storageKey          String?
+  expiresAt           DateTime?
+  processingStartedAt DateTime?
+  attempts            Int          @default(0)
+  lastError           String?
+  createdAt           DateTime     @default(now())
+
+  @@index([status, createdAt])
+  @@index([requestedById, createdAt])
+}
+
+model SystemHeartbeat {
+  id         String   @id
+  lastSeenAt DateTime @updatedAt
+  metadata   Json?
+}
+
+model ManagementAudit {
+  id             String       @id @default(cuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id])
+  eventId        String?
+  actorId        String
+  actor          User         @relation("ManagementAuditActor", fields: [actorId], references: [id])
+  targetUserId   String?
+  targetUser     User?        @relation("ManagementAuditTarget", fields: [targetUserId], references: [id])
+  action         String
+  metadata       Json?
+  createdAt      DateTime     @default(now())
+
+  @@index([organizationId, createdAt])
+  @@index([eventId, createdAt])
+  @@index([targetUserId, createdAt])
+}

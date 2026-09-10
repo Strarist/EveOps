@@ -1,0 +1,37 @@
+name: CI
+on:
+  push:
+  pull_request:
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: eveops
+          POSTGRES_PASSWORD: eveops
+          POSTGRES_DB: eveops
+        ports: ["5432:5432"]
+        options: --health-cmd "pg_isready -U eveops" --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      DATABASE_URL: postgresql://eveops:eveops@localhost:5432/eveops
+      SESSION_SECRET: test-secret-at-least-32-characters
+      OTP_ENCRYPTION_SECRET: test-otp-secret-at-least-32-characters
+      API_URL: http://localhost:4000/api
+      COOKIE_SECURE: "false"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: {node-version: 22, cache: npm}
+      - run: npm ci
+      - run: npm audit --audit-level=high
+      - run: npm run db:generate
+      - run: npx prisma migrate deploy
+      - run: npm run migration:preflight
+      - run: npm run typecheck
+      - run: npm run lint
+      - run: npm test
+      - run: npx playwright install --with-deps chromium
+      - run: npm run test:e2e
+      - run: npm run build

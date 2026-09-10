@@ -1,0 +1,22 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: eveops
+      POSTGRES_PASSWORD: eveops
+      POSTGRES_DB: eveops
+    ports: ["55432:5432"]
+    volumes: [eveops_pg:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U eveops"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+  redis:
+    image: redis:7-alpine
+    ports: ["6379:6379"]
+    command: redis-server --appendonly yes
+    volumes: [eveops_redis:/data]
+volumes:
+  eveops_pg:
+  eveops_redis:

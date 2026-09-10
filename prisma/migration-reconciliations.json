@@ -1,0 +1,27 @@
+{
+  "20260908183000_event_scoped_operations": {
+    "applied": "177c5c79af10502c69491d565fa9fbd4f83eed8674d61a0501003ae75a103d80",
+    "current": "8b74086a35c35171d904113c73fd0254e108c3eeb67dc96d65efe37a19477015",
+    "repairedBy": "20260909170000_runtime_contract_repair"
+  },
+  "20260908185000_audited_queue_priority": {
+    "applied": "caf660a180b93d99f672d2da3d42f22c3e54d8908533e0850f6775dd534e663e",
+    "current": "9d0f2c1c00898cde15947f6486a008148e5c1c3de687773a2ce94c289425b9b0",
+    "repairedBy": "20260909170000_runtime_contract_repair"
+  },
+  "20260908190000_one_active_otp": {
+    "applied": "3ab27f1bc3a29f16dc500770bef791eb3b9753cf455e173fdc666a2f7abd5e56",
+    "current": "6fb367576b0d8703ccce77317c21e02abff2a4813c9aae1beb4d64b8ba912cb8",
+    "repairedBy": "20260909170000_runtime_contract_repair"
+  },
+  "20260908191500_protected_otp_delivery": {
+    "applied": "fbc8ddcd36d9b39bd2f0c752eeae8deeead83eb2c37e133450202e4bb220175f",
+    "current": "310a3623d45087f29bb75aaa719c0fc5babd1f98052743969c7370549f6e562f",
+    "repairedBy": "20260909170000_runtime_contract_repair"
+  },
+  "20260909190000_user_management": {
+    "applied": "0e4e7011d63912cc9897a716f28da579e67716d7c22b4c7a3566a75785a65b8a",
+    "current": "e2484a0b88b5896876987ee32a84f8d0b2ad8777f553833123596a48f3b6e091",
+    "repairedBy": "20260910133000_workforce_employee_code"
+  }
+}
