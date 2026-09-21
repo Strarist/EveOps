@@ -1,0 +1,32 @@
+# Optional Blueprint for EveOps API + worker.
+# If you already created the Web Service in the dashboard, you can skip Blueprint
+# sync and only update Build/Start commands to match the values below.
+services:
+  - type: web
+    name: eveops-api
+    runtime: node
+    plan: starter
+    region: singapore
+    buildCommand: npm install --include=dev && npm run build:render
+    preDeployCommand: npx prisma migrate deploy
+    startCommand: bash scripts/start-api-worker.sh
+    healthCheckPath: /api/system/health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: COOKIE_SECURE
+        value: "true"
+      - key: EXPORT_DIR
+        value: /opt/render/project/src/exports
+      # Set these in the Render dashboard (do not commit secrets):
+      # DATABASE_URL, SESSION_SECRET, OTP_ENCRYPTION_SECRET, API_URL, WEB_ORIGIN
+      - key: DATABASE_URL
+        sync: false
+      - key: SESSION_SECRET
+        sync: false
+      - key: OTP_ENCRYPTION_SECRET
+        sync: false
+      - key: API_URL
+        sync: false
+      - key: WEB_ORIGIN
+        sync: false
