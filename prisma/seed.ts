@@ -4,7 +4,12 @@ import { hash } from 'bcryptjs';
 const prisma = new PrismaClient();
 async function main() {
   if (process.env.NODE_ENV === 'production' && process.env.ALLOW_DEMO_SEED !== 'true') {
-    throw new Error('Demo seed is disabled in production');
+    const userCount = await prisma.user.count();
+    if (userCount > 0) {
+      console.log('Skipping demo seed: production database already has users (set ALLOW_DEMO_SEED=true to refresh).');
+      return;
+    }
+    console.log('Bootstrapping empty production database with demo users.');
   }
   const passwordHash = await hash('EveOpsDemo!2026', 12);
   const organization = await prisma.organization.upsert({ where: { id: 'demo-org' }, update: {}, create: { id: 'demo-org', name: 'Nexus Exhibitions' } });

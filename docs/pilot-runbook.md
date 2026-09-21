@@ -13,12 +13,13 @@ Missing/invalid secrets fail API startup in production.
 2. Confirm database reachable
 3. `npm run db:generate`
 4. `npm run db:deploy` (`prisma migrate deploy`) — **do not start the app if this fails**
-5. `npm run build:packages` then full `npm run build` (contracts → operations → api → worker → web)
-6. `npm run verify:operations-fresh` (guards against stale `@eveops/operations` dist)
-7. Start API
-8. Start workers
-9. Confirm `/api/system/health` (liveness) and `/api/system/ready` (readiness; **503 when degraded**)
-10. Start / expose frontend traffic
+5. For a fresh pilot database, run `npm run db:seed` (or set `ALLOW_DEMO_SEED=true` on Render so deploys re-upsert demo users). Empty production DBs also bootstrap demo users once on API start.
+6. `npm run build:packages` then full `npm run build` (contracts → operations → api → worker → web)
+7. `npm run verify:operations-fresh` (guards against stale `@eveops/operations` dist)
+8. Start API
+9. Start workers
+10. Confirm `/api/system/health` (liveness) and `/api/system/ready` (readiness; **503 when degraded**)
+11. Start / expose frontend traffic
 
 ## Staff approval vs account vs password
 Keep these axes independent:

@@ -8,7 +8,7 @@ services:
     plan: starter
     region: singapore
     buildCommand: npm install --include=dev && npm run build:render
-    preDeployCommand: npx prisma migrate deploy
+    preDeployCommand: bash scripts/render-predeploy.sh
     startCommand: bash scripts/start-api-worker.sh
     healthCheckPath: /api/system/health
     envVars:
@@ -20,6 +20,7 @@ services:
         value: /opt/render/project/src/exports
       # Set these in the Render dashboard (do not commit secrets):
       # DATABASE_URL, SESSION_SECRET, OTP_ENCRYPTION_SECRET, API_URL, WEB_ORIGIN
+      # Optional: ALLOW_DEMO_SEED=true to re-upsert demo users on every deploy
       - key: DATABASE_URL
         sync: false
       - key: SESSION_SECRET
@@ -29,4 +30,6 @@ services:
       - key: API_URL
         sync: false
       - key: WEB_ORIGIN
+        sync: false
+      - key: ALLOW_DEMO_SEED
         sync: false

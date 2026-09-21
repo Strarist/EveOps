@@ -4,6 +4,10 @@ set -euo pipefail
 export EXPORT_DIR="${EXPORT_DIR:-$PWD/exports}"
 mkdir -p "$EXPORT_DIR"
 
+# Keep schema current and bootstrap demo users when the database is still empty.
+npx prisma migrate deploy
+npm run db:seed
+
 node apps/api/dist/main.js &
 API_PID=$!
 node apps/worker/dist/main.js &
