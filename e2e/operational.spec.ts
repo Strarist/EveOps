@@ -56,9 +56,15 @@ async function clearOperationalData() {
     prisma.exportJob.deleteMany({ where: { requestedBy: { organizationId: ids.organization } } }),
     prisma.managementAudit.deleteMany({ where: { organizationId: ids.organization } }),
     prisma.event.update({ where: { id: ids.event }, data: { ticketSequence: 0 } }),
+    // Only fixture workers should be route-eligible between tests. Leftover people created
+    // mid-suite (Admin/HM create flows) must stay OFF_DUTY so they cannot steal assignments.
     prisma.workforceMembership.updateMany({
-      where: { eventId: ids.event },
+      where: { eventId: ids.event, userId: { in: [ids.staffUser, ids.houseStaffUser, ids.managerUser] } },
       data: { availability: 'ON_DUTY', lastAvailableAt: new Date('2026-01-01T00:00:00Z') },
+    }),
+    prisma.workforceMembership.updateMany({
+      where: { eventId: ids.event, userId: { notIn: [ids.staffUser, ids.houseStaffUser, ids.managerUser] } },
+      data: { availability: 'OFF_DUTY' },
     }),
   ]);
 }
@@ -603,6 +609,10 @@ test.describe.serial('isolated multi-role operational acceptance', () => {
     const staff = await login(browser, emails.staff);
     const first = await createTicket(stall);
     expect(first.status).toBe('ASSIGNED');
+    const firstAssignment = await prisma.assignment.findFirst({
+      where: { ticketId: first.id, status: { in: ['ACTIVE', 'ACCEPTED'] } },
+    });
+    expect(firstAssignment?.staffId).toBe(ids.staffUser);
     const paused = await staff.request.patch('/api/workforce/availability', { data: { value: 'PAUSED' } });
     expect(paused.status()).toBe(200);
     const second = await createTicket(stall);

@@ -1,3 +1,7 @@
+/**
+ * Workforce & identity management — create/approve people, availability, reassignment.
+ * Hall Managers request Staff; Admins approve and assign public employee codes.
+ */
 import {
   BadRequestException,
   Body,
@@ -135,16 +139,26 @@ export class WorkforceService {
     return 'STF';
   }
 
-  private async nextServiceEmployeeCode(tx: Prisma.TransactionClient, category: string) {
-    const prefix = this.staffCodePrefix(category);
-    const latest = await tx.user.findFirst({
+  private async nextEmployeeCode(tx: Prisma.TransactionClient, prefix: string, pad: number) {
+    const existing = await tx.user.findMany({
       where: { employeeCode: { startsWith: `${prefix}-` } },
-      orderBy: { employeeCode: 'desc' },
       select: { employeeCode: true },
     });
-    const current = latest?.employeeCode?.match(new RegExp(`^${prefix}-(\\d+)$`))?.[1];
-    const next = (current ? Number(current) : 0) + 1;
-    return `${prefix}-${String(next).padStart(4, '0')}`;
+    let highest = 0;
+    const matcher = new RegExp(`^${prefix}-(\\d+)$`);
+    for (const row of existing) {
+      const match = row.employeeCode?.match(matcher)?.[1];
+      if (match) highest = Math.max(highest, Number(match));
+    }
+    return `${prefix}-${String(highest + 1).padStart(pad, '0')}`;
+  }
+
+  private nextServiceEmployeeCode(tx: Prisma.TransactionClient, category: string) {
+    return this.nextEmployeeCode(tx, this.staffCodePrefix(category), 4);
+  }
+
+  private nextRoleEmployeeCode(tx: Prisma.TransactionClient, role: ManagedRole) {
+    return this.nextEmployeeCode(tx, ROLE_CODE_PREFIX[role], 5);
   }
 
   private assertCanManageRole(scope: AuthScope, role: ManagedRole) {
@@ -153,23 +167,11 @@ export class WorkforceService {
     }
   }
 
-  private async actorOrganization(scope: AuthScope) {
+  private actorOrganization(scope: AuthScope) {
     return this.prisma.user.findUniqueOrThrow({
       where: { id: scope.userId },
       select: { organizationId: true },
     });
-  }
-
-  private async nextEmployeeCode(tx: Prisma.TransactionClient, role: ManagedRole) {
-    const prefix = ROLE_CODE_PREFIX[role];
-    const latest = await tx.user.findFirst({
-      where: { employeeCode: { startsWith: `${prefix}-` } },
-      orderBy: { employeeCode: 'desc' },
-      select: { employeeCode: true },
-    });
-    const current = latest?.employeeCode?.match(new RegExp(`^${prefix}-(\\d+)$`))?.[1];
-    const next = (current ? Number(current) : 0) + 1;
-    return `${prefix}-${String(next).padStart(5, '0')}`;
   }
 
   private async writeAudit(
@@ -228,25 +230,25 @@ export class WorkforceService {
       },
       orderBy: [{ availability: 'asc' }, { lastAvailableAt: 'asc' }],
     });
-    return memberships.map((membership) => ({
+    return memberships.map(({ user, ...membership }) => ({
       ...membership,
       capacity: membership.capacity,
-      activeAssignmentCount: membership.user._count.assignments,
+      activeAssignmentCount: user._count.assignments,
       user: {
-        id: membership.user.id,
-        name: membership.user.name,
-        phone: membership.user.phone,
-        email: membership.user.email,
-        employeeCode: membership.user.employeeCode,
-        status: membership.user.status,
-        role: membership.user.role,
-        approvalStatus: membership.user.approvalStatus,
-        requestedById: membership.user.requestedById,
-        requestedBy: membership.user.requestedBy,
-        approvedAt: membership.user.approvedAt,
-        rejectedAt: membership.user.rejectedAt,
-        rejectionReason: membership.user.rejectionReason,
-        createdAt: membership.user.createdAt,
+        id: user.id,
+        name: user.name,
+        phone: user.phone,
+        email: user.email,
+        employeeCode: user.employeeCode,
+        status: user.status,
+        role: user.role,
+        approvalStatus: user.approvalStatus,
+        requestedById: user.requestedById,
+        requestedBy: user.requestedBy,
+        approvedAt: user.approvedAt,
+        rejectedAt: user.rejectedAt,
+        rejectionReason: user.rejectionReason,
+        createdAt: user.createdAt,
       },
     }));
   }
@@ -300,76 +302,83 @@ export class WorkforceService {
       throw new ConflictException('Staff request has already been reviewed');
     }
     const now = new Date();
-    const updated = await this.prisma.$transaction(async (tx) => {
-      let assignedEmployeeCode = user.employeeCode;
-      if (!assignedEmployeeCode) {
-        const membership = await tx.workforceMembership.findFirst({
-          where: { userId: user.id },
-          include: { pool: { select: { category: true } } },
-        });
-        assignedEmployeeCode = membership?.pool.category && ['ELECTRICAL', 'HOUSE_HELP'].includes(membership.pool.category)
-          ? await this.nextServiceEmployeeCode(tx, membership.pool.category)
-          : await this.nextEmployeeCode(tx, user.role as ManagedRole);
-      }
-      const result = await tx.user.updateMany({
-        where: { id: user.id, approvalStatus: 'PENDING_APPROVAL' },
-        data: {
-          approvalStatus: 'APPROVED',
-          approvedById: scope.userId,
-          approvedAt: now,
-          rejectedById: null,
-          rejectedAt: null,
-          rejectionReason: null,
-          employeeCode: assignedEmployeeCode,
-        },
-      });
-      if (result.count !== 1) throw new ConflictException('Staff request has already been reviewed');
-      const person = await tx.user.findUniqueOrThrow({
-        where: { id: user.id },
-        select: {
-          id: true,
-          employeeCode: true,
-          name: true,
-          email: true,
-          role: true,
-          status: true,
-          approvalStatus: true,
-          approvedAt: true,
-          requestedById: true,
-        },
-      });
-      await this.writeAudit(tx, {
-        organizationId: actor.organizationId,
-        eventId: user.scopes[0]?.eventId ?? null,
-        actorId: scope.userId,
-        targetUserId: user.id,
-        action: 'STAFF_APPROVED',
-        metadata: { employeeCode: person.employeeCode },
-      });
-      if (person.requestedById) {
-        await tx.notification.create({
+    try {
+      const updated = await this.prisma.$transaction(async (tx) => {
+        let assignedEmployeeCode = user.employeeCode;
+        if (!assignedEmployeeCode) {
+          const membership = await tx.workforceMembership.findFirst({
+            where: { userId: user.id },
+            include: { pool: { select: { category: true } } },
+          });
+          assignedEmployeeCode = membership?.pool.category && ['ELECTRICAL', 'HOUSE_HELP'].includes(membership.pool.category)
+            ? await this.nextServiceEmployeeCode(tx, membership.pool.category)
+            : await this.nextRoleEmployeeCode(tx, user.role as ManagedRole);
+        }
+        const result = await tx.user.updateMany({
+          where: { id: user.id, approvalStatus: 'PENDING_APPROVAL' },
           data: {
-            eventId: user.scopes[0]?.eventId ?? scope.eventIds[0],
-            recipientId: person.requestedById,
-            type: 'STAFF_APPROVED',
-            dedupeKey: `staff_approved:${person.id}:${person.requestedById}:${now.toISOString()}`,
-            payload: { targetUserId: person.id, employeeCode: person.employeeCode, name: person.name },
+            approvalStatus: 'APPROVED',
+            approvedById: scope.userId,
+            approvedAt: now,
+            rejectedById: null,
+            rejectedAt: null,
+            rejectionReason: null,
+            employeeCode: assignedEmployeeCode,
           },
         });
-      }
-      const eventId = user.scopes[0]?.eventId ?? scope.eventIds[0];
-      if (eventId) {
-        await this.writeWorkforceOutbox(tx, {
-          eventId,
-          hallId: user.scopes[0]?.hallId,
-          aggregateId: person.id,
-          eventType: 'STAFF_APPROVED',
+        if (result.count !== 1) throw new ConflictException('Staff request has already been reviewed');
+        const person = await tx.user.findUniqueOrThrow({
+          where: { id: user.id },
+          select: {
+            id: true,
+            employeeCode: true,
+            name: true,
+            email: true,
+            role: true,
+            status: true,
+            approvalStatus: true,
+            approvedAt: true,
+            requestedById: true,
+          },
         });
+        await this.writeAudit(tx, {
+          organizationId: actor.organizationId,
+          eventId: user.scopes[0]?.eventId ?? null,
+          actorId: scope.userId,
+          targetUserId: user.id,
+          action: 'STAFF_APPROVED',
+          metadata: { employeeCode: person.employeeCode },
+        });
+        if (person.requestedById) {
+          await tx.notification.create({
+            data: {
+              eventId: user.scopes[0]?.eventId ?? scope.eventIds[0],
+              recipientId: person.requestedById,
+              type: 'STAFF_APPROVED',
+              dedupeKey: `staff_approved:${person.id}:${person.requestedById}:${now.toISOString()}`,
+              payload: { targetUserId: person.id, employeeCode: person.employeeCode, name: person.name },
+            },
+          });
+        }
+        const eventId = user.scopes[0]?.eventId ?? scope.eventIds[0];
+        if (eventId) {
+          await this.writeWorkforceOutbox(tx, {
+            eventId,
+            hallId: user.scopes[0]?.hallId,
+            aggregateId: person.id,
+            eventType: 'STAFF_APPROVED',
+          });
+        }
+        return person;
+      });
+      if (user.scopes[0]?.eventId) this.notifyWorkforceChange(user.scopes[0].eventId, user.scopes[0].hallId);
+      return updated;
+    } catch (error) {
+      if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002') {
+        throw new ConflictException('Could not assign a unique public person ID. Retry approval.');
       }
-      return person;
-    });
-    if (user.scopes[0]?.eventId) this.notifyWorkforceChange(user.scopes[0].eventId, user.scopes[0].hallId);
-    return updated;
+      throw error;
+    }
   }
 
   async rejectPerson(scope: AuthScope, id: string, reason: string) {
@@ -604,7 +613,7 @@ export class WorkforceService {
           : (dto.employeeCode?.trim().toUpperCase()
             ?? (dto.role === 'STAFF' && dto.serviceCategory
               ? await this.nextServiceEmployeeCode(tx, dto.serviceCategory)
-              : await this.nextEmployeeCode(tx, dto.role)));
+              : await this.nextRoleEmployeeCode(tx, dto.role)));
         const now = new Date();
         const user = await tx.user.create({
           data: {
@@ -914,6 +923,7 @@ export class WorkforceService {
   }
 
   async reassign(ticketId: string, staffId: string, reason: string, scope: AuthScope) {
+    // Manager override of the one-active-assignee rule; previous staff is released for FIFO drain.
     requireAuthority(scope.role, 'HALL_MANAGER');
     if (!reason.trim()) throw new BadRequestException('Reassignment reason is required');
     const result = await this.prisma.$transaction(async (tx) => {
@@ -1015,58 +1025,16 @@ export class WorkforceService {
 @Controller('workforce')
 export class WorkforceController {
   constructor(private readonly service: WorkforceService) {}
-
-  @Get()
-  list(@CurrentScope() scope: AuthScope) {
-    return this.service.list(scope);
-  }
-
-  @Get('pending')
-  listPending(@CurrentScope() scope: AuthScope) {
-    return this.service.listPending(scope);
-  }
-
-  @Get('me')
-  mine(@CurrentScope() scope: AuthScope) {
-    return this.service.mine(scope);
-  }
-
-  @Patch('availability')
-  availability(@Body() body: AvailabilityDto, @CurrentScope() scope: AuthScope) {
-    return this.service.availability(scope, body.value);
-  }
-
-  @Post('people')
-  createPerson(@Body() body: CreatePersonDto, @CurrentScope() scope: AuthScope) {
-    return this.service.createPerson(scope, body);
-  }
-
-  @Get('people/:id')
-  getPerson(@Param('id') id: string, @CurrentScope() scope: AuthScope) {
-    return this.service.getPerson(scope, id);
-  }
-
-  @Patch('people/:id')
-  updatePerson(@Param('id') id: string, @Body() body: UpdatePersonDto, @CurrentScope() scope: AuthScope) {
-    return this.service.updatePerson(scope, id, body);
-  }
-
-  @Post('people/:id/approve')
-  approvePerson(@Param('id') id: string, @CurrentScope() scope: AuthScope) {
-    return this.service.approvePerson(scope, id);
-  }
-
-  @Post('people/:id/reject')
-  rejectPerson(@Param('id') id: string, @Body() body: RejectPersonDto, @CurrentScope() scope: AuthScope) {
-    return this.service.rejectPerson(scope, id, body.reason);
-  }
-
-  @Patch('tickets/:ticketId/reassign')
-  reassign(
-    @Param('ticketId') ticketId: string,
-    @Body() body: ReassignDto,
-    @CurrentScope() scope: AuthScope,
-  ) {
+  @Get() list(@CurrentScope() scope: AuthScope) { return this.service.list(scope); }
+  @Get('pending') listPending(@CurrentScope() scope: AuthScope) { return this.service.listPending(scope); }
+  @Get('me') mine(@CurrentScope() scope: AuthScope) { return this.service.mine(scope); }
+  @Patch('availability') availability(@Body() body: AvailabilityDto, @CurrentScope() scope: AuthScope) { return this.service.availability(scope, body.value); }
+  @Post('people') createPerson(@Body() body: CreatePersonDto, @CurrentScope() scope: AuthScope) { return this.service.createPerson(scope, body); }
+  @Get('people/:id') getPerson(@Param('id') id: string, @CurrentScope() scope: AuthScope) { return this.service.getPerson(scope, id); }
+  @Patch('people/:id') updatePerson(@Param('id') id: string, @Body() body: UpdatePersonDto, @CurrentScope() scope: AuthScope) { return this.service.updatePerson(scope, id, body); }
+  @Post('people/:id/approve') approvePerson(@Param('id') id: string, @CurrentScope() scope: AuthScope) { return this.service.approvePerson(scope, id); }
+  @Post('people/:id/reject') rejectPerson(@Param('id') id: string, @Body() body: RejectPersonDto, @CurrentScope() scope: AuthScope) { return this.service.rejectPerson(scope, id, body.reason); }
+  @Patch('tickets/:ticketId/reassign') reassign(@Param('ticketId') ticketId: string, @Body() body: ReassignDto, @CurrentScope() scope: AuthScope) {
     return this.service.reassign(ticketId, body.staffId, body.reason, scope);
   }
 }
