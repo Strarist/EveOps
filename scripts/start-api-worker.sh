@@ -4,9 +4,10 @@ set -euo pipefail
 export EXPORT_DIR="${EXPORT_DIR:-$PWD/exports}"
 mkdir -p "$EXPORT_DIR"
 
-# Keep schema current and bootstrap demo users when the database is still empty.
+# Keep schema current. Default ALLOW_DEMO_SEED=true so pilot deploys keep the
+# documented demo logins working; set ALLOW_DEMO_SEED=false to disable.
 npx prisma migrate deploy
-npm run db:seed
+ALLOW_DEMO_SEED="${ALLOW_DEMO_SEED:-true}" npm run db:seed
 
 node apps/api/dist/main.js &
 API_PID=$!

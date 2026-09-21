@@ -2,4 +2,4 @@
 set -euo pipefail
 
 npx prisma migrate deploy
-npm run db:seed
+ALLOW_DEMO_SEED="${ALLOW_DEMO_SEED:-true}" npm run db:seed

@@ -36,7 +36,7 @@ Read `01-product-plan.md`, `02-workflow.md`, `03-ui-ux-spec.md`, and `04-rules-p
 ## Security and operational notes
 - Replace all development credentials and SESSION_SECRET before deployment.
 - Set an absolute `API_URL`, the public `WEB_ORIGIN`, and `COOKIE_SECURE=true` for HTTPS deployments. Plain HTTP requires `COOKIE_SECURE=false`; it is not an acceptable production transport.
-- Demo seeding is blocked when `NODE_ENV=production` and the database already has users, unless `ALLOW_DEMO_SEED=true` is set. An empty production database is bootstrapped once with the documented demo accounts (Render start/predeploy runs `npm run db:seed`).
+- Demo seeding: Render start/predeploy default to `ALLOW_DEMO_SEED=true` so the documented demo accounts stay usable on pilot deploys. Set `ALLOW_DEMO_SEED=false` to skip. Locally, `npm run db:seed` always upserts demo users.
 - PostgreSQL is authoritative; Redis must never become the system of record.
 - OTP verification uses a one-way hash; the stall-only presentation value is encrypted at rest with AES-256-GCM and omitted from logs/exports.
 - All protected endpoints enforce role and object scope server-side.
