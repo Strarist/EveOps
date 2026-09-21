@@ -301,6 +301,16 @@ export class WorkforceService {
     }
     const now = new Date();
     const updated = await this.prisma.$transaction(async (tx) => {
+      let assignedEmployeeCode = user.employeeCode;
+      if (!assignedEmployeeCode) {
+        const membership = await tx.workforceMembership.findFirst({
+          where: { userId: user.id },
+          include: { pool: { select: { category: true } } },
+        });
+        assignedEmployeeCode = membership?.pool.category && ['ELECTRICAL', 'HOUSE_HELP'].includes(membership.pool.category)
+          ? await this.nextServiceEmployeeCode(tx, membership.pool.category)
+          : await this.nextEmployeeCode(tx, user.role as ManagedRole);
+      }
       const result = await tx.user.updateMany({
         where: { id: user.id, approvalStatus: 'PENDING_APPROVAL' },
         data: {
@@ -310,6 +320,7 @@ export class WorkforceService {
           rejectedById: null,
           rejectedAt: null,
           rejectionReason: null,
+          employeeCode: assignedEmployeeCode,
         },
       });
       if (result.count !== 1) throw new ConflictException('Staff request has already been reviewed');
@@ -579,14 +590,21 @@ export class WorkforceService {
       membershipRows = [{ eventId: dto.eventId, poolId: pool.id, capacity }];
     }
 
+    if (scope.role === 'HALL_MANAGER' && dto.employeeCode?.trim()) {
+      throw new ForbiddenException('Only Admin can assign public person IDs');
+    }
+
     const requiresApproval = scope.role === 'HALL_MANAGER' && dto.role === 'STAFF';
     const passwordHash = await hash(dto.password, 12);
     try {
       const created = await this.prisma.$transaction(async (tx) => {
-        const employeeCode = dto.employeeCode?.trim().toUpperCase()
-          ?? (dto.role === 'STAFF' && dto.serviceCategory
-            ? await this.nextServiceEmployeeCode(tx, dto.serviceCategory)
-            : await this.nextEmployeeCode(tx, dto.role));
+        // Hall Manager requests create the person without an ID; Admin assigns/generates on create or approve.
+        const employeeCode = scope.role === 'HALL_MANAGER'
+          ? null
+          : (dto.employeeCode?.trim().toUpperCase()
+            ?? (dto.role === 'STAFF' && dto.serviceCategory
+              ? await this.nextServiceEmployeeCode(tx, dto.serviceCategory)
+              : await this.nextEmployeeCode(tx, dto.role)));
         const now = new Date();
         const user = await tx.user.create({
           data: {

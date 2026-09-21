@@ -166,7 +166,7 @@ describe('workforce identity management', () => {
     await prisma.$disconnect();
   });
 
-  it('allows Hall Manager to create House Help staff in own hall as pending approval', async () => {
+  it('allows Hall Manager to create House Help staff in own hall as pending approval without person ID', async () => {
     const created = await workforce.createPerson(managerScope, {
       name: 'House Helper',
       email: `${key}-house@example.test`,
@@ -176,11 +176,10 @@ describe('workforce identity management', () => {
       hallId: ids.hall,
       serviceCategory: 'HOUSE_HELP',
       serviceSubtype: 'General',
-      employeeCode: 'HELP-HOUSE-T1',
     } as CreatePersonDto);
     createdUserIds.push(created.id);
     expect(created.role).toBe('STAFF');
-    expect(created.employeeCode).toBe('HELP-HOUSE-T1');
+    expect(created.employeeCode).toBeNull();
     expect(created.approvalStatus).toBe('PENDING_APPROVAL');
     const membership = await prisma.workforceMembership.findFirst({
       where: { userId: created.id, poolId: ids.housePool },
@@ -190,6 +189,22 @@ describe('workforce identity management', () => {
       where: { targetUserId: created.id, action: 'STAFF_APPROVAL_REQUESTED' },
     });
     expect(audit).toBeTruthy();
+  });
+
+  it('forbids Hall Manager from assigning public person IDs', async () => {
+    await expect(
+      workforce.createPerson(managerScope, {
+        name: 'Coded Staff',
+        email: `${key}-coded@example.test`,
+        password,
+        role: 'STAFF',
+        eventId: ids.event,
+        hallId: ids.hall,
+        serviceCategory: 'HOUSE_HELP',
+        serviceSubtype: 'General',
+        employeeCode: 'HELP-HOUSE-T1',
+      } as CreatePersonDto),
+    ).rejects.toBeInstanceOf(ForbiddenException);
   });
 
   it('forbids Hall Manager from creating staff in another hall', async () => {
@@ -260,14 +275,15 @@ describe('workforce identity management', () => {
       hallId: ids.hall,
       serviceCategory: 'ELECTRICAL',
       serviceSubtype: 'Lighting',
-      employeeCode: 'ELEC-101',
     } as CreatePersonDto);
     createdUserIds.push(created.id);
     expect(created.approvalStatus).toBe('PENDING_APPROVAL');
+    expect(created.employeeCode).toBeNull();
     const pending = await workforce.listPending(adminScope);
     expect(pending.some((person) => person.id === created.id)).toBe(true);
     const approved = await workforce.approvePerson(adminScope, created.id);
     expect(approved.approvalStatus).toBe('APPROVED');
+    expect(approved.employeeCode).toMatch(/^ELEC-\d{4}$/);
     await expect(workforce.approvePerson(adminScope, created.id)).rejects.toThrow(/already been reviewed/i);
   });
 
@@ -281,7 +297,6 @@ describe('workforce identity management', () => {
       hallId: ids.hall,
       serviceCategory: 'HOUSE_HELP',
       serviceSubtype: 'General',
-      employeeCode: 'HELP-REJ-01',
     } as CreatePersonDto);
     createdUserIds.push(created.id);
     const rejected = await workforce.rejectPerson(adminScope, created.id, 'Incomplete paperwork');
@@ -299,7 +314,6 @@ describe('workforce identity management', () => {
       hallId: ids.hall,
       serviceCategory: 'ELECTRICAL',
       serviceSubtype: 'Lighting',
-      employeeCode: 'ELEC-LOGIN-1',
     } as CreatePersonDto);
     createdUserIds.push(created.id);
     const response = { cookie: jest.fn(), clearCookie: jest.fn() };

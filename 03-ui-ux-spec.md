@@ -101,7 +101,9 @@ Timeline: Raised -\> Assigned -\> Accepted -\> Work started**
 expiry; \[Work is not satisfactory\]. Stall never enters the OTP.
 
 **Completion panel (AWAITING_OTP, Staff):** segmented 6-digit OTP entry
-+ Verify & close ticket.
++ Verify & close ticket. Hall Managers use the same entry pattern for
+scoped hall tickets awaiting verification and never see the generated
+code in-app.
 
 # 5. Staff interface - simplified mobile UI
 

@@ -192,7 +192,7 @@ async function closeWithOtp(stall: BrowserContext, staff: BrowserContext, ticket
   const stallVerify = await stall.request.post(`/api/tickets/${ticketId}/otp/verify`, { data: { otp: body.otp } });
   expect([403, 429].includes(stallVerify.status()), `stall verify status ${stallVerify.status()}`).toBe(true);
   if (stallVerify.status() === 403) {
-    expect(String((await stallVerify.json()).message ?? '')).toMatch(/assigned staff|Forbidden/i);
+    expect(String((await stallVerify.json()).message ?? '')).toMatch(/assigned staff|hall manager|Forbidden/i);
   }
   const closeResponse = await staff.request.post(`/api/tickets/${ticketId}/otp/verify`, { data: { otp: body.otp } });
   expect(closeResponse.status(), await closeResponse.text()).toBe(201);
@@ -283,6 +283,30 @@ test.describe.serial('isolated multi-role operational acceptance', () => {
     await advanceToOtp(manager, ticket.id);
     await closeWithOtp(stall, manager, ticket.id);
     await Promise.all([stall.close(), manager.close()]);
+  });
+
+  test('2b Hall Manager can verify stall OTP for an assigned staff ticket', async ({ browser }) => {
+    const stall = await login(browser, emails.stall);
+    const staff = await login(browser, emails.staff);
+    const manager = await login(browser, emails.manager);
+    const ticket = await createTicket(stall);
+    expect(ticket.status).toBe('ASSIGNED');
+    await advanceToOtp(staff, ticket.id);
+    const otpResponse = await stall.request.get(`/api/tickets/${ticket.id}/otp`);
+    expect(otpResponse.status()).toBe(200);
+    const { otp } = await otpResponse.json() as { otp: string };
+    expect(otp).toMatch(/^\d{6}$/);
+    const managerPresent = await manager.request.get(`/api/tickets/${ticket.id}/otp`);
+    expect(managerPresent.status()).toBe(403);
+    const verified = await manager.request.post(`/api/tickets/${ticket.id}/otp/verify`, { data: { otp } });
+    expect(verified.status(), await verified.text()).toBe(201);
+    expect((await verified.json()).status).toBe('CLOSED');
+    const event = await prisma.ticketEvent.findFirst({
+      where: { ticketId: ticket.id, eventType: 'OTP_VERIFIED' },
+      orderBy: { createdAt: 'desc' },
+    });
+    expect((event?.metadata as { enteredBy?: string } | null)?.enteredBy).toBe('HALL_MANAGER');
+    await Promise.all([stall.close(), staff.close(), manager.close()]);
   });
 
   test('3 compatible pool queue remains FIFO when capacity is released', async ({ browser }) => {
@@ -415,9 +439,24 @@ test.describe.serial('isolated multi-role operational acceptance', () => {
         employeeCode: 'HELP-E2E-NEW',
       },
     });
-    expect(create.status(), await create.text()).toBe(201);
-    const person = await create.json() as { id: string; employeeCode: string; approvalStatus: string };
-    expect(person.employeeCode).toBe('HELP-E2E-NEW');
+    expect(create.status()).toBe(403);
+    expect(String((await create.json()).message)).toMatch(/Admin can assign public person IDs/i);
+    const createOk = await manager.request.post('/api/workforce/people', {
+      data: {
+        name: 'Test House Help',
+        email: `${runKey}.created-house@eveops.test`,
+        password,
+        role: 'STAFF',
+        eventId: ids.event,
+        hallId: ids.hall,
+        serviceCategory: 'HOUSE_HELP',
+        serviceSubtype: 'General',
+        capacity: 1,
+      },
+    });
+    expect(createOk.status(), await createOk.text()).toBe(201);
+    const person = await createOk.json() as { id: string; employeeCode: string | null; approvalStatus: string };
+    expect(person.employeeCode).toBeNull();
     expect(person.approvalStatus).toBe('PENDING_APPROVAL');
     const forbidAdmin = await manager.request.post('/api/workforce/people', {
       data: {
@@ -438,6 +477,8 @@ test.describe.serial('isolated multi-role operational acceptance', () => {
     expect((await pending.json() as Array<{ id: string }>).some((item) => item.id === person.id)).toBe(true);
     const approve = await admin.request.post(`/api/workforce/people/${person.id}/approve`);
     expect(approve.status(), await approve.text()).toBe(201);
+    const approved = await approve.json() as { employeeCode: string };
+    expect(approved.employeeCode).toMatch(/^HELP-\d{4}$/);
     const deactivate = await manager.request.patch(`/api/workforce/people/${person.id}`, { data: { status: 'DISABLED' } });
     expect(deactivate.status()).toBe(200);
     const loginAttempt = await manager.request.post('/api/auth/login', {
@@ -616,16 +657,17 @@ test.describe.serial('isolated multi-role operational acceptance', () => {
         serviceCategory: 'ELECTRICAL',
         serviceSubtype: 'Lighting',
         capacity: 1,
-        employeeCode: 'ELEC-ROUTE-1',
       },
     });
     expect(create.status(), await create.text()).toBe(201);
-    const person = await create.json() as { id: string };
+    const person = await create.json() as { id: string; employeeCode: string | null };
+    expect(person.employeeCode).toBeNull();
     await prisma.workforceMembership.updateMany({ where: { userId: person.id }, data: { availability: 'ON_DUTY' } });
     const ticket = await createTicket(stall);
     expect(ticket.status).toBe('QUEUED');
     const approve = await admin.request.post(`/api/workforce/people/${person.id}/approve`);
     expect(approve.status()).toBe(201);
+    expect((await approve.json() as { employeeCode: string }).employeeCode).toMatch(/^ELEC-\d{4}$/);
     const pendingStaff = await login(browser, `${runKey}.pending-route@eveops.test`);
     const blocked = await pendingStaff.request.patch('/api/workforce/availability', { data: { value: 'ON_DUTY' } });
     expect(blocked.status()).toBe(403);

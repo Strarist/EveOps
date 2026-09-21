@@ -131,6 +131,11 @@ export function projectTicketView(ticket: TicketProjectionInput, scope: AuthScop
       advanceHallManagerWork: scope.role === 'HALL_MANAGER'
         && current?.staffId === scope.userId
         && ticket.pool?.category === 'HALL_MANAGER',
+      verifyStallOtp: ticket.status === 'AWAITING_OTP'
+        && (
+          (scope.role === 'STAFF' && current?.staffId === scope.userId)
+          || scope.role === 'HALL_MANAGER'
+        ),
       emergencyClose: ['ADMIN', 'SUPER_ADMIN'].includes(scope.role)
         && ['AWAITING_OTP', 'ESCALATED'].includes(ticket.status),
     },
@@ -139,7 +144,11 @@ export function projectTicketView(ticket: TicketProjectionInput, scope: AuthScop
       : ticket.status === 'QUEUED'
         ? 'WAIT_FOR_ASSIGNMENT'
         : ticket.status === 'AWAITING_OTP'
-          ? 'STAFF_VERIFY_OTP'
+          ? (
+            (scope.role === 'STAFF' && current?.staffId === scope.userId) || scope.role === 'HALL_MANAGER'
+              ? 'VERIFY_OTP'
+              : 'WAIT_FOR_OTP_VERIFICATION'
+          )
           : current ? 'ASSIGNEE_ACTION' : 'ROUTE',
   };
 }
@@ -540,22 +549,26 @@ export class TicketService {
       const ticket = await tx.ticket.findUniqueOrThrow({ where: { id } });
       assertScope(scope, ticket);
       if (!['STAFF', 'HALL_MANAGER'].includes(scope.role)) {
-        throw new ForbiddenException('Only the assigned staff can enter the stall completion code');
+        throw new ForbiddenException('Only assigned staff or the hall manager can enter the stall completion code');
       }
       const priorAssignment = await tx.assignment.findFirst({
         where: { ticketId: id, staffId: scope.userId },
         orderBy: { assignedAt: 'desc' },
       });
       if (ticket.status === 'CLOSED') {
-        if (!priorAssignment) throw new ForbiddenException('Only the assigned staff can verify completion');
+        if (scope.role === 'STAFF' && !priorAssignment) {
+          throw new ForbiddenException('Only assigned staff or the hall manager can verify completion');
+        }
         return { invalidOtp: false as const, expired: false as const, ticket, releasedStaffIds: [] as string[] };
       }
       if (ticket.status !== 'AWAITING_OTP') throw new BadRequestException('Ticket is not awaiting OTP');
-      const assignment = await tx.assignment.findFirst({
-        where: { ticketId: id, staffId: scope.userId, status: { in: ['ACTIVE', 'ACCEPTED'] } },
-        orderBy: { assignedAt: 'desc' },
-      });
-      if (!assignment) throw new ForbiddenException('Only the assigned staff can enter the stall completion code');
+      if (scope.role === 'STAFF') {
+        const assignment = await tx.assignment.findFirst({
+          where: { ticketId: id, staffId: scope.userId, status: { in: ['ACTIVE', 'ACCEPTED'] } },
+          orderBy: { assignedAt: 'desc' },
+        });
+        if (!assignment) throw new ForbiddenException('Only assigned staff or the hall manager can enter the stall completion code');
+      }
       const challenge = await tx.otpChallenge.findFirst({ where: { ticketId: id, activeTicketKey: id, invalidatedAt: null, verifiedAt: null }, orderBy: { createdAt: 'desc' } });
       const now = new Date();
       if (!challenge || challenge.attempts >= 5) throw new BadRequestException('OTP unavailable or expired');
@@ -610,6 +623,7 @@ export class TicketService {
         });
       }
       const correlationId = requestCorrelationId();
+      const enteredBy = scope.role === 'HALL_MANAGER' ? 'HALL_MANAGER' : 'ASSIGNED_STAFF';
       await tx.ticketEvent.create({
         data: {
           eventId: ticket.eventId,
@@ -619,7 +633,7 @@ export class TicketService {
           fromStatus: 'AWAITING_OTP',
           toStatus: 'CLOSED',
           correlationId,
-          metadata: { enteredBy: 'ASSIGNED_STAFF', credentialSource: 'STALL_DISPLAYED' },
+          metadata: { enteredBy, credentialSource: 'STALL_DISPLAYED' },
         },
       });
       await tx.ticketEvent.create({

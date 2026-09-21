@@ -24,6 +24,7 @@ type Ticket = {
   slaState: 'On track' | 'Response overdue' | 'SLA breached';
   capabilities: {
     advanceHallManagerWork: boolean;
+    verifyStallOtp?: boolean;
     emergencyClose: boolean;
   };
 };
@@ -50,10 +51,11 @@ type ApiTicket = {
   currentAssignee: { id: string; name: string } | null;
   lastAssignee: { id: string; name: string } | null;
   queueState: 'QUEUED' | 'ASSIGNED' | 'NONE';
-  nextAction: 'NONE' | 'WAIT_FOR_ASSIGNMENT' | 'STAFF_VERIFY_OTP' | 'STALL_VERIFY_OTP' | 'ASSIGNEE_ACTION' | 'ROUTE';
+  nextAction: 'NONE' | 'WAIT_FOR_ASSIGNMENT' | 'VERIFY_OTP' | 'WAIT_FOR_OTP_VERIFICATION' | 'STAFF_VERIFY_OTP' | 'STALL_VERIFY_OTP' | 'ASSIGNEE_ACTION' | 'ROUTE';
   slaState: 'ON_TRACK' | 'RESPONSE_OVERDUE' | 'SLA_BREACHED';
   capabilities: {
     advanceHallManagerWork: boolean;
+    verifyStallOtp?: boolean;
     emergencyClose: boolean;
   };
 };
@@ -98,7 +100,7 @@ function mapTicket(ticket: ApiTicket): Ticket {
     completionRequestedAt: ticket.completionRequestedAt,
     closedAt: ticket.closedAt,
     slaState: ticket.slaState === 'SLA_BREACHED' ? 'SLA breached' : ticket.slaState === 'RESPONSE_OVERDUE' ? 'Response overdue' : 'On track',
-    capabilities: ticket.capabilities ?? { advanceHallManagerWork: false, emergencyClose: false },
+    capabilities: ticket.capabilities ?? { advanceHallManagerWork: false, verifyStallOtp: false, emergencyClose: false },
   };
 }
 
@@ -628,7 +630,7 @@ export function StallWorkspace() {
                             <OtpDigits value={otpByTicket[ticket.id]} />
                           </div>
                           <p className="otp-expiry">Expires in {countdownLabel(otpExpiryByTicket[ticket.id], nowMs)}</p>
-                          <p className="otp-hint">Tell this code to {ticket.assignee} only if the work is complete.</p>
+                          <p className="otp-hint">Tell this code to the assigned worker or hall manager only if the work is complete.</p>
                           <button type="button" className="secondary-action" disabled={otpPending[ticket.id]} onClick={() => void regenerateOtp(ticket.id)}>
                             Request new completion code
                           </button>
@@ -924,7 +926,7 @@ function eventTime(value: string | null | undefined, timezone = 'UTC') {
   return new Intl.DateTimeFormat('en-IN', { timeZone: timezone, dateStyle: 'medium', timeStyle: 'short' }).format(new Date(value));
 }
 
-function TicketDrawer({ ticket, timing, detail, eligibleStaff, onPing, onReassign, onReopen, onEscalate, onOverrideClose, onAdvance, onPrioritize, onCancel, canAdmin, canAdvance, canEmergencyClose }: {
+function TicketDrawer({ ticket, timing, detail, eligibleStaff, onPing, onReassign, onReopen, onEscalate, onOverrideClose, onAdvance, onPrioritize, onCancel, onVerifyOtp, canAdmin, canAdvance, canEmergencyClose, canVerifyOtp }: {
   ticket: Ticket;
   timing?: TimingRecord;
   detail?: TicketDetail;
@@ -937,12 +939,24 @@ function TicketDrawer({ ticket, timing, detail, eligibleStaff, onPing, onReassig
   onAdvance?: () => void;
   onPrioritize: (reason: string) => Promise<unknown>;
   onCancel: (reason: string) => Promise<unknown>;
+  onVerifyOtp?: (otp: string) => Promise<boolean>;
   canAdmin: boolean;
   canAdvance: boolean;
   canEmergencyClose: boolean;
+  canVerifyOtp?: boolean;
 }) {
   const [pendingAction, setPendingAction] = useState<'ping' | 'reassign' | 'reopen' | 'escalate' | 'override' | 'prioritize' | 'cancel' | null>(null);
   const [submitting, setSubmitting] = useState(false);
+  const [otpValue, setOtpValue] = useState('');
+  const [otpError, setOtpError] = useState('');
+  const [otpSuccess, setOtpSuccess] = useState('');
+  const [otpSubmitting, setOtpSubmitting] = useState(false);
+  useEffect(() => {
+    setOtpValue('');
+    setOtpError('');
+    setOtpSuccess('');
+    setOtpSubmitting(false);
+  }, [ticket.id, ticket.status]);
   const milestones = [
     ['Raised', timing?.createdAt ?? detail?.createdAt, null as string | null],
     ['Assigned', timing?.firstAssignedAt ?? detail?.firstAssignedAt, timing?.raiseToAssignSeconds != null ? duration(timing.raiseToAssignSeconds) + ' after raise' : null],
@@ -962,6 +976,31 @@ function TicketDrawer({ ticket, timing, detail, eligibleStaff, onPing, onReassig
       {!!timing?.workCycles.length && <div className="cycles"><h3>Work cycles</h3>{timing.workCycles.map((cycle) => <div key={cycle.attempt}><strong>Attempt {cycle.attempt}</strong><span>{eventTime(cycle.assignedAt, timing.eventTimezone)} · {cycle.releasedAt ? 'Completed/released' : 'Active'}</span></div>)}</div>}
       {!!detail?.complaints.length && <div className="cycles"><h3>Complaints</h3>{detail.complaints.map((complaint) => <div key={complaint.id}><strong>{complaint.reasonCode.replaceAll('_', ' ')}</strong><span>{complaint.comment || 'No additional note'} · {eventTime(complaint.createdAt, timing?.eventTimezone)}</span></div>)}</div>}
       {!!detail?.events.length && <div className="timeline"><h3>Audit timeline</h3>{detail.events.map((event) => <div className="timeline-item" key={event.id}><i className="active"></i><div><strong>{event.eventType.replaceAll('_', ' ')}</strong><span>{event.actor?.name ?? 'System'} · {eventTime(event.createdAt, timing?.eventTimezone)}</span></div></div>)}</div>}
+      {canVerifyOtp && ticket.status === 'AWAITING_OTP' && onVerifyOtp && (
+        <StaffOtpEntry
+          value={otpValue}
+          onChange={(next) => { setOtpValue(next); setOtpError(''); }}
+          onSubmit={() => {
+            if (otpValue.length !== 6 || otpSubmitting) return;
+            setOtpSubmitting(true);
+            void onVerifyOtp(otpValue)
+              .then((ok) => {
+                if (ok) {
+                  setOtpSuccess('Completion verified. Ticket closed.');
+                  setOtpError('');
+                } else {
+                  setOtpError('Could not verify the code. Try again.');
+                }
+              })
+              .catch(() => setOtpError('Could not verify the code. Try again.'))
+              .finally(() => setOtpSubmitting(false));
+          }}
+          submitting={otpSubmitting}
+          disabled={!!otpSuccess}
+          error={otpError}
+          success={otpSuccess}
+        />
+      )}
       <div className="drawer-actions">
         {canAdvance && ticket.service.startsWith('HALL MANAGER') && ['ASSIGNED', 'SNOOZED', 'ACCEPTED', 'IN_PROGRESS'].includes(ticket.status) && <button className="primary" onClick={onAdvance}>{ticket.status === 'ACCEPTED' ? 'Start work' : ticket.status === 'IN_PROGRESS' ? 'Request completion' : 'Accept'}</button>}
         {['ASSIGNED', 'SNOOZED', 'ACCEPTED'].includes(ticket.status) && <><button onClick={() => setPendingAction('ping')}>Ping staff</button><button onClick={() => setPendingAction('reassign')}>Reassign</button></>}
@@ -1338,8 +1377,11 @@ export function ManagementWorkspace({ role }: { role: 'HALL_MANAGER' | 'ADMIN' }
       eventId,
       hallId,
       capacity: Number(values.get('capacity') || 1),
-      employeeCode: String(values.get('employeeCode') ?? '').trim().toUpperCase() || undefined,
     };
+    if (role === 'ADMIN') {
+      const employeeCode = String(values.get('employeeCode') ?? '').trim().toUpperCase();
+      if (employeeCode) body.employeeCode = employeeCode;
+    }
     if (createdRole === 'STAFF') {
       body.serviceCategory = String(values.get('serviceCategory') ?? personServiceCategory);
       body.serviceSubtype = String(values.get('serviceSubtype') ?? '');
@@ -1363,7 +1405,7 @@ export function ManagementWorkspace({ role }: { role: 'HALL_MANAGER' | 'ADMIN' }
     setPersonServiceCategory('HOUSE_HELP');
     setManagementError(
       created.approvalStatus === 'PENDING_APPROVAL'
-        ? `Staff ${created.employeeCode ?? ''} created and sent for Admin approval. They cannot sign in until approved.`
+        ? `Staff ${created.name ?? String(body.name)} created and sent for Admin approval. Public person ID will be assigned on approval.`
         : `Created ${created.name ?? String(body.name)} (${created.employeeCode ?? 'no public ID'}). Temporary password must be changed on first sign-in.`,
     );
     await refreshWorkforcePanels();
@@ -1474,7 +1516,7 @@ export function ManagementWorkspace({ role }: { role: 'HALL_MANAGER' | 'ADMIN' }
       </aside>
       <main className="management">
         <header className="topbar"><div><span className="eyebrow">{profile?.scopes[0]?.event.name ?? 'EveOps event'} · {connection === 'live' ? 'Live' : 'Reconnecting'}</span><h1>{title}</h1></div><div className="top-actions"><span>{profile?.scopes[0]?.hall?.name ?? 'All scoped halls'}</span><button onClick={() => void loadNotifications()}>Notifications · {notifications.filter((notification) => !notification.readAt).length}</button></div></header>
-        {managementError && <div className={managementError.startsWith('Export queued') || managementError.startsWith('Created ') || managementError.includes('sent for Admin approval') || managementError.startsWith('Staff approved') || managementError.startsWith('Staff request rejected') || managementError.endsWith('created.') || managementError.startsWith('SLA targets') || managementError.includes('Temporary password must be changed') ? 'alert-line' : 'form-error'} role="status">{managementError}</div>}
+        {managementError && <div className={managementError.startsWith('Export queued') || managementError.startsWith('Created ') || managementError.includes('sent for Admin approval') || managementError.startsWith('Staff approved') || managementError.startsWith('Staff request rejected') || managementError.endsWith('created.') || managementError.startsWith('SLA targets') || managementError.includes('Temporary password must be changed') || managementError.startsWith('Completion verified') ? 'alert-line' : 'form-error'} role="status">{managementError}</div>}
         {showNotifications && <section className="notification-panel">{notifications.length ? notifications.slice(0, 10).map((notification) => <button key={notification.id} onClick={() => void apiFetch('/api/notifications/' + notification.id + '/read', { method: 'PATCH', credentials: 'include' }).then(() => loadNotifications())}><strong>{notification.type.replaceAll('_', ' ')}</strong><span>{eventTime(notification.sentAt)}</span></button>) : <p className="empty-state">No notifications.</p>}</section>}
         <section className="metric-grid" aria-label="Operational metrics">{metrics.map((metric) => <article key={metric.label} className={metric.critical ? 'metric critical' : 'metric'}><span>{metric.label}</span><strong>{metric.value}</strong><small>Updated live</small></article>)}</section>
         {(activeSection === 'Staff' || activeSection === 'Workforce') && (() => {
@@ -1495,7 +1537,11 @@ export function ManagementWorkspace({ role }: { role: 'HALL_MANAGER' | 'ADMIN' }
               <label>Login email<span aria-hidden="true"> *</span><input name="email" type="email" required autoComplete="username" /></label>
               <label>Phone<input name="phone" autoComplete="tel" /></label>
               <label>Temporary password<span aria-hidden="true"> *</span><input name="password" type="password" required minLength={10} autoComplete="new-password" /><span className="otp-hint">Must be changed on first sign-in.</span></label>
-              <label>Public person ID (optional)<input name="employeeCode" placeholder={role === 'HALL_MANAGER' ? 'ELEC-0012 or HELP-0047' : 'STF-00012'} /></label>
+              {role === 'ADMIN' ? (
+                <label>Public person ID (optional)<input name="employeeCode" placeholder="STF-00012" /><span className="otp-hint">Leave blank to auto-generate. Hall Managers cannot assign IDs.</span></label>
+              ) : (
+                <p className="otp-hint">Public person ID will be assigned by Admin on approval.</p>
+              )}
               {role === 'ADMIN' ? (
                 <label>Role<span aria-hidden="true"> *</span>
                   <select name="role" required value={personRole} onChange={(change) => setPersonRole(change.target.value as 'STAFF' | 'HALL_MANAGER')}>
@@ -1558,7 +1604,21 @@ export function ManagementWorkspace({ role }: { role: 'HALL_MANAGER' | 'ADMIN' }
             <div className="filters"><select aria-label="Status filter" value={statusFilter} onChange={(event) => setStatusFilter(event.target.value)}><option value="">All statuses</option>{Object.keys(statusLabels).map((status) => <option key={status} value={status}>{statusLabels[status as TicketStatus]}</option>)}</select><select aria-label="Service filter" value={categoryFilter} onChange={(event) => setCategoryFilter(event.target.value)}><option value="">All services</option><option value="ELECTRICAL">Electrical</option><option value="HOUSE_HELP">House Help</option><option value="HALL_MANAGER">Hall Manager</option></select><label className="sr-only" htmlFor="ticket-search">Search tickets</label><input id="ticket-search" value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search ticket or stall" /></div>
             {loading ? <p className="empty-state">Loading live operations…</p> : loadError ? <p className="form-error">{loadError}</p> : !items.length ? <p className="empty-state">No tickets match the current scope. Clear filters to see all tickets.</p> : <><div className="table-wrap"><table><thead><tr><th>Ticket</th><th>Location / issue</th><th>Status</th><th>Age</th><th>Assignee</th><th>SLA</th></tr></thead><tbody>{items.map((ticket) => <tr key={ticket.no} tabIndex={0} className={selected?.no === ticket.no ? 'selected' : ''} onClick={() => setSelected(ticket)} onKeyDown={(event) => { if (event.key === 'Enter') setSelected(ticket); }}><td><strong>{ticket.no}</strong><small>{ticket.service}</small></td><td><strong>{ticket.location}</strong><small>{ticket.description}</small></td><td><Status value={ticket.status} /></td><td className={ticket.priority ? 'red' : ''}>{ticket.age}</td><td>{ticket.assignee}</td><td><span className={ticket.slaState === 'On track' ? 'sla' : 'sla breach'}>{ticket.slaState}</span></td></tr>)}</tbody></table></div>{nextCursor && <button onClick={() => void loadMore()}>Load more</button>}</>}
           </div>
-          {selected && <TicketDrawer ticket={selected} timing={timings[selected.id]} detail={detail} canAdmin={role === 'ADMIN'} canEmergencyClose={selected.capabilities.emergencyClose} canAdvance={selected.capabilities.advanceHallManagerWork} eligibleStaff={workforce.filter((membership) => membership.availability === 'ON_DUTY' && (membership.user.approvalStatus ?? 'APPROVED') === 'APPROVED' && membership.user.status !== 'DISABLED')} onAdvance={() => void runTicketAction('/transition', { to: selected.status === 'ACCEPTED' ? 'IN_PROGRESS' : selected.status === 'IN_PROGRESS' ? 'AWAITING_OTP' : 'ACCEPTED' })} onPing={(message) => runTicketAction('/ping', { message })} onReassign={reassignSelected} onReopen={(reason) => transitionSelected('REOPENED', reason)} onEscalate={(reason) => transitionSelected('ESCALATED', reason)} onPrioritize={(reason) => runTicketAction('/prioritize', { reason })} onCancel={(reason) => transitionSelected('CANCELLED', reason)} onOverrideClose={(reason) => runTicketAction('/override-close', { reason })} />}
+          {selected && <TicketDrawer ticket={selected} timing={timings[selected.id]} detail={detail} canAdmin={role === 'ADMIN'} canEmergencyClose={selected.capabilities.emergencyClose} canAdvance={selected.capabilities.advanceHallManagerWork} canVerifyOtp={!!selected.capabilities.verifyStallOtp} eligibleStaff={workforce.filter((membership) => membership.availability === 'ON_DUTY' && (membership.user.approvalStatus ?? 'APPROVED') === 'APPROVED' && membership.user.status !== 'DISABLED')} onAdvance={() => void runTicketAction('/transition', { to: selected.status === 'ACCEPTED' ? 'IN_PROGRESS' : selected.status === 'IN_PROGRESS' ? 'AWAITING_OTP' : 'ACCEPTED' })} onPing={(message) => runTicketAction('/ping', { message })} onReassign={reassignSelected} onReopen={(reason) => transitionSelected('REOPENED', reason)} onEscalate={(reason) => transitionSelected('ESCALATED', reason)} onPrioritize={(reason) => runTicketAction('/prioritize', { reason })} onCancel={(reason) => transitionSelected('CANCELLED', reason)} onOverrideClose={(reason) => runTicketAction('/override-close', { reason })} onVerifyOtp={async (otp) => {
+            const response = await apiFetch('/api/tickets/' + selected.id + '/otp/verify', {
+              method: 'POST',
+              credentials: 'include',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ otp }),
+            });
+            if (!response.ok) {
+              setManagementError(await apiErrorMessage(response, 'Could not verify the completion code'));
+              return false;
+            }
+            setManagementError('Completion verified. Ticket closed.');
+            await refresh();
+            return true;
+          }} />}
         </section>
       </main>
     </div>

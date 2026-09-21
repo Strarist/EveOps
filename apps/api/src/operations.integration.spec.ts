@@ -398,7 +398,7 @@ describe('operational database invariants', () => {
     expect(['CLOSED', 'REOPENED', 'QUEUED', 'ASSIGNED']).toContain(final.status);
   });
 
-  it('allows only stall to present OTP and only assigned staff to verify it', async () => {
+  it('allows only stall to present OTP; assigned staff or hall manager may verify', async () => {
     await releaseActiveAssignments();
     await prisma.workforceMembership.updateMany({ where: { userId: ids.staffUser, poolId: ids.pool }, data: { availability: 'ON_DUTY' } });
     const ticketId = `${key}-otp-roles`;
@@ -410,11 +410,29 @@ describe('operational database invariants', () => {
     const presented = await tickets.presentOtp(ticketId, stallScope);
     expect(presented.otp).toMatch(/^\d{6}$/);
     await expect(tickets.presentOtp(ticketId, staffScope)).rejects.toThrow(/bound stall|Forbidden/i);
-    await expect(tickets.verifyOtp(ticketId, presented.otp!, stallScope)).rejects.toThrow(/assigned staff|Forbidden/i);
+    await expect(tickets.presentOtp(ticketId, managerScope)).rejects.toThrow(/bound stall|Forbidden/i);
+    await expect(tickets.verifyOtp(ticketId, presented.otp!, stallScope)).rejects.toThrow(/assigned staff|hall manager|Forbidden/i);
     await tickets.verifyOtp(ticketId, presented.otp!, staffScope);
     const closed = await prisma.ticket.findUniqueOrThrow({ where: { id: ticketId } });
     expect(closed.status).toBe('CLOSED');
     await expect(tickets.presentOtp(ticketId, stallScope)).rejects.toThrow(/already verified|not awaiting/i);
+  });
+
+  it('allows hall manager to verify stall OTP without being the assignee', async () => {
+    await releaseActiveAssignments();
+    await prisma.workforceMembership.updateMany({ where: { userId: ids.staffUser, poolId: ids.pool }, data: { availability: 'ON_DUTY' } });
+    const ticketId = `${key}-otp-hm-verify`;
+    await prisma.ticket.create({ data: ticketData(ticketId, `${key}-otp-hm-001`, 'ASSIGNED', new Date()) });
+    await prisma.assignment.create({ data: { eventId: ids.event, ticketId, staffId: ids.staffUser, status: 'ACTIVE', activeTicketKey: ticketId } });
+    await tickets.transition(ticketId, 'ACCEPTED', staffScope);
+    await tickets.transition(ticketId, 'IN_PROGRESS', staffScope);
+    await tickets.transition(ticketId, 'AWAITING_OTP', staffScope);
+    const presented = await tickets.presentOtp(ticketId, stallScope);
+    await tickets.verifyOtp(ticketId, presented.otp!, managerScope);
+    const closed = await prisma.ticket.findUniqueOrThrow({ where: { id: ticketId } });
+    expect(closed.status).toBe('CLOSED');
+    const verified = await prisma.ticketEvent.findFirst({ where: { ticketId, eventType: 'OTP_VERIFIED' }, orderBy: { createdAt: 'desc' } });
+    expect((verified?.metadata as { enteredBy?: string } | null)?.enteredBy).toBe('HALL_MANAGER');
   });
 
   it('preserves one active assignee during reassign versus accept', async () => {

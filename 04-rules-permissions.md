@@ -44,7 +44,7 @@ administrators, security/operations reviewers.
 | Snooze assigned alert   | No                   | Own only             | No                   | No            | No               |
 | Start / request closure | No                   | Own only             | Manager override     | Yes           | Yes              |
 | Display OTP             | Own stall            | No                   | No                   | No            | No               |
-| Enter / verify OTP      | No                   | Assigned only        | Assigned only\*\*    | Override only | Override only    |
+| Enter / verify OTP      | No                   | Assigned only        | Yes within hall      | Override only | Override only    |
 | Raise complaint         | Own stall            | No                   | On behalf            | On behalf     | On behalf        |
 | Reassign                | No                   | No                   | Within hall          | Within event  | All scoped       |
 | Reopen                  | No\*\*\*             | No                   | Within hall          | Within event  | All scoped       |
@@ -54,7 +54,7 @@ administrators, security/operations reviewers.
 | View audit log          | Own ticket timeline  | Own ticket timeline  | Hall timeline        | Event audit   | All scoped audit |
 
 \* Staff sees tickets assigned to them and any limited queue metadata
-needed for work. \*\* Normal OTP is displayed only to the Stall; assigned Staff enters it as physical completion confirmation.
+needed for work. \*\* Normal OTP is displayed only to the Stall; assigned Staff or the scoped Hall Manager enters it as physical completion confirmation.
 \*\*\* Stall requests complaint/reopen; Hall Manager/Admin performs
 formal reopen.
 
@@ -204,6 +204,11 @@ subtype/priority.
 - May ping staff and Admin through system notification actions; message
   actions are audit logged.
 
+- May create Electrical or House Help staff requests for Admin approval
+  within assigned halls. Public person IDs (employee codes) are assigned
+  only by Admin on create or approval — Hall Managers cannot set or
+  generate them.
+
 - Cannot alter event-global configuration unless separately granted
   Admin rights.
 
@@ -216,7 +221,8 @@ subtype/priority.
 
 - May create/update halls, zones, stalls, staff mappings and service
   configuration before/during event subject to data-integrity
-  constraints.
+  constraints. Only Admin (and SuperAdmin) may assign or auto-generate
+  public person IDs for workforce identities.
 
 - May reassign/reopen/escalate/cancel and perform emergency close with
   reason.
