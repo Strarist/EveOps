@@ -139,7 +139,7 @@ tbody tr:hover, tbody tr.selected { background: #f1f8f7; }
 
 /* Stall and staff mobile-first workspaces */
 .mobile-page { min-height: 100dvh; background: #e9edf0; }
-.mobile-shell { width: min(100%, 520px); min-height: 100dvh; position: relative; margin: 0 auto; padding: 1.2rem 1.1rem 5.5rem; background: var(--surface); }
+.mobile-shell { width: min(100%, 520px); min-height: 100dvh; position: relative; margin: 0 auto; padding: 1.2rem 1.1rem 8rem; background: var(--surface); }
 .mobile-header { display: flex; align-items: center; justify-content: space-between; gap: 1rem; margin-bottom: 1.5rem; }
 .mobile-header h1 { margin: .2rem 0 0; font-size: 1.5rem; }
 .online, .duty { min-height: 36px; padding: .5rem .7rem; border: 0; border-radius: 1rem; background: var(--green-soft); color: var(--green); font-size: .72rem; font-weight: 800; }
@@ -162,7 +162,7 @@ tbody tr:hover, tbody tr.selected { background: #f1f8f7; }
 .recent > span:last-child { grid-column: 2; color: var(--muted); font-size: .68rem; }
 .bottom-nav { width: min(100%, 520px); height: 68px; position: fixed; right: 0; bottom: 0; left: 0; z-index: 5; margin: 0 auto; display: flex; align-items: center; justify-content: space-around; border-top: 1px solid var(--line); background: var(--white); color: var(--muted); font-size: .68rem; }
 .bottom-nav b, .bottom-nav > button.nav-active { color: var(--teal); font-weight: 800; }
-.bottom-nav > button { border: 0; background: transparent; color: var(--muted); font: inherit; }
+.bottom-nav > button { min-height: 44px; border: 0; background: transparent; color: var(--muted); font: inherit; }
 .bottom-nav .logout { min-height: 38px; border-color: var(--line); color: var(--muted); padding: 0 .5rem; }
 .raise-form h2 { font-size: 1.45rem; }
 .back { min-height: 44px; margin-bottom: 1rem; border: 0; background: transparent; padding: 0; }
@@ -236,17 +236,37 @@ tbody tr:hover, tbody tr.selected { background: #f1f8f7; }
   .login-brand p { display: none; }
   .login-panel { padding: 1rem; }
   .app-shell { display: block; }
-  .sidebar { min-height: auto; position: static; padding: .8rem 1rem; display: grid; grid-template-columns: 1fr auto; }
+  .sidebar { min-height: auto; position: sticky; top: 0; z-index: 20; padding: .8rem 1rem calc(.8rem + env(safe-area-inset-bottom)); display: grid; gap: .6rem; }
   .sidebar .brand { padding: 0; }
-  .sidebar nav, .sidebar .user { display: none; }
-  .sidebar .logout { min-width: 80px; }
+  .sidebar nav { display: flex; gap: .35rem; overflow-x: auto; }
+  .sidebar nav button { flex: 0 0 auto; min-height: 44px; background: #1c3148; }
+  .sidebar .user { display: none; }
+  .sidebar .logout { min-width: 80px; min-height: 44px; }
   .management { width: auto; grid-column: auto; grid-row: auto; padding: 0 .75rem 1.5rem; overflow: visible; }
   .topbar { min-height: 82px; }
   .top-actions button:first-child { display: none; }
   .metric-grid { grid-template-columns: repeat(2, 1fr); }
-  .filters input { display: none; }
+  .filters input, .filters select { display: block; width: 100%; min-height: 44px; }
   .operations th:nth-child(n + 4), .operations td:nth-child(n + 4) { display: none; }
   .portfolio-hero { grid-template-columns: repeat(2, 1fr); }
   .portfolio-list article { grid-template-columns: 1fr 1fr; }
   .portfolio-list article > div:first-child { grid-column: 1 / -1; }
+}
+
+.stall-hero { margin: .2rem 0; font-size: 1.8rem; font-weight: 800; letter-spacing: -.03em; }
+.where-line { margin: 0 0 .4rem; color: var(--muted); }
+.task-alert { display: grid; gap: .35rem; margin: .6rem 0; padding: .9rem; border: 1px solid #e2b15a; border-radius: 10px; background: var(--amber-soft); }
+.task-alert .ticket-actions { display: grid; gap: .45rem; }
+.task-alert a, .task-alert button { min-height: 48px; }
+.raise-form, .authority-action, .availability-panel { width: min(100%, 36rem); }
+.bottom-nav { padding-bottom: calc(.55rem + env(safe-area-inset-bottom)); }
+.mobile-page { padding-bottom: env(safe-area-inset-bottom); }
+@media (min-width: 900px) {
+  .mobile-shell { max-width: 760px; margin: 0 auto; }
+}
+@media (min-width: 1200px) {
+  .mobile-shell.staff { max-width: 960px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation-duration: .01ms !important; transition-duration: .01ms !important; scroll-behavior: auto !important; }
 }

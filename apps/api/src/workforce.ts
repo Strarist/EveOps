@@ -999,7 +999,16 @@ export class WorkforceService {
           ticketId,
           type: 'TICKET_ASSIGNED',
           dedupeKey: `ticket-reassigned:${ticketId}:${assignment.id}:${staffId}`,
-          payload: { hallId: ticket.hallId, previousStaffId: active?.staffId ?? null },
+          payload: {
+            hallId: ticket.hallId,
+            stallCode: (await tx.stall.findUnique({ where: { id: ticket.stallId }, select: { stallCode: true } }))?.stallCode,
+            category: ticket.category,
+            priority: ticket.priority,
+            issue: ticket.description.slice(0, 140),
+            publicNo: ticket.publicNo,
+            summary: 'New task',
+            previousStaffId: active?.staffId ?? null,
+          },
         },
       });
       return { assignment, previousStaffId: active?.staffId };

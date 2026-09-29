@@ -285,6 +285,11 @@ describe('operational database invariants', () => {
     expect(exceptions.some((ticket) => ticket.id === ticketId)).toBe(true);
     const metrics = await management.metrics(managerScope);
     expect(metrics.complaints).toBeGreaterThanOrEqual(1);
+    expect(metrics.halls.length).toBeGreaterThan(0);
+    expect(metrics.categoryBacklog.every((row) => row.open >= 0)).toBe(true);
+    expect(metrics.reopenRate === null || metrics.reopenRate >= 0).toBe(true);
+    expect(metrics.complaintRate).toBeGreaterThan(0);
+    expect(Array.isArray(metrics.workforceLoad)).toBe(true);
   });
 
   it('increments escalation level and records it in audit metadata', async () => {

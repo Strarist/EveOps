@@ -180,6 +180,7 @@ model User {
   ticketEvents         TicketEvent[]
   sessions             Session[]
   notifications        Notification[]
+  pushSubscriptions    PushSubscription[]
   exportJobs           ExportJob[]
   workforceMemberships WorkforceMembership[]
   createdTickets       Ticket[]              @relation("TicketCreator")
@@ -390,12 +391,26 @@ model Notification {
   ticket      Ticket?   @relation(fields: [ticketId], references: [id])
   type        String
   dedupeKey   String    @unique
-  payload     Json?
-  readAt      DateTime?
-  sentAt      DateTime  @default(now())
+  payload      Json?
+  readAt       DateTime?
+  sentAt       DateTime  @default(now())
+  pushAttempts Int       @default(0)
+  pushedAt     DateTime?
 
   @@index([recipientId, readAt, sentAt])
   @@index([eventId, sentAt])
+}
+
+model PushSubscription {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  endpoint  String   @unique
+  p256dh    String
+  auth      String
+  createdAt DateTime @default(now())
+
+  @@index([userId])
 }
 
 model OutboxEvent {

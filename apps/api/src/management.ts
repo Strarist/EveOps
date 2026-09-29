@@ -1,4 +1,4 @@
-import { BadRequestException, Body, Controller, Get, Injectable, NotFoundException, Param, Patch, Post, Query, Res, StreamableFile, UseGuards } from '@nestjs/common';
+import { BadRequestException, Body, Controller, ForbiddenException, Get, Injectable, NotFoundException, Param, Patch, Post, Query, Res, StreamableFile, UseGuards } from '@nestjs/common';
 import type { AuthScope } from '@eveops/contracts';
 import type { Response } from 'express';
 import { Prisma } from '@prisma/client';
@@ -28,6 +28,7 @@ export class MetricsQueryDto {
   @IsOptional() @IsDateString() from?: string;
   @IsOptional() @IsDateString() to?: string;
   @IsOptional() @IsIn(['today', 'event', 'custom']) range?: 'today' | 'event' | 'custom';
+  @IsOptional() @IsString() eventId?: string;
 }
 
 export class UpdatePoolDto {
@@ -73,8 +74,9 @@ export class ManagementService {
 
   async metrics(scope: AuthScope, query: MetricsQueryDto = {}) {
     requireAuthority(scope.role, 'HALL_MANAGER');
+    if (query.eventId && !scope.eventIds.includes(query.eventId)) throw new ForbiddenException('Event is outside your scope');
     const where: Prisma.TicketWhereInput = {
-      eventId: { in: scope.eventIds },
+      eventId: query.eventId ?? { in: scope.eventIds },
       ...(scope.role === 'HALL_MANAGER' ? { hallId: { in: scope.hallIds } } : {}),
     };
     if (query.from || query.to || query.range === 'today') {
@@ -113,9 +115,6 @@ export class ManagementService {
       });
       return formatter.format(ticket.closedAt) === formatter.format(new Date());
     }).length;
-    const responseDurations = openTickets.flatMap((ticket) =>
-      ticket.firstAcceptedAt ? [Math.floor((ticket.firstAcceptedAt.getTime() - ticket.createdAt.getTime()) / 1000)] : [],
-    );
     const now = Date.now();
     const slaBreached = openTickets.filter((ticket) => {
       const responseBreached = !ticket.firstAcceptedAt && now - ticket.createdAt.getTime() > (ticket.pool?.responseTargetSeconds ?? 600) * 1000;
@@ -123,6 +122,121 @@ export class ManagementService {
       return responseBreached || resolutionBreached;
     }).length;
     const statusCounts = Object.fromEntries(statusGroups.map((group) => [group.status.toLowerCase(), group._count._all]));
+    const scopedEventIds = query.eventId ? [query.eventId] : scope.eventIds;
+    const createdFrom = where.createdAt && typeof where.createdAt === 'object' && 'gte' in where.createdAt ? where.createdAt.gte : undefined;
+    const createdTo = where.createdAt && typeof where.createdAt === 'object' && 'lte' in where.createdAt ? where.createdAt.lte : undefined;
+    const ticketScope = scopedEventIds.length
+      ? Prisma.sql`t."eventId" IN (${Prisma.join(scopedEventIds)})`
+      : Prisma.sql`FALSE`;
+    const hallScope = scope.role === 'HALL_MANAGER' && scope.hallIds.length
+      ? Prisma.sql`AND t."hallId" IN (${Prisma.join(scope.hallIds)})`
+      : Prisma.empty;
+    const dateScope = Prisma.sql`${createdFrom ? Prisma.sql`AND t."createdAt" >= ${createdFrom}` : Prisma.empty}${createdTo ? Prisma.sql`AND t."createdAt" <= ${createdTo}` : Prisma.empty}`;
+    const emptyBreakdown = scopedEventIds.length === 0 || (scope.role === 'HALL_MANAGER' && scope.hallIds.length === 0);
+    const [rates, durations, categoryGroups, halls, workforceLoad, oldestQueued, oldestAccepted, oldestInProgress] = emptyBreakdown
+      ? [{ total: 0, reopened: 0, complained: 0 }, { avgResponseSeconds: null, avgResolutionSeconds: null, medianResponseSeconds: null, p90ResponseSeconds: null, medianResolutionSeconds: null, p90ResolutionSeconds: null }, [], [], [], null, null, null]
+      : await Promise.all([
+        this.prisma.ticket.aggregate({
+          where: { ...where, status: { not: 'CANCELLED' } },
+          _count: { _all: true },
+        }).then(async (total) => {
+          const [reopened, complained] = await Promise.all([
+            this.prisma.ticket.count({ where: { ...where, reopenCount: { gt: 0 }, status: { not: 'CANCELLED' } } }),
+            this.prisma.ticket.count({ where: { ...where, status: { not: 'CANCELLED' }, complaints: { some: {} } } }),
+          ]);
+          return { total: total._count._all, reopened, complained };
+        }),
+        this.prisma.$queryRaw<Array<{
+          avgResponseSeconds: number | null;
+          avgResolutionSeconds: number | null;
+          medianResponseSeconds: number | null;
+          p90ResponseSeconds: number | null;
+          medianResolutionSeconds: number | null;
+          p90ResolutionSeconds: number | null;
+        }>>(Prisma.sql`
+          SELECT
+            (AVG(EXTRACT(EPOCH FROM (t."firstAcceptedAt" - t."createdAt"))) FILTER (WHERE t."firstAcceptedAt" IS NOT NULL))::double precision AS "avgResponseSeconds",
+            (AVG(EXTRACT(EPOCH FROM (t."closedAt" - t."createdAt"))) FILTER (WHERE t.status = 'CLOSED' AND t."closedAt" IS NOT NULL))::double precision AS "avgResolutionSeconds",
+            (percentile_cont(0.5) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM (t."firstAcceptedAt" - t."createdAt"))) FILTER (WHERE t."firstAcceptedAt" IS NOT NULL))::double precision AS "medianResponseSeconds",
+            (percentile_cont(0.9) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM (t."firstAcceptedAt" - t."createdAt"))) FILTER (WHERE t."firstAcceptedAt" IS NOT NULL))::double precision AS "p90ResponseSeconds",
+            (percentile_cont(0.5) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM (t."closedAt" - t."createdAt"))) FILTER (WHERE t.status = 'CLOSED' AND t."closedAt" IS NOT NULL))::double precision AS "medianResolutionSeconds",
+            (percentile_cont(0.9) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM (t."closedAt" - t."createdAt"))) FILTER (WHERE t.status = 'CLOSED' AND t."closedAt" IS NOT NULL))::double precision AS "p90ResolutionSeconds"
+          FROM "Ticket" t
+          WHERE ${ticketScope} ${hallScope} ${dateScope}
+        `).then((rows) => rows[0] ?? {
+          avgResponseSeconds: null,
+          avgResolutionSeconds: null,
+          medianResponseSeconds: null,
+          p90ResponseSeconds: null,
+          medianResolutionSeconds: null,
+          p90ResolutionSeconds: null,
+        }),
+        this.prisma.ticket.groupBy({
+          by: ['category'],
+          where: { ...where, status: { notIn: ['CLOSED', 'CANCELLED'] } },
+          _count: { _all: true },
+        }),
+        this.prisma.$queryRaw<Array<{ id: string; code: string; name: string; open: number; queued: number; overdue: number; escalated: number }>>(Prisma.sql`
+          SELECT
+            h.id,
+            h.code,
+            h.name,
+            COUNT(DISTINCT t.id) FILTER (WHERE t.status NOT IN ('CLOSED', 'CANCELLED'))::int AS open,
+            COUNT(DISTINCT t.id) FILTER (WHERE t.status = 'QUEUED')::int AS queued,
+            COUNT(DISTINCT t.id) FILTER (WHERE a.status::text IN ('ACTIVE', 'ACCEPTED') AND a."responseOverdueAt" IS NOT NULL)::int AS overdue,
+            COUNT(DISTINCT t.id) FILTER (WHERE t.status = 'ESCALATED')::int AS escalated
+          FROM "Hall" h
+          LEFT JOIN "Ticket" t ON t."hallId" = h.id AND t."eventId" = h."eventId" ${createdFrom ? Prisma.sql`AND t."createdAt" >= ${createdFrom}` : Prisma.empty} ${createdTo ? Prisma.sql`AND t."createdAt" <= ${createdTo}` : Prisma.empty}
+          LEFT JOIN "Assignment" a ON a."ticketId" = t.id
+          WHERE h."eventId" IN (${Prisma.join(scopedEventIds)})
+            ${scope.role === 'HALL_MANAGER' ? Prisma.sql`AND h.id IN (${Prisma.join(scope.hallIds)})` : Prisma.empty}
+          GROUP BY h.id, h.code, h.name
+          ORDER BY h.code ASC
+        `),
+        this.prisma.$queryRaw<Array<{ hallCode: string; category: string; onDuty: number; paused: number; offDuty: number; capacity: number; active: number }>>(Prisma.sql`
+          SELECT
+            COALESCE(h.code, 'EVENT') AS "hallCode",
+            sp.category,
+            COUNT(DISTINCT wm."userId") FILTER (WHERE wm.availability::text = 'ON_DUTY' AND u.status::text = 'ACTIVE' AND u."approvalStatus"::text = 'APPROVED')::int AS "onDuty",
+            COUNT(DISTINCT wm."userId") FILTER (WHERE wm.availability::text = 'PAUSED' AND u.status::text = 'ACTIVE' AND u."approvalStatus"::text = 'APPROVED')::int AS paused,
+            COUNT(DISTINCT wm."userId") FILTER (WHERE wm.availability::text IN ('OFF_DUTY', 'OFFLINE') AND u.status::text = 'ACTIVE' AND u."approvalStatus"::text = 'APPROVED')::int AS "offDuty",
+            COALESCE(SUM(wm.capacity) FILTER (WHERE wm.availability::text = 'ON_DUTY' AND u.status::text = 'ACTIVE' AND u."approvalStatus"::text = 'APPROVED'), 0)::int AS capacity,
+            COALESCE(SUM(load.active) FILTER (WHERE wm.availability::text = 'ON_DUTY' AND u.status::text = 'ACTIVE' AND u."approvalStatus"::text = 'APPROVED'), 0)::int AS active
+          FROM "WorkforceMembership" wm
+          JOIN "ServicePool" sp ON sp.id = wm."poolId"
+          JOIN "User" u ON u.id = wm."userId"
+          LEFT JOIN "Hall" h ON h.id = sp."hallId"
+          LEFT JOIN LATERAL (
+            SELECT COUNT(DISTINCT at.id)::int AS active
+            FROM "Assignment" asn
+            JOIN "Ticket" at ON at.id = asn."ticketId" AND at."poolId" = wm."poolId"
+            WHERE asn."staffId" = wm."userId" AND asn.status::text IN ('ACTIVE', 'ACCEPTED')
+          ) load ON true
+          WHERE wm."eventId" IN (${Prisma.join(scopedEventIds)})
+            ${scope.role === 'HALL_MANAGER' ? Prisma.sql`AND sp."hallId" IN (${Prisma.join(scope.hallIds)})` : Prisma.empty}
+          GROUP BY h.code, sp.category
+          ORDER BY h.code ASC, sp.category ASC
+        `),
+        this.prisma.ticket.findFirst({
+          where: { ...where, status: { in: ['NEW', 'QUEUED'] } },
+          orderBy: { createdAt: 'asc' },
+          select: { createdAt: true },
+        }),
+        this.prisma.ticket.findFirst({
+          where: { ...where, status: 'ACCEPTED' },
+          orderBy: { firstAcceptedAt: 'asc' },
+          select: { firstAcceptedAt: true },
+        }),
+        this.prisma.ticket.findFirst({
+          where: { ...where, status: 'IN_PROGRESS' },
+          orderBy: { firstStartedAt: 'asc' },
+          select: { firstStartedAt: true },
+        }),
+      ]);
+    const seconds = (value: number | null | undefined) => value == null || Number.isNaN(Number(value)) ? null : Math.floor(Number(value));
+    const ageSeconds = (value: Date | null | undefined) => value ? Math.floor((now - value.getTime()) / 1000) : null;
+    const onDutyCapacity = workforceLoad.reduce((sum, row) => sum + Number(row.capacity), 0);
+    const onDutyActive = workforceLoad.reduce((sum, row) => sum + Number(row.active), 0);
     return {
       open: openTickets.length,
       queued,
@@ -132,7 +246,35 @@ export class ManagementService {
       closedToday,
       slaBreached,
       oldestOutstandingSeconds: openTickets.length ? Math.floor((now - Math.min(...openTickets.map((ticket) => ticket.createdAt.getTime()))) / 1000) : null,
-      avgResponseSeconds: responseDurations.length ? Math.floor(responseDurations.reduce((sum, value) => sum + value, 0) / responseDurations.length) : null,
+      avgResponseSeconds: seconds(durations.avgResponseSeconds),
+      avgResolutionSeconds: seconds(durations.avgResolutionSeconds),
+      medianResponseSeconds: seconds(durations.medianResponseSeconds),
+      p90ResponseSeconds: seconds(durations.p90ResponseSeconds),
+      medianResolutionSeconds: seconds(durations.medianResolutionSeconds),
+      p90ResolutionSeconds: seconds(durations.p90ResolutionSeconds),
+      reopenRate: rates.total ? rates.reopened / rates.total : null,
+      complaintRate: rates.total ? rates.complained / rates.total : null,
+      staffUtilization: onDutyCapacity ? onDutyActive / onDutyCapacity : null,
+      oldestQueuedSeconds: ageSeconds(oldestQueued?.createdAt),
+      oldestAcceptedSeconds: ageSeconds(oldestAccepted?.firstAcceptedAt),
+      oldestInProgressSeconds: ageSeconds(oldestInProgress?.firstStartedAt),
+      categoryBacklog: categoryGroups.map((group) => ({ category: group.category, open: group._count._all })),
+      halls: halls.map((hall) => ({
+        ...hall,
+        open: Number(hall.open),
+        queued: Number(hall.queued),
+        overdue: Number(hall.overdue),
+        escalated: Number(hall.escalated),
+      })),
+      workforceLoad: workforceLoad.map((row) => ({
+        hallCode: row.hallCode,
+        category: row.category,
+        onDuty: Number(row.onDuty),
+        paused: Number(row.paused),
+        offDuty: Number(row.offDuty),
+        capacity: Number(row.capacity),
+        active: Number(row.active),
+      })),
       ...statusCounts,
     };
   }
@@ -328,7 +470,7 @@ export class ManagementService {
       },
       include: {
         actor: { select: { name: true, role: true } },
-        targetUser: { select: { name: true, employeeCode: true } },
+        targetUser: { select: { name: true, employeeCode: true, role: true } },
       },
       orderBy: { createdAt: 'desc' },
       take: 100,
@@ -349,7 +491,7 @@ export class ManagementService {
         eventType: event.action,
         createdAt: event.createdAt,
         actor: event.actor,
-        ticket: { publicNo: event.targetUser?.employeeCode ?? 'Workforce' },
+        ticket: { publicNo: event.targetUser?.role === 'STALL' ? 'Stall account' : (event.targetUser?.employeeCode ?? event.targetUser?.name ?? 'Account') },
         target: event.targetUser,
       })),
     ].sort((left, right) => right.createdAt.getTime() - left.createdAt.getTime()).slice(0, 200);

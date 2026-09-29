@@ -181,6 +181,8 @@ export class AuthController {
       select: {
         id: true,
         name: true,
+        email: true,
+        phone: true,
         role: true,
         mustChangePassword: true,
         scopes: {

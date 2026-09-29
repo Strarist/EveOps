@@ -6,6 +6,7 @@ import { unlink } from 'node:fs/promises';
 import { basename, resolve } from 'node:path';
 
 const prisma = new PrismaClient();
+const baseURL = process.env.E2E_BASE_URL ?? 'http://localhost:3000';
 const password = 'EveOpsE2E!2026';
 const runKey = `e2e-${process.pid}-${Date.now()}`;
 const ids = {
@@ -160,7 +161,7 @@ async function login(browser: Browser, email: string, portal: 'OPERATIONS' | 'GO
   await context.addCookies([{
     name: 'eveops_session',
     value: token,
-    url: 'http://localhost:3000',
+    url: baseURL,
     httpOnly: true,
     sameSite: 'Lax',
   }]);
@@ -209,7 +210,7 @@ test.describe.serial('isolated multi-role operational acceptance', () => {
     await expect.poll(async () => {
       try {
         const health = await fetch('http://localhost:4000/api/system/health');
-        const loginPage = await fetch('http://localhost:3000/login');
+        const loginPage = await fetch(`${baseURL}/login`);
         return health.ok && loginPage.ok;
       } catch {
         return false;
@@ -235,7 +236,7 @@ test.describe.serial('isolated multi-role operational acceptance', () => {
     const staffPage = await staff.newPage();
     await staffPage.goto('/staff');
     await expect(staffPage.getByText(ticket.publicNo)).toBeVisible();
-    await expect(staffPage.getByRole('button', { name: 'Accept assignment' })).toBeVisible();
+    await expect(staffPage.getByRole('button', { name: 'Accept task' }).first()).toBeVisible();
     await advanceToOtp(staff, ticket.id);
     const afterRequest = await (await staff.request.get(`/api/tickets/${ticket.id}`)).json() as { status: string; completionRequestedAt: string | null };
     expect(afterRequest.status).toBe('AWAITING_OTP');
@@ -253,8 +254,8 @@ test.describe.serial('isolated multi-role operational acceptance', () => {
     await expect(stallPage.locator('.otp-digits')).toBeVisible();
     const staffAwait = await staff.newPage();
     await staffAwait.goto('/staff');
-    await expect(staffAwait.getByText('Waiting for stall code')).toBeVisible();
-    await expect(staffAwait.getByRole('button', { name: 'Verify & close ticket' })).toBeVisible();
+    await expect(staffAwait.getByText("Waiting for stall's code")).toBeVisible();
+    await expect(staffAwait.getByRole('button', { name: 'Verify code' })).toBeVisible();
     await expect(staffAwait.locator('.otp-digits')).toHaveCount(0);
     await closeWithOtp(stall, staff, ticket.id);
     const detail = await admin.request.get(`/api/tickets/${ticket.id}`);

@@ -112,6 +112,10 @@ export async function routeTicket(database: DatabaseClient, ticketId: string, ac
         where: { eventId: selectedTicket.eventId, stallId: selectedTicket.stallId, user: { role: 'STALL' } },
         select: { userId: true },
       });
+      const stall = await tx.stall.findUnique({
+        where: { id: selectedTicket.stallId },
+        select: { stallCode: true, zone: { select: { code: true, hall: { select: { name: true } } } } },
+      });
       const assignmentRecipients = [...new Set([selectedStaff.userId, ...stallRecipients.map((scope) => scope.userId)])];
       await tx.notification.createMany({
         data: assignmentRecipients.map((recipientId) => ({
@@ -120,7 +124,17 @@ export async function routeTicket(database: DatabaseClient, ticketId: string, ac
           ticketId: selectedTicket.id,
           type: 'TICKET_ASSIGNED',
           dedupeKey: `ticket-assigned:${selectedTicket.id}:${recipientId}:${selectedTicket.version}`,
-          payload: { hallId: selectedTicket.hallId },
+          payload: {
+            hallId: selectedTicket.hallId,
+            stallCode: stall?.stallCode,
+            hallName: stall?.zone.hall.name,
+            zone: stall?.zone.code,
+            category: selectedTicket.category,
+            priority: selectedTicket.priority,
+            issue: selectedTicket.description.slice(0, 140),
+            publicNo: selectedTicket.publicNo,
+            summary: `New task · Stall ${stall?.stallCode ?? ''}`.trim(),
+          },
         })),
         skipDuplicates: true,
       });

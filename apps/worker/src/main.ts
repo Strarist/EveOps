@@ -20,6 +20,7 @@ async function tick() {
   for (const assignment of overdue) await processOverdueAssignment(assignment.id, now);
   await processSlaBreaches();
   await processOutbox();
+  await deliverPushes();
   await processExports();
   await expireExports();
   const [outboxBacklog, deadLetteredOutbox, failedExports] = await Promise.all([
@@ -178,6 +179,51 @@ async function processOverdueAssignment(assignmentId: string, now: Date) {
       skipDuplicates: true,
     });
   });
+}
+
+async function deliverPushes() {
+  if (!process.env.VAPID_PUBLIC_KEY || !process.env.VAPID_PRIVATE_KEY) return;
+  const webpush = await import('web-push');
+  webpush.default.setVapidDetails(process.env.VAPID_SUBJECT ?? 'mailto:ops@eveops.local', process.env.VAPID_PUBLIC_KEY, process.env.VAPID_PRIVATE_KEY);
+  const pending = await prisma.notification.findMany({
+    where: { pushedAt: null, pushAttempts: { lt: 5 }, sentAt: { gt: new Date(Date.now() - 60 * 60 * 1000) } },
+    take: 25,
+    include: { recipient: { include: { pushSubscriptions: true } } },
+  });
+  for (const notification of pending) {
+    const payload = notification.payload && typeof notification.payload === 'object' && !Array.isArray(notification.payload)
+      ? notification.payload as Record<string, unknown>
+      : {};
+    const summary = typeof payload.summary === 'string' ? payload.summary : 'You have an update';
+    const target = notification.recipient.role === 'STAFF' && notification.ticketId
+      ? '/staff/task/' + notification.ticketId
+      : notification.recipient.role === 'STALL' && notification.ticketId
+        ? '/stall/ticket/' + notification.ticketId
+        : notification.recipient.role === 'HALL_MANAGER'
+          ? '/hall-manager'
+          : '/';
+    const url = target.startsWith('/') && !target.startsWith('//') ? target : '/';
+    let failed = false;
+    for (const subscription of notification.recipient.pushSubscriptions) {
+      try {
+        await webpush.default.sendNotification({
+          endpoint: subscription.endpoint,
+          keys: { p256dh: subscription.p256dh, auth: subscription.auth },
+        }, JSON.stringify({ title: 'EveOps', body: summary, url, tag: notification.id }));
+      } catch (error) {
+        const status = (error as { statusCode?: number }).statusCode;
+        if (status === 404 || status === 410) {
+          await prisma.pushSubscription.delete({ where: { id: subscription.id } }).catch(() => undefined);
+        } else {
+          failed = true;
+        }
+      }
+    }
+    await prisma.notification.update({
+      where: { id: notification.id },
+      data: failed ? { pushAttempts: { increment: 1 } } : { pushedAt: new Date(), pushAttempts: { increment: 1 } },
+    });
+  }
 }
 
 async function processOutbox() {

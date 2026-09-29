@@ -79,7 +79,6 @@ async function createLifecycleNotifications(
       OR: [
         { stallId: ticket.stallId, user: { role: 'STALL' } },
         { hallId: ticket.hallId, user: { role: 'HALL_MANAGER' } },
-        { user: { role: { in: ['ADMIN', 'SUPER_ADMIN'] } } },
       ],
     },
     select: { userId: true },
@@ -91,6 +90,12 @@ async function createLifecycleNotifications(
   });
   const recipients = [...new Set([...scopes.map((item) => item.userId), ...(assignment ? [assignment.staffId] : [])])]
     .filter((recipientId) => recipientId !== actorId);
+  const stall = await tx.stall.findUnique({ where: { id: ticket.stallId }, select: { stallCode: true } });
+  const record = await tx.ticket.findUnique({ where: { id: ticket.id }, select: { publicNo: true, category: true } });
+  const stallCode = stall?.stallCode ?? 'stall';
+  const summary = type === 'TICKET_REOPENED'
+    ? `Ticket opened again · Stall ${stallCode}`
+    : `Update · Stall ${stallCode}`;
   await tx.notification.createMany({
     data: recipients.map((recipientId) => ({
       eventId: ticket.eventId,
@@ -98,7 +103,7 @@ async function createLifecycleNotifications(
       ticketId: ticket.id,
       type,
       dedupeKey: `${type.toLowerCase()}:${ticket.id}:${recipientId}:${ticket.version}`,
-      payload: { hallId: ticket.hallId, stallId: ticket.stallId },
+      payload: { hallId: ticket.hallId, stallId: ticket.stallId, stallCode, publicNo: record?.publicNo, category: record?.category, summary },
     })),
     skipDuplicates: true,
   });
@@ -275,6 +280,33 @@ export class TicketService {
     };
   }
 
+  async activity(id: string, scope: AuthScope, cursor?: string) {
+    const ticket = await this.prisma.ticket.findUnique({
+      where: { id },
+      select: { id: true, eventId: true, hallId: true, stallId: true, assignments: { select: { staffId: true } } },
+    });
+    if (!ticket) throw new BadRequestException('Ticket not found');
+    assertScope(scope, ticket);
+    if (scope.role === 'STAFF' && !ticket.assignments.some((assignment) => assignment.staffId === scope.userId)) {
+      throw new BadRequestException('Ticket is not assigned to this staff account');
+    }
+    const rows = await this.prisma.ticketEvent.findMany({
+      where: { ticketId: id },
+      orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
+      take: 21,
+      ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
+      select: { id: true, eventType: true, createdAt: true, actor: { select: { name: true } } },
+    });
+    const hasMore = rows.length > 20;
+    const items = (hasMore ? rows.slice(0, 20) : rows).map((event) => ({
+      id: event.id,
+      eventType: event.eventType,
+      createdAt: event.createdAt,
+      actorName: event.actor?.name ?? 'System',
+    }));
+    return { items, nextCursor: hasMore ? items.at(-1)?.id ?? null : null };
+  }
+
   async create(dto: CreateTicketDto, scope: AuthScope) {
     if (scope.role === 'STAFF') throw new BadRequestException('Staff cannot create stall tickets');
     const stallId = scope.role === 'STALL' ? scope.stallId : dto.stallId;
@@ -319,7 +351,6 @@ export class TicketService {
           OR: [
             { stallId: target.stallId, user: { role: 'STALL' } },
             { hallId: target.hallId, user: { role: 'HALL_MANAGER' } },
-            { user: { role: { in: ['ADMIN', 'SUPER_ADMIN'] } } },
           ],
         },
         select: { userId: true },
@@ -331,7 +362,14 @@ export class TicketService {
           ticketId: created.id,
           type: 'TICKET_CREATED',
           dedupeKey: 'ticket-created:' + created.id + ':' + userId,
-          payload: { hallId: target.hallId, stallId: target.stallId },
+          payload: {
+            hallId: target.hallId,
+            stallId: target.stallId,
+            stallCode: stall.stallCode,
+            publicNo: created.publicNo,
+            category: dto.category,
+            summary: `New request · Stall ${stall.stallCode} · ${dto.category === 'HOUSE_HELP' ? 'House Help' : dto.category === 'HALL_MANAGER' ? 'Hall Manager' : 'Electrical'}`,
+          },
         })),
         skipDuplicates: true,
       });
@@ -881,6 +919,9 @@ export class TicketService {
 export class TicketController {
   constructor(private readonly service: TicketService, private readonly realtime: RealtimeService) {}
   @Get() list(@CurrentScope() scope: AuthScope, @Query() query: ListTicketsDto) { return this.service.list(scope, query); }
+  @Get(':id/activity') activity(@Param('id') id: string, @CurrentScope() scope: AuthScope, @Query('cursor') cursor?: string) {
+    return this.service.activity(id, scope, cursor);
+  }
   @Get(':id') detail(@Param('id') id: string, @CurrentScope() scope: AuthScope) { return this.service.detail(id, scope); }
   @Post() create(@Body() dto: CreateTicketDto, @CurrentScope() scope: AuthScope) { return this.service.create(dto, scope); }
   @Post(':id/transition') transition(@Param('id') id: string, @Body() body: TransitionTicketDto, @CurrentScope() scope: AuthScope) { return this.service.transition(id, body.to, scope, body.reason); }
