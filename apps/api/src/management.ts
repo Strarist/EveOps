@@ -25,6 +25,7 @@ import { Throttle } from '@nestjs/throttler';
 import { CurrentScope, SessionGuard } from './auth';
 import { requireAuthority } from './domain';
 import { PrismaService } from './prisma.service';
+import { stallCodeConflictMessage } from './stall-conflict';
 
 export class MetricsQueryDto {
   @IsOptional() @IsDateString() from?: string;
@@ -605,6 +606,10 @@ export class ManagementService {
         },
       });
       return created;
+    }).catch((error: unknown) => {
+      const message = type === 'stall' ? stallCodeConflictMessage(error, body.stallCode ?? '') : null;
+      if (message) throw new ConflictException(message);
+      throw error;
     });
   }
 
@@ -680,9 +685,8 @@ export class ManagementService {
         return updated;
       });
     } catch (error) {
-      if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002') {
-        throw new ConflictException('That stall code is already used in this zone');
-      }
+      const message = stallCodeConflictMessage(error, stallCode ?? '');
+      if (message) throw new ConflictException(message);
       throw error;
     }
   }
@@ -731,7 +735,6 @@ export class ManagementService {
         data: { stallId: destinationRow.id, hallId: destinationRow.zone.hallId, eventId: destinationRow.eventId },
       });
       await tx.session.deleteMany({ where: { userId: { in: userIds } } });
-      await tx.pushSubscription.deleteMany({ where: { userId: { in: userIds } } });
       const previousDestination = {
         exhibitorName: destinationRow.exhibitorName,
         contact: destinationRow.contact,
@@ -776,17 +779,7 @@ export class ManagementService {
       const userIds = exhibitors.map((row) => row.userId);
       if (userIds.length) {
         await tx.userScope.deleteMany({ where: { stallId: current.id, userId: { in: userIds } } });
-        await tx.session.deleteMany({ where: { userId: { in: userIds } } });
-        await tx.pushSubscription.deleteMany({ where: { userId: { in: userIds } } });
-        const remaining = await tx.userScope.groupBy({
-          by: ['userId'],
-          where: { userId: { in: userIds } },
-        });
-        const stillScoped = new Set(remaining.map((row) => row.userId));
-        const toDisable = userIds.filter((userId) => !stillScoped.has(userId));
-        if (toDisable.length) {
-          await tx.user.updateMany({ where: { id: { in: toDisable }, role: 'STALL' }, data: { status: 'DISABLED' } });
-        }
+        await this.revokeExhibitorsWhoLostAccess(tx, userIds);
       }
       const archived = await tx.stall.update({
         where: { id: current.id },
@@ -818,6 +811,27 @@ export class ManagementService {
     if (open > 0) {
       throw new ConflictException(`${action} is blocked while this stall has unresolved tickets`);
     }
+  }
+
+  /**
+   * Archive drops only the stall scope. Sessions and push subscriptions go with an account
+   * that has no scope left. An account that still belongs to another stall keeps both.
+   * Repeated calls are safe: empty deletes and an already-disabled account are no-ops.
+   */
+  private async revokeExhibitorsWhoLostAccess(tx: Prisma.TransactionClient, userIds: string[]) {
+    const remaining = await tx.userScope.groupBy({
+      by: ['userId'],
+      where: { userId: { in: userIds } },
+    });
+    const stillScoped = new Set(remaining.map((row) => row.userId));
+    const toDisable = userIds.filter((userId) => !stillScoped.has(userId));
+    if (!toDisable.length) return;
+    await tx.session.deleteMany({ where: { userId: { in: toDisable } } });
+    await tx.pushSubscription.deleteMany({ where: { userId: { in: toDisable } } });
+    await tx.user.updateMany({
+      where: { id: { in: toDisable }, role: 'STALL', status: { not: 'DISABLED' } },
+      data: { status: 'DISABLED' },
+    });
   }
 
   private async lockStalls(tx: Prisma.TransactionClient, stallIds: string[]) {

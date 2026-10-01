@@ -3,10 +3,10 @@
 import type { Role, TicketStatus } from '@eveops/contracts';
 import { FormEvent, KeyboardEvent, ClipboardEvent, useCallback, useEffect, useRef, useState } from 'react';
 import Link from 'next/link';
-import { useRouter } from 'next/navigation';
+import { useRouter, useSearchParams } from 'next/navigation';
 import { apiFetch, apiErrorMessage, AUTH_LOST_EVENT, subscribeRealtime } from '../lib/api-client';
 import { activitySentence, serviceLabel } from '../lib/activity-copy';
-import { enableSound, playOnce, playRepeatAlert, soundEnabled, stopSound, testSound } from '../lib/sounds';
+import { bindAlertUser, enableSound, playOnce, playRepeatAlert, setSoundEnabled, silenceAlert, silencedAlerts, soundEnabled, stopSound, testSound } from '../lib/sounds';
 
 type Ticket = {
   id: string;
@@ -277,6 +277,7 @@ function LogoutButton() {
   const router = useRouter();
   async function logout() {
     stopSound();
+    bindAlertUser('');
     const endpoint = window.localStorage.getItem('eveops-push-endpoint');
     if (endpoint) {
       await apiFetch('/api/notifications/push-subscription', {
@@ -792,19 +793,29 @@ function TicketActivity({ ticketId }: { ticketId: string }) {
   const [items, setItems] = useState<Array<{ id: string; eventType: string; createdAt: string; actorName: string }>>([]);
   const [cursor, setCursor] = useState<string | null>(null);
   const [error, setError] = useState('');
+  const [loading, setLoading] = useState(true);
   const load = useCallback(async (next?: string) => {
+    setLoading(true);
+    setError('');
     const response = await apiFetch('/api/tickets/' + ticketId + '/activity' + (next ? '?cursor=' + encodeURIComponent(next) : ''), { credentials: 'include', cache: 'no-store' });
-    if (!response.ok) { setError('Activity could not be loaded'); return; }
+    if (!response.ok) {
+      setError('Activity could not be loaded');
+      setLoading(false);
+      return;
+    }
     const result = await response.json() as { items: Array<{ id: string; eventType: string; createdAt: string; actorName: string }>; nextCursor: string | null };
     setItems((current) => next ? [...current, ...result.items] : result.items);
     setCursor(result.nextCursor);
+    setLoading(false);
   }, [ticketId]);
   useEffect(() => { void load(); }, [load]);
-  if (error) return <p className="form-error">{error}</p>;
   return (
     <div className="timeline">
       <h3>Activity</h3>
-      {items.length ? items.map((event) => (
+      {loading && !items.length ? <p className="empty-state">Loading activity…</p> : null}
+      {error ? <p className="form-error" role="alert">{error} <button type="button" onClick={() => void load()}>Try again</button></p> : null}
+      {!loading && !error && !items.length ? <p className="empty-state">No activity yet.</p> : null}
+      {items.map((event) => (
         <div className="timeline-item" key={event.id}>
           <i className="active"></i>
           <div>
@@ -812,14 +823,15 @@ function TicketActivity({ ticketId }: { ticketId: string }) {
             <span>{eventTime(event.createdAt)}</span>
           </div>
         </div>
-      )) : <p className="empty-state">No activity yet.</p>}
-      {cursor && <button type="button" onClick={() => void load(cursor)}>Load more</button>}
+      ))}
+      {cursor && <button type="button" onClick={() => void load(cursor)} disabled={loading}>{loading ? 'Loading…' : 'Load more'}</button>}
     </div>
   );
 }
 
 export function StaffWorkspace({ focusId }: { focusId?: string } = {}) {
   const profile = useProfile();
+  const sectionQuery = useSearchParams().get('section');
   const { items, loading, error: loadError, refresh, connection } = useApiTickets('view=active');
   const { items: history } = useApiTickets('view=closed&limit=10');
   const [actionError, setActionError] = useState('');
@@ -829,6 +841,7 @@ export function StaffWorkspace({ focusId }: { focusId?: string } = {}) {
   const [availability, setAvailability] = useState<'ON_DUTY' | 'PAUSED' | 'OFF_DUTY' | 'OFFLINE'>('OFF_DUTY');
   const [workload, setWorkload] = useState({ activeCount: 0, completedToday: 0, capacity: 0 });
   const [actionPending, setActionPending] = useState(false);
+  const [pendingTicketId, setPendingTicketId] = useState<string | null>(null);
   const [section, setSection] = useState<'task' | 'history' | 'availability'>('task');
   useAuthLoss(() => {
     setAvailability('OFF_DUTY');
@@ -839,19 +852,17 @@ export function StaffWorkspace({ focusId }: { focusId?: string } = {}) {
     setOtpError('');
     setOtpSuccess('');
   });
-  const [detailTab, setDetailTab] = useState<'details' | 'activity'>('details');
   const [soundOn, setSoundOn] = useState(false);
   const [silenced, setSilenced] = useState<string[]>([]);
-  const ordered = [...items].sort((left, right) => Number(Boolean(right.priority)) - Number(Boolean(left.priority)));
+  const ordered = [...items].sort((left, right) => left.no.localeCompare(right.no));
   const focused = focusId ? (ordered.find((ticket) => ticket.id === focusId) ?? history.find((ticket) => ticket.id === focusId)) : undefined;
-  const current = focused ?? ordered.find((ticket) => ['ASSIGNED', 'SNOOZED'].includes(ticket.status)) ?? ordered[0];
   const incoming = ordered.filter((ticket) => ['ASSIGNED', 'SNOOZED'].includes(ticket.status) && !silenced.includes(ticket.id));
 
   useEffect(() => {
     setOtpValue('');
     setOtpError('');
     setOtpSuccess('');
-  }, [current?.id, current?.status]);
+  }, [focused?.id, focused?.status]);
 
   const refreshWorkload = useCallback(async () => {
     const response = await apiFetch('/api/workforce/me', { credentials: 'include', cache: 'no-store' });
@@ -861,7 +872,16 @@ export function StaffWorkspace({ focusId }: { focusId?: string } = {}) {
     setWorkload(result);
   }, []);
   useEffect(() => { void refreshWorkload(); }, [refreshWorkload]);
-  useEffect(() => { setSoundOn(soundEnabled()); }, []);
+  useEffect(() => {
+    if (sectionQuery === 'completed') setSection('history');
+    if (sectionQuery === 'availability') setSection('availability');
+  }, [sectionQuery]);
+  useEffect(() => {
+    if (!profile?.id) return;
+    bindAlertUser(profile.id);
+    setSoundOn(soundEnabled());
+    setSilenced(silencedAlerts());
+  }, [profile?.id]);
   const incomingId = incoming[0]?.id;
   useEffect(() => {
     if (!incomingId || !soundOn) return;
@@ -889,10 +909,11 @@ export function StaffWorkspace({ focusId }: { focusId?: string } = {}) {
     setActionPending(false);
   }
 
-  async function transition(ticket = current) {
+  async function transition(ticket?: Ticket) {
     if (!ticket) return;
     if (!['ASSIGNED', 'SNOOZED', 'ACCEPTED', 'IN_PROGRESS'].includes(ticket.status)) return;
     setActionPending(true);
+    setPendingTicketId(ticket.id);
     const next = ticket.status === 'ACCEPTED' ? 'IN_PROGRESS' : ticket.status === 'IN_PROGRESS' ? 'AWAITING_OTP' : 'ACCEPTED';
     const response = await apiFetch('/api/tickets/' + ticket.id + '/transition', {
       method: 'POST',
@@ -903,6 +924,7 @@ export function StaffWorkspace({ focusId }: { focusId?: string } = {}) {
     if (!response.ok) {
       setActionError(await apiErrorMessage(response, next === 'AWAITING_OTP' ? 'Could not request completion. Try again.' : 'Action could not be confirmed'));
       setActionPending(false);
+      setPendingTicketId(null);
       return;
     }
     setActionError('');
@@ -910,28 +932,32 @@ export function StaffWorkspace({ focusId }: { focusId?: string } = {}) {
     await refresh();
     await refreshWorkload();
     setActionPending(false);
+    setPendingTicketId(null);
   }
 
-  async function snooze(ticket = current) {
+  async function snooze(ticket?: Ticket) {
     if (!ticket) return;
     setActionPending(true);
+    setPendingTicketId(ticket.id);
     const response = await apiFetch('/api/tickets/' + ticket.id + '/snooze', { method: 'POST', credentials: 'include' });
     if (!response.ok) {
       setActionError(await apiErrorMessage(response, 'Snooze could not be confirmed'));
       setActionPending(false);
+      setPendingTicketId(null);
       return;
     }
     setActionError('');
     stopSound();
     await refresh();
     setActionPending(false);
+    setPendingTicketId(null);
   }
 
   async function verifyOtp() {
-    if (!current || otpValue.length !== 6 || actionPending) return;
+    if (!focused || otpValue.length !== 6 || actionPending) return;
     setActionPending(true);
     setOtpError('');
-    const response = await apiFetch('/api/tickets/' + current.id + '/otp/verify', {
+    const response = await apiFetch('/api/tickets/' + focused.id + '/otp/verify', {
       method: 'POST',
       credentials: 'include',
       headers: { 'content-type': 'application/json' },
@@ -949,120 +975,190 @@ export function StaffWorkspace({ focusId }: { focusId?: string } = {}) {
     setActionPending(false);
   }
 
-  const actionLabel = current?.status === 'ACCEPTED'
-    ? 'Start work'
-    : current?.status === 'IN_PROGRESS'
-      ? 'Work done'
-      : 'Accept task';
-  const loadingLabel = current?.status === 'ACCEPTED'
-    ? 'Starting…'
-    : current?.status === 'IN_PROGRESS'
-      ? 'Requesting completion…'
-      : 'Accepting…';
   const atCapacity = workload.capacity > 0 && workload.activeCount >= workload.capacity;
+  const serviceName = serviceLabel(profile?.scopes.find((scope) => scope.serviceType)?.serviceType ?? '');
 
   return (
     <div className="mobile-page">
       <main className="mobile-shell staff">
         <header className="mobile-header">
           <div>
-            <span className="eyebrow">{profile?.scopes[0]?.event.name ?? 'Current shift'} · {connection === 'live' ? 'Live' : 'Reconnecting'}</span>
+            <span className="eyebrow">Your tasks · {connection === 'live' ? 'Live' : 'Reconnecting'}</span>
             <h1>{profile?.name ?? 'Service workspace'}</h1>
+            {serviceName ? <p className="staff-role">{serviceName}</p> : null}
           </div>
           <span className={'duty duty-badge ' + availability.toLowerCase()} aria-label={`Availability ${availability.replaceAll('_', ' ')}`}>
             {availability === 'ON_DUTY' ? 'On duty' : availability === 'PAUSED' ? 'Paused' : 'Off duty'}
           </span>
         </header>
-        {!focusId && !!incoming.length && (
-          <div className="task-alert" role="status">
-            <strong>{incoming.length > 1 ? `${incoming.length} new tasks` : 'New task'}</strong>
-            <p className="stall-hero">Stall {incoming[0].locationParts.stall}</p>
-            <p>{incoming[0].locationParts.hall} · Zone {incoming[0].locationParts.zone}</p>
-            <p>{incoming[0].service} · {incoming[0].description}</p>
-            {incoming[0].priority && <p>Urgent</p>}
-            <div className="ticket-actions">
-              <a className="secondary-action" href={'/staff/task/' + incoming[0].id}>View task</a>
-              <button type="button" onClick={() => { stopSound(); setSilenced((currentIds) => [...currentIds, incoming[0].id]); }}>Silence</button>
-              <button type="button" className="primary" disabled={actionPending} onClick={() => void transition(incoming[0])}>Accept task</button>
-              {incoming[0].status === 'ASSIGNED' && <button type="button" disabled={actionPending} onClick={() => void snooze(incoming[0])}>10 min later</button>}
-            </div>
-          </div>
-        )}
-        {section === 'task' && (
+        {actionError && <div className="form-error" role="alert">{actionError}</div>}
+        {focusId ? (
+          <StaffTaskDetail
+            ticket={focused}
+            loading={loading}
+            error={loadError}
+            actionPending={actionPending}
+            otpValue={otpValue}
+            otpError={otpError}
+            otpSuccess={otpSuccess}
+            backHref={focused && ['CLOSED', 'CANCELLED'].includes(focused.status) ? '/staff?section=completed' : '/staff'}
+            onTransition={() => void transition(focused)}
+            onSnooze={() => void snooze(focused)}
+            onOtpChange={(next) => { setOtpValue(next); setOtpError(''); }}
+            onVerify={() => void verifyOtp()}
+          />
+        ) : (
           <>
-            {actionError && <div className="form-error" role="alert">{actionError}</div>}
-            {loading && !items.length ? <p className="empty-state">Loading current task…</p> : !current ? (loadError ? <p className="form-error">{loadError}</p> : <p className="empty-state">No current task. New work appears here when you are on duty.</p>) : (
-              <>
-                <TicketCard
-                  ticket={current}
-                  audience="staff"
-                  actions={['ASSIGNED', 'SNOOZED', 'ACCEPTED', 'IN_PROGRESS'].includes(current.status) && (Boolean(focusId) || current.id !== incoming[0]?.id)}
-                  actionLabel={actionLabel}
-                  actionDisabled={actionPending}
-                  loadingLabel={loadingLabel}
-                  onAccept={() => void transition()}
-                  onSnooze={() => void snooze()}
-                />
-                {focusId && (
-                  <div className="drawer-actions">
-                    <button type="button" className={detailTab === 'details' ? 'primary' : ''} onClick={() => setDetailTab('details')}>Details</button>
-                    <button type="button" className={detailTab === 'activity' ? 'primary' : ''} onClick={() => setDetailTab('activity')}>Activity</button>
-                    <a href="/staff">Back to tasks</a>
-                  </div>
-                )}
-                {detailTab === 'activity' && focusId ? <TicketActivity ticketId={focusId} /> : null}
-                {(!focusId || detailTab === 'details') && current.status === 'AWAITING_OTP' && (
-                  <StaffOtpEntry
-                    value={otpValue}
-                    onChange={(next) => { setOtpValue(next); setOtpError(''); }}
-                    onSubmit={() => void verifyOtp()}
-                    submitting={actionPending}
-                    error={otpError}
-                    success={otpSuccess}
-                  />
-                )}
-              </>
-            )}
-            {ordered.length > 1 && <section><div className="section-title"><h2>Other open tasks</h2></div>{ordered.filter((ticket) => ticket.id !== current?.id).map((ticket) => <a key={ticket.id} href={'/staff/task/' + ticket.id}><TicketCard ticket={ticket} audience="staff" /></a>)}</section>}
-            <section>
-              <div className="section-title"><h2>Today</h2></div>
-              <div className="stats-row">
-                <div><strong>{workload.completedToday}</strong><span>Completed</span></div>
-                <div><strong>{workload.activeCount}</strong><span>Active{atCapacity ? ' · At capacity' : ''}</span></div>
-                <div><strong>{workload.capacity}</strong><span>Capacity</span></div>
+            {!focusId && !!incoming.length && (
+              <div className="task-alert" role="status">
+                <strong>{incoming.length > 1 ? `${incoming.length} new tasks` : 'New task'}</strong>
+                <p className="stall-hero">Stall {incoming[0].locationParts.stall}</p>
+                <p>{incoming[0].locationParts.hall} · Zone {incoming[0].locationParts.zone}</p>
+                <div className="ticket-actions">
+                  <a className="secondary-action" href={'/staff/task/' + incoming[0].id}>View task</a>
+                  <button type="button" onClick={() => { silenceAlert(incoming[0].id); setSilenced(silencedAlerts()); }}>Stop sound</button>
+                </div>
+                <p className="otp-hint">Stopping the sound leaves the task on your list. It does not accept the task.</p>
               </div>
-            </section>
+            )}
+            {section === 'task' && (
+              <section className="staff-board" aria-label="Active tasks">
+                <div className="section-title"><div><h2>Active tasks</h2><p>{ordered.length ? `${ordered.length} on your list` : 'Nothing active'}{atCapacity ? ' · At capacity' : ''}</p></div></div>
+                {loading && !ordered.length ? <p className="empty-state">Loading tasks…</p> : loadError ? <p className="form-error" role="alert">{loadError}</p> : ordered.length ? ordered.map((ticket) => (
+                  <StaffTaskSummary key={ticket.id} ticket={ticket} pending={actionPending && pendingTicketId === ticket.id} locked={actionPending} onTransition={() => void transition(ticket)} onSnooze={() => void snooze(ticket)} />
+                )) : <p className="empty-state">No active tasks. New work appears here when you are on duty and free.</p>}
+              </section>
+            )}
+            {section === 'history' && (
+              <section aria-label="Completed tasks">
+                <div className="section-title"><h2>Completed tasks</h2></div>
+                {history.length ? history.map((ticket) => <StaffTaskSummary key={ticket.id} ticket={ticket} />) : <p className="empty-state">No completed work yet.</p>}
+              </section>
+            )}
+            {section === 'availability' && (
+              <section className="availability-panel">
+                <div className="section-title"><h2>Availability</h2></div>
+                <p>Choose whether you can take new tasks. Tasks already assigned to you stay on your list.</p>
+                <button type="button" className={availability === 'ON_DUTY' ? 'primary' : 'secondary-action'} disabled={actionPending} onClick={() => void setAvailabilityValue('ON_DUTY')}>{actionPending ? 'Saving…' : 'On duty · ready for new tasks'}</button>
+                <button type="button" className={availability === 'PAUSED' ? 'primary' : 'secondary-action'} disabled={actionPending} onClick={() => void setAvailabilityValue('PAUSED')}>{actionPending ? 'Saving…' : 'Paused · finish current tasks, no new ones'}</button>
+                <button type="button" className={availability === 'OFF_DUTY' ? 'primary' : 'secondary-action'} disabled={actionPending} onClick={() => void setAvailabilityValue('OFF_DUTY')}>{actionPending ? 'Saving…' : 'Off duty · not available'}</button>
+                <h3>Sound</h3>
+                <p>{soundOn ? 'Sound is on for new tasks on this account.' : 'Sound is off for this account. New tasks still show on screen.'}</p>
+                <button type="button" onClick={() => void enableSound().then((ok) => setSoundOn(ok))}>Turn sound on</button>
+                <button type="button" onClick={() => { setSoundEnabled(false); setSoundOn(false); stopSound(); }}>Turn sound off</button>
+                <button type="button" onClick={() => void testSound().then((ok) => setSoundOn(ok))}>Play a test</button>
+                <p className="otp-hint">This browser can play the sound while EveOps is open. A second tab may also play it once. iPhone and iPad do not keep a looping sound after you leave the app or lock the screen.</p>
+                <PushOptIn />
+              </section>
+            )}
           </>
         )}
-        {section === 'history' && (
-          <section>
-            <div className="section-title"><h2>Recent history</h2></div>
-            {history.length ? history.map((ticket) => <a key={ticket.id} href={'/staff/task/' + ticket.id}><TicketCard ticket={ticket} audience="staff" /></a>) : <p className="empty-state">No completed work yet.</p>}
-          </section>
-        )}
-        {section === 'availability' && (
-          <section className="availability-panel">
-            <div className="section-title"><h2>Availability</h2></div>
-            <p>Choose how new work should reach you. Active tickets stay with you until closed or reassigned.</p>
-            <button type="button" className={availability === 'ON_DUTY' ? 'primary' : 'secondary-action'} disabled={actionPending} onClick={() => void setAvailabilityValue('ON_DUTY')}>On duty · ready for new assignments</button>
-            <button type="button" className={availability === 'PAUSED' ? 'primary' : 'secondary-action'} disabled={actionPending} onClick={() => void setAvailabilityValue('PAUSED')}>Paused · finish current work, no new jobs</button>
-            <button type="button" className={availability === 'OFF_DUTY' ? 'primary' : 'secondary-action'} disabled={actionPending} onClick={() => void setAvailabilityValue('OFF_DUTY')}>Off duty · not available</button>
-            <h3>Sound</h3>
-            <p>{soundOn ? 'Sound is on for new tasks.' : 'Sound is off. Alerts still show on screen.'}</p>
-            <button type="button" onClick={() => void enableSound().then((ok) => setSoundOn(ok))}>Enable sound</button>
-            <button type="button" onClick={() => void testSound().then((ok) => setSoundOn(ok))}>Test sound</button>
-            <p className="otp-hint">On iPhone or iPad, add EveOps to the Home Screen before expecting alerts while the app is closed. Locked-screen sound follows the device settings and does not loop.</p>
-            <PushOptIn />
-          </section>
-        )}
         <nav className="bottom-nav" aria-label="Staff navigation">
-          <button type="button" className={section === 'task' ? 'nav-active' : undefined} onClick={() => setSection('task')}>Current task</button>
-          <button type="button" className={section === 'history' ? 'nav-active' : undefined} onClick={() => setSection('history')}>History</button>
-          <button type="button" className={section === 'availability' ? 'nav-active' : undefined} onClick={() => setSection('availability')}>Availability</button>
+          <a className={!focusId && section === 'task' ? 'nav-active' : undefined} href="/staff">Active</a>
+          <a className={!focusId && section === 'history' ? 'nav-active' : undefined} href="/staff?section=completed">Completed</a>
+          <a className={!focusId && section === 'availability' ? 'nav-active' : undefined} href="/staff?section=availability">Availability</a>
           <LogoutButton />
         </nav>
       </main>
     </div>
+  );
+}
+
+function staffStatus(status: string) {
+  const labels: Record<string, string> = {
+    ASSIGNED: 'New task',
+    SNOOZED: 'Snoozed',
+    ACCEPTED: 'Accepted',
+    IN_PROGRESS: 'In progress',
+    AWAITING_OTP: 'Waiting for close code',
+    CLOSED: 'Completed',
+    CANCELLED: 'Cancelled',
+  };
+  return labels[status] ?? 'Update';
+}
+
+function staffNext(status: string) {
+  if (status === 'ACCEPTED') return { label: 'Start work', pending: 'Starting…' };
+  if (status === 'IN_PROGRESS') return { label: 'Work done', pending: 'Asking for the close code…' };
+  if (status === 'ASSIGNED' || status === 'SNOOZED') return { label: 'Accept task', pending: 'Accepting…' };
+  return null;
+}
+
+function StaffTaskSummary({ ticket, pending = false, locked = false, onTransition, onSnooze }: {
+  ticket: Ticket;
+  pending?: boolean;
+  locked?: boolean;
+  onTransition?: () => void;
+  onSnooze?: () => void;
+}) {
+  const next = staffNext(ticket.status);
+  return (
+    <article className="task-summary">
+      <div className="ticket-top">
+        <h2>Stall {ticket.locationParts.stall}</h2>
+        <span className={'status status-' + ticket.status.toLowerCase()}>{staffStatus(ticket.status)}</span>
+      </div>
+      <p>{ticket.locationParts.hall} · Zone {ticket.locationParts.zone}</p>
+      <p>{ticket.service}</p>
+      <p className="description">{ticket.description}</p>
+      <div className="staff-actions">
+        <a href={'/staff/task/' + ticket.id}>Open task</a>
+        {next && onTransition ? <button type="button" className="primary" disabled={locked} onClick={onTransition}>{pending ? next.pending : next.label}</button> : null}
+        {ticket.status === 'ASSIGNED' && onSnooze ? <button type="button" disabled={locked} onClick={onSnooze}>10 min later</button> : null}
+      </div>
+    </article>
+  );
+}
+
+function StaffTaskDetail({ ticket, loading, error, actionPending, otpValue, otpError, otpSuccess, backHref, onTransition, onSnooze, onOtpChange, onVerify }: {
+  ticket?: Ticket;
+  loading: boolean;
+  error: string;
+  actionPending: boolean;
+  otpValue: string;
+  otpError: string;
+  otpSuccess: string;
+  backHref: string;
+  onTransition: () => void;
+  onSnooze: () => void;
+  onOtpChange: (next: string) => void;
+  onVerify: () => void;
+}) {
+  const next = ticket ? staffNext(ticket.status) : null;
+  return (
+    <section className="staff-detail" aria-label="Task details">
+      <a className="back" href={backHref}>Back to tasks</a>
+      {loading && !ticket ? <p className="empty-state">Loading task…</p> : null}
+      {!loading && !ticket ? <p className="form-error" role="alert">{error || 'This task is not on your list.'}</p> : null}
+      {ticket ? (
+        <>
+          <div className="ticket-top">
+            <h2>Stall {ticket.locationParts.stall}</h2>
+            <span className={'status status-' + ticket.status.toLowerCase()}>{staffStatus(ticket.status)}</span>
+          </div>
+          <p>{ticket.locationParts.hall} · Zone {ticket.locationParts.zone}</p>
+          <p>{ticket.service}</p>
+          <p className="description">{ticket.description}</p>
+          {next ? (
+            <div className="staff-actions">
+              <button type="button" className="primary" disabled={actionPending} onClick={onTransition}>{actionPending ? next.pending : next.label}</button>
+              {ticket.status === 'ASSIGNED' ? <button type="button" disabled={actionPending} onClick={onSnooze}>10 min later</button> : null}
+            </div>
+          ) : null}
+          {ticket.status === 'AWAITING_OTP' ? (
+            <StaffOtpEntry
+              value={otpValue}
+              onChange={onOtpChange}
+              onSubmit={onVerify}
+              submitting={actionPending}
+              error={otpError}
+              success={otpSuccess}
+            />
+          ) : null}
+          <TicketActivity ticketId={ticket.id} />
+        </>
+      ) : null}
+    </section>
   );
 }
 

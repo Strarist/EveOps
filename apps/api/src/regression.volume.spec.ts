@@ -1,16 +1,18 @@
+import { createHash, randomBytes } from 'node:crypto';
 import { INestApplication, ValidationPipe } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
 import cookieParser from 'cookie-parser';
 import type { Response } from 'express';
-import { serviceQueueOrderBy } from '@eveops/operations';
+import { deliverNotificationPush, deliverPendingPushes, serviceQueueOrderBy, type PushSend } from '@eveops/operations';
 import { AppModule } from './app.module';
 import { AuthController } from './auth';
+import { SanitizedExceptionFilter } from './http-exception.filter';
 import { ManagementService } from './management';
 import { PrismaService } from './prisma.service';
 import {
   assertRegressionDatabase,
   ensureRegressionFixture,
-  REGRESSION_FIXTURE_PASSWORD,
+  regressionFixturePassword,
   type RegressionFixture,
   type RegressionStall,
   type RegressionStaff,
@@ -37,7 +39,6 @@ const isolated = (() => {
   let lab: RegressionFixture;
   let app: INestApplication;
   let baseUrl = '';
-  let archivedPushSubscriptions = 0;
 
   beforeAll(async () => {
     process.env.ALLOW_DEMO_SEED = 'false';
@@ -53,6 +54,7 @@ const isolated = (() => {
     app.setGlobalPrefix('api');
     app.use(cookieParser());
     app.useGlobalPipes(new ValidationPipe({ whitelist: true, forbidNonWhitelisted: true, transform: true }));
+    app.useGlobalFilters(new SanitizedExceptionFilter());
     await app.listen(0);
     baseUrl = await app.getUrl();
   });
@@ -81,17 +83,17 @@ const isolated = (() => {
     expect(accounts).toHaveLength(40);
     for (const account of accounts) {
       const portal = account.role === 'SUPER_ADMIN' ? 'GOVERNANCE' : 'OPERATIONS';
-      const result = await auth.login({ email: account.email, password: REGRESSION_FIXTURE_PASSWORD, portal }, response);
+      const result = await auth.login({ email: account.email, password: regressionFixturePassword(), portal }, response);
       expect(result.user.role).toBe(account.role);
     }
     await expect(auth.login({
       email: lab.stalls[0].email,
-      password: REGRESSION_FIXTURE_PASSWORD,
+      password: regressionFixturePassword(),
       portal: 'GOVERNANCE',
     }, response)).rejects.toThrow('not authorized');
     await expect(auth.login({
       email: lab.superAdmin.email,
-      password: REGRESSION_FIXTURE_PASSWORD,
+      password: regressionFixturePassword(),
       portal: 'OPERATIONS',
     }, response)).rejects.toThrow('not authorized');
   });
@@ -330,7 +332,8 @@ const isolated = (() => {
     const reopened = await tickets.transition(created.id, 'REOPENED', manager.scope, 'Work was incomplete');
     const persisted = await prisma.ticket.findUniqueOrThrow({ where: { id: created.id } });
     expect(['ASSIGNED', 'QUEUED']).toContain(persisted.status);
-    expect(reopened.status).toBe('REOPENED');
+    expect(reopened.status).toBe(persisted.status);
+    expect(reopened.reopenCount).toBe(persisted.reopenCount);
     const alerts = await prisma.notification.findMany({ where: { ticketId: created.id, type: 'TICKET_REOPENED' } });
     expect(alerts.some((alert) => alert.recipientId === stall.userId)).toBe(true);
     expect(alerts.some((alert) => alert.recipientId === manager.id)).toBe(false);
@@ -428,13 +431,13 @@ const isolated = (() => {
       zoneId: lab.stalls[0].zoneId,
       stallCode: `CASE-SRC-${suffix}`,
       exhibitorName: 'Duplicate',
-    })).rejects.toThrow(/Unique constraint/);
+    })).rejects.toThrow(/CASE-SRC-.*already used in this zone/);
     expect(await prisma.stall.count({ where: { zoneId: lab.stalls[0].zoneId, stallCode: `CASE-SRC-${suffix}` } })).toBe(1);
     await expect(management.updateRegistration(lab.admin.scope, source.id, { exhibitorName: ' ' })).rejects.toThrow(/required/);
     const person = await workforce.createPerson(lab.admin.scope, {
       name: 'Case exhibitor',
       email: `regression.case.${suffix}@volume.lab`,
-      password: REGRESSION_FIXTURE_PASSWORD,
+      password: regressionFixturePassword(),
       role: 'STALL',
       eventId: lab.eventId,
       stallId: source.id,
@@ -442,7 +445,7 @@ const isolated = (() => {
     await prisma.user.update({ where: { id: person.id }, data: { mustChangePassword: false } });
     const auth = new AuthController(prisma);
     const response = { cookie() { return undefined; } } as unknown as Response;
-    await auth.login({ email: `regression.case.${suffix}@volume.lab`, password: REGRESSION_FIXTURE_PASSWORD, portal: 'OPERATIONS' }, response);
+    await auth.login({ email: `regression.case.${suffix}@volume.lab`, password: regressionFixturePassword(), portal: 'OPERATIONS' }, response);
     const open = await tickets.create({
       category: 'ELECTRICAL',
       subtype: 'Lighting',
@@ -464,21 +467,67 @@ const isolated = (() => {
     await prisma.assignment.deleteMany({ where: { ticketId: open.id } });
     await prisma.ticket.delete({ where: { id: open.id } });
     const historical = await prisma.ticket.findUnique({ where: { id: lab.busyTicketIds[0] } });
+    await prisma.pushSubscription.create({
+      data: { userId: person.id, endpoint: `https://push.example.test/case-${suffix}`, p256dh: 'regression-p256dh-key', auth: 'regression-auth' },
+    });
+    const unrelated = lab.stalls.find((stall) => stall.userId !== person.id)!;
+    await prisma.pushSubscription.create({
+      data: { userId: unrelated.userId, endpoint: `https://push.example.test/other-${suffix}`, p256dh: 'regression-p256dh-key', auth: 'regression-auth' },
+    });
     const transferred = await management.transferExhibitor(lab.admin.scope, source.id, { destinationStallId: destination.id, reason: 'Moving booth' });
     expect(transferred.destinationStallId).toBe(destination.id);
     const sessions = await prisma.session.count({ where: { userId: person.id } });
     expect(sessions).toBe(0);
+    expect(await prisma.pushSubscription.count({ where: { userId: person.id } })).toBe(1);
     const moved = await prisma.userScope.findFirstOrThrow({ where: { userId: person.id, stallId: destination.id } });
     expect(moved.stallId).toBe(destination.id);
     expect(historical?.stallId).toBe(busyStallId);
-    await prisma.pushSubscription.create({
-      data: { userId: person.id, endpoint: `https://push.volume.lab/${suffix}`, p256dh: 'regression-p256dh-key', auth: 'regression-auth' },
+    if (!historical) throw new Error('Busy ticket missing');
+    const sourceNotice = await prisma.notification.create({
+      data: {
+        eventId: lab.eventId,
+        recipientId: person.id,
+        ticketId: historical.id,
+        type: 'TICKET_CREATED',
+        dedupeKey: `case-source-notice-${suffix}`,
+        payload: { summary: 'Request from the previous stall' },
+      },
     });
+    const sent: string[] = [];
+    const sender: PushSend = async (subscription) => { sent.push(subscription.userId); };
+    await deliverNotificationPush(prisma as never, sourceNotice.id, sender);
+    expect(sent).not.toContain(person.id);
+    const sourceDelivery = await prisma.notification.findUniqueOrThrow({ where: { id: sourceNotice.id } });
+    expect(sourceDelivery.pushedAt).toBeNull();
+    expect(sourceDelivery.pushAttempts).toBe(5);
+    expect(await prisma.pushSubscription.count({ where: { userId: person.id } })).toBe(1);
     const archived = await management.archiveRegistration(lab.admin.scope, destination.id, { reason: 'Booth left the hall' });
     expect(archived.archivedAt).not.toBeNull();
     const disabled = await prisma.user.findUniqueOrThrow({ where: { id: person.id } });
     expect(disabled.status).toBe('DISABLED');
-    archivedPushSubscriptions = await prisma.pushSubscription.count({ where: { userId: person.id } });
+    expect(await prisma.pushSubscription.count({ where: { userId: person.id } })).toBe(0);
+    expect(await prisma.pushSubscription.count({ where: { userId: unrelated.userId } })).toBe(1);
+    expect(await prisma.notification.findUnique({ where: { id: sourceNotice.id } })).not.toBeNull();
+    await expect(management.archiveRegistration(lab.admin.scope, destination.id, { reason: 'Booth left the hall' })).rejects.toThrow(/already archived/);
+    expect((await prisma.user.findUniqueOrThrow({ where: { id: person.id } })).status).toBe('DISABLED');
+    await prisma.pushSubscription.create({
+      data: { userId: person.id, endpoint: `https://push.example.test/again-${suffix}`, p256dh: 'regression-p256dh-key', auth: 'regression-auth' },
+    });
+    const disabledNotice = await prisma.notification.create({
+      data: {
+        eventId: lab.eventId,
+        recipientId: person.id,
+        type: 'TICKET_CREATED',
+        dedupeKey: `case-disabled-notice-${suffix}`,
+        payload: { summary: 'Must not be delivered' },
+      },
+    });
+    await deliverNotificationPush(prisma as never, disabledNotice.id, sender);
+    expect(sent).not.toContain(person.id);
+    expect(await prisma.pushSubscription.count({ where: { userId: person.id } })).toBe(0);
+    const kept = await prisma.notification.findUniqueOrThrow({ where: { id: disabledNotice.id } });
+    expect(kept.pushedAt).toBeNull();
+    expect(kept.pushAttempts).toBe(5);
     await expect(tickets.create({
       category: 'ELECTRICAL',
       subtype: 'Lighting',
@@ -496,13 +545,274 @@ const isolated = (() => {
     await prisma.notification.deleteMany({ where: { recipientId: person.id } });
     await prisma.userScope.deleteMany({ where: { userId: person.id } });
     await prisma.session.deleteMany({ where: { userId: person.id } });
-    await prisma.pushSubscription.deleteMany({ where: { userId: person.id } });
+    await prisma.pushSubscription.deleteMany({ where: { userId: { in: [person.id, unrelated.userId] }, endpoint: { contains: suffix } } });
     await prisma.user.delete({ where: { id: person.id } });
     await prisma.stall.deleteMany({ where: { id: { in: [source.id, destination.id] } } });
   });
 
-  it('revokes push subscriptions when archive disables the exhibitor', () => {
-    expect(archivedPushSubscriptions).toBe(0);
+  it('keeps a remaining stall subscription and selects push recipients at dispatch', async () => {
+    const suffix = Date.now().toString(36);
+    const zoneId = lab.stalls[0].zoneId;
+    const hallId = lab.stalls[0].hallId;
+    const adminUser = await prisma.user.findUniqueOrThrow({ where: { id: lab.admin.id }, select: { organizationId: true } });
+    const keptStall = await management.createMaster(lab.admin.scope, 'stall', {
+      eventId: lab.eventId,
+      zoneId,
+      stallCode: `CASE-KEEP-${suffix}`,
+      exhibitorName: 'Kept booth',
+      servicePriority: 'LOW',
+    });
+    const droppedStall = await management.createMaster(lab.admin.scope, 'stall', {
+      eventId: lab.eventId,
+      zoneId,
+      stallCode: `CASE-DROP-${suffix}`,
+      exhibitorName: 'Dropped booth',
+      servicePriority: 'LOW',
+    });
+    const person = await prisma.user.create({
+      data: {
+        organizationId: adminUser.organizationId,
+        name: 'Shared exhibitor',
+        email: `regression.case.shared.${suffix}@volume.lab`,
+        passwordHash: 'not-used',
+        role: 'STALL',
+        status: 'ACTIVE',
+        approvalStatus: 'APPROVED',
+      },
+    });
+    await prisma.userScope.createMany({
+      data: [
+        { userId: person.id, eventId: lab.eventId, hallId, stallId: keptStall.id },
+        { userId: person.id, eventId: lab.eventId, hallId, stallId: droppedStall.id },
+      ],
+    });
+    await prisma.session.create({
+      data: { userId: person.id, tokenHash: `shared-session-${suffix}`, expiresAt: new Date(Date.now() + 3600_000) },
+    });
+    await prisma.pushSubscription.create({
+      data: { userId: person.id, endpoint: `https://push.example.test/shared-${suffix}`, p256dh: 'regression-p256dh-key', auth: 'regression-auth' },
+    });
+    const keptTicket = await prisma.ticket.create({
+      data: {
+        eventId: lab.eventId,
+        publicNo: `CASE-KEEP-${suffix}`,
+        hallId,
+        zoneId,
+        stallId: keptStall.id,
+        category: 'ELECTRICAL',
+        subtype: 'Lighting',
+        description: 'Still this exhibitor',
+        status: 'CLOSED',
+        createdById: person.id,
+        idempotencyKey: `case-keep-${suffix}`,
+        closedAt: new Date(),
+      },
+    });
+    const droppedTicket = await prisma.ticket.create({
+      data: {
+        eventId: lab.eventId,
+        publicNo: `CASE-DROP-${suffix}`,
+        hallId,
+        zoneId,
+        stallId: droppedStall.id,
+        category: 'ELECTRICAL',
+        subtype: 'Lighting',
+        description: 'Previous booth',
+        status: 'CLOSED',
+        createdById: person.id,
+        idempotencyKey: `case-drop-${suffix}`,
+        closedAt: new Date(),
+      },
+    });
+    await management.archiveRegistration(lab.admin.scope, droppedStall.id, { reason: 'One booth closed' });
+    expect((await prisma.user.findUniqueOrThrow({ where: { id: person.id } })).status).toBe('ACTIVE');
+    expect(await prisma.session.count({ where: { userId: person.id } })).toBe(1);
+    expect(await prisma.pushSubscription.count({ where: { userId: person.id } })).toBe(1);
+    expect(await prisma.userScope.count({ where: { userId: person.id, stallId: keptStall.id } })).toBe(1);
+
+    const parked = await prisma.notification.findMany({ where: { pushedAt: null }, select: { id: true } });
+    if (parked.length) {
+      await prisma.notification.updateMany({ where: { id: { in: parked.map((row) => row.id) } }, data: { pushedAt: new Date() } });
+    }
+    const sent: string[] = [];
+    const sender: PushSend = async (subscription) => { sent.push(subscription.id); };
+    try {
+      const droppedNotice = await prisma.notification.create({
+        data: {
+          eventId: lab.eventId,
+          recipientId: person.id,
+          ticketId: droppedTicket.id,
+          type: 'TICKET_CREATED',
+          dedupeKey: `case-drop-notice-${suffix}`,
+          payload: { summary: 'Old booth' },
+        },
+      });
+      const keptNotice = await prisma.notification.create({
+        data: {
+          eventId: lab.eventId,
+          recipientId: person.id,
+          ticketId: keptTicket.id,
+          type: 'TICKET_CREATED',
+          dedupeKey: `case-keep-notice-${suffix}`,
+          payload: { summary: 'Current booth' },
+        },
+      });
+      await deliverPendingPushes(prisma as never, sender);
+      expect(sent).toHaveLength(1);
+      const droppedDelivery = await prisma.notification.findUniqueOrThrow({ where: { id: droppedNotice.id } });
+      const keptDelivery = await prisma.notification.findUniqueOrThrow({ where: { id: keptNotice.id } });
+      expect(droppedDelivery.pushedAt).toBeNull();
+      expect(droppedDelivery.pushAttempts).toBe(5);
+      expect(keptDelivery.pushedAt).not.toBeNull();
+      expect(await prisma.pushSubscription.count({ where: { userId: person.id } })).toBe(1);
+      sent.length = 0;
+      await deliverPendingPushes(prisma as never, sender);
+      expect(sent).toHaveLength(0);
+
+      const assignee = await prisma.assignment.findFirstOrThrow({
+        where: { ticketId: lab.busyTicketIds[0], status: { in: ['ACTIVE', 'ACCEPTED'] } },
+        include: { ticket: true },
+      });
+      const bystander = lab.staff.find((row) => row.id !== assignee.staffId && row.hallId === assignee.ticket.hallId && row.kind === assignee.ticket.category)!;
+      await prisma.pushSubscription.create({
+        data: { userId: assignee.staffId, endpoint: `https://push.example.test/staff-${suffix}`, p256dh: 'regression-p256dh-key', auth: 'regression-auth' },
+      });
+      await prisma.pushSubscription.create({
+        data: { userId: bystander.id, endpoint: `https://push.example.test/bystander-${suffix}`, p256dh: 'regression-p256dh-key', auth: 'regression-auth' },
+      });
+      const assignedNotice = await prisma.notification.create({
+        data: {
+          eventId: assignee.ticket.eventId,
+          recipientId: assignee.staffId,
+          ticketId: assignee.ticketId,
+          type: 'TICKET_ASSIGNED',
+          dedupeKey: `case-assignee-${suffix}`,
+          payload: { summary: 'Your task' },
+        },
+      });
+      const staleNotice = await prisma.notification.create({
+        data: {
+          eventId: assignee.ticket.eventId,
+          recipientId: bystander.id,
+          ticketId: assignee.ticketId,
+          type: 'TICKET_ASSIGNED',
+          dedupeKey: `case-bystander-${suffix}`,
+          payload: { summary: 'Not your task' },
+        },
+      });
+      await deliverPendingPushes(prisma as never, sender);
+      expect(sent).toHaveLength(1);
+      expect((await prisma.notification.findUniqueOrThrow({ where: { id: assignedNotice.id } })).pushedAt).not.toBeNull();
+      expect((await prisma.notification.findUniqueOrThrow({ where: { id: staleNotice.id } })).pushAttempts).toBe(5);
+      expect(await prisma.pushSubscription.count({ where: { userId: bystander.id, endpoint: { contains: suffix } } })).toBe(1);
+    } finally {
+      if (parked.length) {
+        await prisma.notification.updateMany({ where: { id: { in: parked.map((row) => row.id) } }, data: { pushedAt: null } });
+      }
+      await prisma.notification.deleteMany({ where: { dedupeKey: { contains: suffix } } });
+      await prisma.pushSubscription.deleteMany({ where: { endpoint: { contains: suffix } } });
+    }
+  });
+
+  it('maps duplicate stall codes to a conflict through HTTP', async () => {
+    const suffix = Date.now().toString(36);
+    const zoneId = lab.stalls[0].zoneId;
+    const adminCookie = await sessionCookie(prisma, lab.admin.id);
+    const code = `CASE-HTTP-${suffix}`;
+    const createStall = (stallCode: string, exhibitorName: string) => api(baseUrl, '/api/management/masters/stall', adminCookie, {
+      method: 'POST',
+      body: JSON.stringify({ eventId: lab.eventId, zoneId, stallCode, exhibitorName }),
+    });
+    const missing = await api(baseUrl, '/api/management/masters/stall', adminCookie, {
+      method: 'POST',
+      body: JSON.stringify({ eventId: lab.eventId, zoneId, stallCode: `CASE-HTTP-BAD-${suffix}` }),
+    });
+    expect(missing.status).toBe(400);
+
+    const first = await createStall(code, 'First booth');
+    expect(first.status).toBe(201);
+    const duplicate = await createStall(code, 'Second booth');
+    expect(duplicate.status).toBe(409);
+    expect(JSON.stringify(await duplicate.json())).toContain(code);
+    expect(await prisma.stall.count({ where: { zoneId, stallCode: code } })).toBe(1);
+    expect(await prisma.stall.count({ where: { exhibitorName: 'Second booth' } })).toBe(0);
+
+    const otherCode = `CASE-HTTP-B-${suffix}`;
+    const other = await createStall(otherCode, 'Other booth');
+    expect(other.status).toBe(201);
+    const otherRow = await other.json() as { id: string };
+    const edited = await api(baseUrl, `/api/management/registrations/${otherRow.id}`, adminCookie, {
+      method: 'PATCH',
+      body: JSON.stringify({ stallCode: code }),
+    });
+    expect(edited.status).toBe(409);
+    expect(JSON.stringify(await edited.json())).toContain(code);
+    expect((await prisma.stall.findUniqueOrThrow({ where: { id: otherRow.id } })).stallCode).toBe(otherCode);
+
+    const raceCode = `CASE-HTTP-RACE-${suffix}`;
+    const [left, right] = await Promise.all([
+      createStall(raceCode, 'Race left'),
+      createStall(raceCode, 'Race right'),
+    ]);
+    expect([left.status, right.status].sort()).toEqual([201, 409]);
+    expect(await prisma.stall.count({ where: { zoneId, stallCode: raceCode } })).toBe(1);
+    const loser = left.status === 409 ? 'Race left' : 'Race right';
+    expect(await prisma.stall.count({ where: { exhibitorName: loser } })).toBe(0);
+
+    const validCode = `CASE-HTTP-OK-${suffix}`;
+    const valid = await createStall(validCode, 'Valid booth');
+    expect(valid.status).toBe(201);
+    expect(await prisma.stall.count({ where: { zoneId, stallCode: validCode } })).toBe(1);
+  });
+
+  it('returns the assigned ticket and still notifies when reopen has capacity', async () => {
+    const stall = stallsIn(lab, 'H4')[0];
+    const manager = lab.managers.find((person) => person.hallId === stall.hallId)!;
+    const worker = staffBy(lab, 'H4', 'HOUSE_HELP', 2);
+    const other = staffBy(lab, 'H4', 'HOUSE_HELP', 1);
+    await workforce.availability(staffScope(other), 'OFF_DUTY');
+    await workforce.availability(staffScope(worker), 'ON_DUTY');
+    const created = await createCase(tickets, stall, 'HOUSE_HELP', 'General', 'Reopen with a free worker', 'NORMAL', 'case-reopen-free');
+    expect(created.status).toBe('ASSIGNED');
+    await closeThroughOtp(tickets, created.id, worker, stall, manager.scope);
+    const before = await prisma.notification.count({ where: { ticketId: created.id, type: 'TICKET_REOPENED' } });
+    const reopened = await tickets.transition(created.id, 'REOPENED', manager.scope, 'The work was incomplete');
+    const persisted = await prisma.ticket.findUniqueOrThrow({ where: { id: created.id } });
+    expect(persisted.status).toBe('ASSIGNED');
+    expect(reopened.status).toBe('ASSIGNED');
+    expect(reopened.id).toBe(persisted.id);
+    expect(reopened.reopenCount).toBe(1);
+    expect(await prisma.assignment.count({
+      where: { ticketId: created.id, status: { in: ['ACTIVE', 'ACCEPTED'] } },
+    })).toBe(1);
+    const alerts = await prisma.notification.findMany({ where: { ticketId: created.id, type: 'TICKET_REOPENED' } });
+    expect(alerts.length).toBeGreaterThan(before);
+    expect(alerts.some((alert) => alert.recipientId === stall.userId)).toBe(true);
+    await expect(tickets.transition(created.id, 'REOPENED', manager.scope, 'The work was incomplete')).rejects.toThrow(/Invalid ticket transition/);
+    expect((await prisma.ticket.findUniqueOrThrow({ where: { id: created.id } })).reopenCount).toBe(1);
+  });
+
+  it('returns the queued ticket and still notifies when reopen has no capacity', async () => {
+    const stall = stallsIn(lab, 'H4')[1];
+    const manager = lab.managers.find((person) => person.hallId === stall.hallId)!;
+    const worker = staffBy(lab, 'H4', 'HOUSE_HELP', 2);
+    const other = staffBy(lab, 'H4', 'HOUSE_HELP', 1);
+    await workforce.availability(staffScope(other), 'OFF_DUTY');
+    await workforce.availability(staffScope(worker), 'ON_DUTY');
+    const created = await createCase(tickets, stall, 'HOUSE_HELP', 'General', 'Reopen with nobody free', 'NORMAL', 'case-reopen-busy');
+    expect(created.status).toBe('ASSIGNED');
+    await closeThroughOtp(tickets, created.id, worker, stall, manager.scope);
+    await workforce.availability(staffScope(worker), 'OFF_DUTY');
+    const reopened = await tickets.transition(created.id, 'REOPENED', manager.scope, 'Nobody is free');
+    const persisted = await prisma.ticket.findUniqueOrThrow({ where: { id: created.id } });
+    expect(persisted.status).toBe('QUEUED');
+    expect(reopened.status).toBe('QUEUED');
+    expect(await prisma.assignment.count({
+      where: { ticketId: created.id, status: { in: ['ACTIVE', 'ACCEPTED'] } },
+    })).toBe(0);
+    const alerts = await prisma.notification.findMany({ where: { ticketId: created.id, type: 'TICKET_REOPENED' } });
+    expect(alerts.some((alert) => alert.recipientId === stall.userId)).toBe(true);
+    expect(alerts.some((alert) => alert.recipientId === manager.id)).toBe(false);
   });
 });
 
@@ -550,6 +860,22 @@ function staffScope(person: RegressionStaff) {
     hallIds: [person.hallId],
     serviceTypes: [person.kind],
   };
+}
+
+async function closeThroughOtp(
+  tickets: TicketService,
+  ticketId: string,
+  worker: RegressionStaff,
+  stall: RegressionStall,
+  manager: RegressionFixture['managers'][number]['scope'],
+) {
+  const assignee = staffScope(worker);
+  await tickets.transition(ticketId, 'ACCEPTED', assignee);
+  await tickets.transition(ticketId, 'IN_PROGRESS', assignee);
+  await tickets.transition(ticketId, 'AWAITING_OTP', assignee);
+  const presented = await tickets.presentOtp(ticketId, stallScope(stall));
+  if (!presented.otp) throw new Error('OTP was not presented');
+  return tickets.verifyOtp(ticketId, presented.otp, manager);
 }
 
 async function createCase(
@@ -611,11 +937,23 @@ async function restoreStaff(prisma: PrismaService, lab: RegressionFixture | unde
   }
 }
 
+async function sessionCookie(prisma: PrismaService, userId: string) {
+  const token = randomBytes(32).toString('base64url');
+  await prisma.session.create({
+    data: {
+      userId,
+      tokenHash: createHash('sha256').update(token).digest('hex'),
+      expiresAt: new Date(Date.now() + 60 * 60 * 1000),
+    },
+  });
+  return `eveops_session=${token}`;
+}
+
 async function login(baseUrl: string, email: string, portal: 'OPERATIONS' | 'GOVERNANCE') {
   const response = await fetch(`${baseUrl}/api/auth/login`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ email, password: REGRESSION_FIXTURE_PASSWORD, portal }),
+    body: JSON.stringify({ email, password: regressionFixturePassword(), portal }),
   });
   if (!response.ok) throw new Error(`Login failed with status ${response.status}`);
   const header = typeof response.headers.getSetCookie === 'function'

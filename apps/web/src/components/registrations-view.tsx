@@ -4,7 +4,7 @@ import Link from 'next/link';
 import { FormEvent, useCallback, useEffect, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { apiErrorMessage, apiFetch } from '../lib/api-client';
-import { stopSound } from '../lib/sounds';
+import { bindAlertUser, stopSound } from '../lib/sounds';
 
 type ServicePriority = 'HIGH' | 'MEDIUM' | 'LOW';
 
@@ -55,6 +55,7 @@ export function RegistrationsView() {
 
   async function logout() {
     stopSound();
+    bindAlertUser('');
     await globalThis.fetch('/api/auth/logout', { method: 'POST', credentials: 'include' });
     router.replace('/login');
     router.refresh();

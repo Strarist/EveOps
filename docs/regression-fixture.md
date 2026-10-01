@@ -23,7 +23,38 @@ DATABASE_URL="postgresql://eveops:eveops@localhost:55432/eveops_regression?schem
 
 The command runs through the API test runner so Nest decorators load. `ALLOW_DEMO_SEED=false` keeps the documented pilot accounts out of this database. Running it again updates the same rows.
 
-The shared password is the `REGRESSION_FIXTURE_PASSWORD` constant in `apps/api/src/regression-fixture.ts`. It is not printed by the seed command. Emails use `@volume.lab`.
+The shared password is `REGRESSION_FIXTURE_PASSWORD`, supplied in the environment. The fixture refuses to run when it is missing, updates the synthetic account hashes to that value, and does not print it. Do not commit the password, and do not put it in tracked source, screenshots, or reports. Emails use `@volume.lab`.
+
+## Isolated browser stack
+
+`npm run dev` loads `.env`, which points at the application database. Do not use it for regression.
+
+Start the regression stack only through `scripts/dev-regression.sh`. That script:
+
+- Sets `DATABASE_URL` to local `eveops_regression` after reading `.env`, so an inherited application database URL cannot remain in effect.
+- Sets `ALLOW_DEMO_SEED=false`. API startup also skips demo seed when the connected database is `eveops_regression`.
+- Sets `EVEOPS_REQUIRE_DATABASE=eveops_regression`. API and worker startup query `current_database()` once and refuse to continue if it does not match. The startup log shows the database name and not the connection string. `GET /api/system/health` stays a process check and includes `databaseName` only while that guard is set; it does not query the database again.
+- Uses ports 3100 (web) and 4100 (API) unless `REGRESSION_WEB_PORT` and `REGRESSION_API_PORT` are set.
+- Points `API_URL`, `NEXT_PUBLIC_API_URL`, `WEB_ORIGIN`, and `E2E_BASE_URL` at that stack.
+- Sets `COOKIE_SECURE=false` for local HTTP cookies.
+- Runs migrations and the fixture seed against `eveops_regression` only.
+
+```bash
+export REGRESSION_FIXTURE_PASSWORD='your-local-password'
+bash scripts/dev-regression.sh
+```
+
+Confirm health before opening the browser:
+
+```bash
+curl -s http://localhost:4100/api/system/health
+```
+
+The JSON `databaseName` must be `eveops_regression`.
+
+Playwright for this stack is `npx playwright test -c playwright.regression.config.ts`. It does not start `npm run dev`. Start the regression script first, or let that config start it. The browser base URL is `E2E_BASE_URL`.
+
+## Tests
 
 | Role | Count | Email pattern |
 | --- | ---: | --- |

@@ -906,6 +906,9 @@ export class WorkforceService {
         if (deactivated || dto.password !== undefined) {
           await tx.session.deleteMany({ where: { userId: user.id } });
         }
+        if (deactivated) {
+          await tx.pushSubscription.deleteMany({ where: { userId: user.id } });
+        }
 
         const actions = ['USER_UPDATED'];
         if (deactivated) actions.push('USER_DEACTIVATED');

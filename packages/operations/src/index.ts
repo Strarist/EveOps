@@ -1,6 +1,10 @@
 import { Prisma, PrismaClient, TicketStatus, type Ticket } from '@prisma/client';
 import { randomUUID } from 'node:crypto';
 
+export { assertEffectiveDatabase, effectiveDatabaseName, publishedDatabaseName } from './database-guard';
+export { classifyPushEndpoint, deliverNotificationPush, deliverPendingPushes, loadPushDecision, pushEndpointShapeAllowed } from './push-delivery';
+export type { PushDecision, PushSend, PushSubscriptionTarget } from './push-delivery';
+
 type DatabaseClient = Pick<PrismaClient, '$transaction'>;
 
 export type RoutingChange = { ticket: Ticket; assigneeId?: string };

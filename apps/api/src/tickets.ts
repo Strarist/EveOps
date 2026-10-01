@@ -503,6 +503,7 @@ export class TicketService {
     if (to === 'REOPENED') {
       await this.route(id, undefined, requestCorrelationId());
       await this.assignWaitingForReleasedStaff(result.releasedStaffId ? [result.releasedStaffId] : []);
+      return this.prisma.ticket.findUniqueOrThrow({ where: { id } });
     }
     return result.ticket;
   }

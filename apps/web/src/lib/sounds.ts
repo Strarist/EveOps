@@ -1,12 +1,37 @@
 const SOUND_KEY = 'eveops-sound';
 const PLAYED_KEY = 'eveops-played-alerts';
+const SILENCED_KEY = 'eveops-silenced-alerts';
+
+let activeUserId = '';
+
+/** Staff alerts are stored per account so a later login does not inherit them. */
+export function bindAlertUser(userId: string) {
+  if (activeUserId !== userId) stopSound();
+  activeUserId = userId;
+}
+
+function scopedKey(base: string) {
+  return activeUserId ? `${base}:${activeUserId}` : null;
+}
+
+function readList(key: string) {
+  try {
+    const parsed = JSON.parse(sessionStorage.getItem(key) ?? '[]') as unknown;
+    return Array.isArray(parsed) ? parsed.filter((item): item is string => typeof item === 'string') : [];
+  } catch {
+    return [];
+  }
+}
 
 export function soundEnabled() {
-  return typeof window !== 'undefined' && window.localStorage.getItem(SOUND_KEY) === 'on';
+  const key = scopedKey(SOUND_KEY);
+  return key !== null && typeof window !== 'undefined' && window.localStorage.getItem(key) === 'on';
 }
 
 export function setSoundEnabled(enabled: boolean) {
-  window.localStorage.setItem(SOUND_KEY, enabled ? 'on' : 'off');
+  const key = scopedKey(SOUND_KEY);
+  if (!key || typeof window === 'undefined') return;
+  window.localStorage.setItem(key, enabled ? 'on' : 'off');
 }
 
 export function soundStatus() {
@@ -66,16 +91,30 @@ export function stopSound() {
 }
 
 export function playedAlerts(): string[] {
-  try {
-    return JSON.parse(sessionStorage.getItem(PLAYED_KEY) ?? '[]') as string[];
-  } catch {
-    return [];
-  }
+  const key = scopedKey(PLAYED_KEY);
+  if (!key || typeof window === 'undefined') return [];
+  return readList(key);
 }
 
 export function rememberAlert(id: string) {
+  const key = scopedKey(PLAYED_KEY);
+  if (!key || typeof window === 'undefined') return;
   const next = [...new Set([...playedAlerts(), id])].slice(-200);
-  sessionStorage.setItem(PLAYED_KEY, JSON.stringify(next));
+  sessionStorage.setItem(key, JSON.stringify(next));
+}
+
+export function silencedAlerts(): string[] {
+  const key = scopedKey(SILENCED_KEY);
+  if (!key || typeof window === 'undefined') return [];
+  return readList(key);
+}
+
+export function silenceAlert(id: string) {
+  stopSound();
+  const key = scopedKey(SILENCED_KEY);
+  if (!key || typeof window === 'undefined') return;
+  const next = [...new Set([...silencedAlerts(), id])].slice(-200);
+  sessionStorage.setItem(key, JSON.stringify(next));
 }
 
 export async function playRepeatAlert(id: string, durationMs = 20000) {
