@@ -14,6 +14,8 @@ export const TERMINAL_TICKET_STATUSES: readonly TicketStatus[] = ['CLOSED', 'CAN
 export const ASSIGNED_TICKET_STATUSES: readonly TicketStatus[] = ['ASSIGNED', 'SNOOZED', 'ACCEPTED', 'IN_PROGRESS', 'AWAITING_OTP'];
 
 export type TicketPriority = 'NORMAL' | 'URGENT';
+export const SERVICE_PRIORITIES = ['HIGH', 'MEDIUM', 'LOW'] as const;
+export type ServicePriority = (typeof SERVICE_PRIORITIES)[number];
 export type ServiceCategory = 'ELECTRICAL' | 'HOUSE_HELP' | 'HALL_MANAGER';
 
 export interface AuthScope {

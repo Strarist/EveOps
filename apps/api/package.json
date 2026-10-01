@@ -10,7 +10,9 @@
     "prestart:dev": "npm run build -w @eveops/contracts && npm run build -w @eveops/operations",
     "start:dev": "nest start --watch",
     "lint": "eslint src",
-    "test": "jest --runInBand"
+    "test": "jest --runInBand",
+    "test:regression": "jest --runInBand --testPathPatterns regression.volume.spec",
+    "db:fixture:regression": "jest --runInBand --testPathPatterns regression.fixture.seed.spec --forceExit"
   },
   "dependencies": {
     "@eveops/contracts": "*",

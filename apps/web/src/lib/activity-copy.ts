@@ -49,6 +49,8 @@ export function activitySentence(eventType: string, actor = 'The system') {
       return `${who} closed this request with a recorded reason.`;
     case 'QUEUE_PRIORITY_OVERRIDDEN':
       return `${who} moved this request ahead in the queue and recorded a reason.`;
+    case 'SERVICE_PRIORITY_CHANGED':
+      return `${who} changed the service priority of this waiting request and recorded a reason.`;
     case 'STAFF_PINGED':
       return `${who} sent a reminder about this task.`;
     case 'SLA_BREACHED':

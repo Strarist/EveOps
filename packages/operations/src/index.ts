@@ -8,6 +8,14 @@ export type RoutingResult = { requested: Ticket; changed: RoutingChange[] };
 
 const transitionsToAssigned = new Set<TicketStatus>(['NEW', 'QUEUED', 'REOPENED']);
 
+/** Reasoned override, then HIGH → MEDIUM → LOW, then creation time, then id. */
+export const serviceQueueOrderBy = [
+  { queuePriorityOverrideAt: { sort: 'asc' as const, nulls: 'last' as const } },
+  { servicePriority: 'asc' as const },
+  { createdAt: 'asc' as const },
+  { id: 'asc' as const },
+];
+
 export async function routeTicket(database: DatabaseClient, ticketId: string, actorId?: string, correlationId: string = randomUUID()): Promise<RoutingResult> {
   return database.$transaction(async (tx) => {
     const initial = await tx.ticket.findUniqueOrThrow({ where: { id: ticketId } });
@@ -59,15 +67,11 @@ export async function routeTicket(database: DatabaseClient, ticketId: string, ac
         left.lastAvailableAt.getTime() - right.lastAvailableAt.getTime() ||
         left.userId.localeCompare(right.userId),
       )[0];
-    const waiting = await tx.ticket.findFirst({
-      where: { poolId: requestedTicket.poolId, status: 'QUEUED' },
-      orderBy: [
-        { queuePriorityOverrideAt: { sort: 'asc', nulls: 'last' } },
-        { createdAt: 'asc' },
-        { id: 'asc' },
-      ],
+    const candidates = await tx.ticket.findMany({
+      where: { poolId: requestedTicket.poolId, status: { in: ['NEW', 'QUEUED', 'REOPENED'] } },
+      orderBy: serviceQueueOrderBy,
     });
-    const selectedTicket = selectedStaff ? waiting ?? requestedTicket : undefined;
+    const selectedTicket = selectedStaff ? candidates[0] : undefined;
     const now = new Date();
     const changed: RoutingChange[] = [];
 

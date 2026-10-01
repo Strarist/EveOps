@@ -45,6 +45,13 @@ enum TicketPriority {
   URGENT
 }
 
+/// Declaration order is the queue order: HIGH, then MEDIUM, then LOW.
+enum ServicePriority {
+  HIGH
+  MEDIUM
+  LOW
+}
+
 enum TicketStatus {
   NEW
   ASSIGNED
@@ -137,12 +144,14 @@ model Stall {
   eventId       String
   zoneId        String
   zone          Zone        @relation(fields: [zoneId], references: [id])
-  stallCode     String
-  exhibitorName String
-  contact       String?
-  active        Boolean     @default(true)
-  scopes        UserScope[]
-  tickets       Ticket[]
+  stallCode       String
+  exhibitorName   String
+  contact         String?
+  servicePriority ServicePriority @default(MEDIUM)
+  active          Boolean         @default(true)
+  archivedAt      DateTime?
+  scopes          UserScope[]
+  tickets         Ticket[]
 
   @@unique([zoneId, stallCode])
   @@index([eventId])
@@ -271,8 +280,10 @@ model Ticket {
   category                String
   subtype                 String
   description             String
-  priority                TicketPriority @default(NORMAL)
-  status                  TicketStatus   @default(NEW)
+  priority                TicketPriority  @default(NORMAL)
+  /// Copy of the stall service priority at creation. Later stall edits do not rewrite it.
+  servicePriority         ServicePriority @default(MEDIUM)
+  status                  TicketStatus    @default(NEW)
   createdById             String
   createdBy               User           @relation("TicketCreator", fields: [createdById], references: [id])
   idempotencyKey          String
@@ -299,6 +310,7 @@ model Ticket {
   @@index([eventId, hallId, status, createdAt])
   @@index([poolId, status, createdAt])
   @@index([poolId, status, queuePriorityOverrideAt, createdAt])
+  @@index([poolId, status, queuePriorityOverrideAt, servicePriority, createdAt], map: "Ticket_queue_order_idx")
   @@index([eventId, status, priority, createdAt])
   @@index([stallId, status, createdAt])
 }

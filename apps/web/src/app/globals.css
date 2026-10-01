@@ -51,7 +51,7 @@ button:disabled { cursor: wait; opacity: .65; }
 .brand { display: flex; align-items: center; gap: .65rem; padding: 0 .55rem 1.8rem; color: var(--white); font-size: 1.35rem; font-weight: 800; }
 .brand > span { width: 32px; height: 32px; display: grid; place-items: center; border-radius: 7px; background: var(--teal); font: 700 1.25rem Georgia, serif; }
 .sidebar nav { display: grid; gap: .25rem; }
-.sidebar nav button { width: 100%; min-height: 42px; display: flex; align-items: center; justify-content: space-between; padding: .7rem .8rem; border: 0; border-radius: 7px; background: transparent; color: inherit; font-size: .83rem; text-align: left; }
+.sidebar nav button, .sidebar nav a { width: 100%; min-height: 42px; display: flex; align-items: center; justify-content: space-between; padding: .7rem .8rem; border: 0; border-radius: 7px; background: transparent; color: inherit; font-size: .83rem; text-align: left; text-decoration: none; }
 .sidebar nav button.active { background: var(--navy-2); color: var(--white); border-left: 3px solid #35bdb5; font-weight: 700; }
 .sidebar nav i { padding: .15rem .45rem; border-radius: 1rem; background: #33435d; color: var(--white); font-size: .65rem; font-style: normal; }
 .user { margin-top: auto; padding: 1.2rem .45rem .8rem; border-top: 1px solid #2b3a53; display: flex; gap: .65rem; align-items: center; }
@@ -239,7 +239,7 @@ tbody tr:hover, tbody tr.selected { background: #f1f8f7; }
   .sidebar { min-height: auto; position: sticky; top: 0; z-index: 20; padding: .8rem 1rem calc(.8rem + env(safe-area-inset-bottom)); display: grid; gap: .6rem; }
   .sidebar .brand { padding: 0; }
   .sidebar nav { display: flex; gap: .35rem; overflow-x: auto; }
-  .sidebar nav button { flex: 0 0 auto; min-height: 44px; background: #1c3148; }
+  .sidebar nav button, .sidebar nav a { flex: 0 0 auto; min-height: 44px; background: #1c3148; }
   .sidebar .user { display: none; }
   .sidebar .logout { min-width: 80px; min-height: 44px; }
   .management { width: auto; grid-column: auto; grid-row: auto; padding: 0 .75rem 1.5rem; overflow: visible; }

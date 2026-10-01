@@ -17,6 +17,7 @@ import {
   UseGuards,
 } from '@nestjs/common';
 import type { AuthScope, Role } from '@eveops/contracts';
+import { serviceQueueOrderBy } from '@eveops/operations';
 import { Availability, Prisma, UserStatus } from '@prisma/client';
 import { Type } from 'class-transformer';
 import {
@@ -512,7 +513,7 @@ export class WorkforceService {
           for (let slot = 0; slot < membership.capacity; slot += 1) {
             const waiting = await this.prisma.ticket.findFirst({
               where: { poolId: membership.poolId, status: 'QUEUED' },
-              orderBy: [{ queuePriorityOverrideAt: { sort: 'asc', nulls: 'last' } }, { createdAt: 'asc' }, { id: 'asc' }],
+              orderBy: serviceQueueOrderBy,
             });
             if (!waiting) break;
             const before = waiting.version;
@@ -607,6 +608,18 @@ export class WorkforceService {
     const passwordHash = await hash(dto.password, 12);
     try {
       const created = await this.prisma.$transaction(async (tx) => {
+        if (dto.role === 'STALL' && dto.stallId) {
+          await tx.$queryRaw(Prisma.sql`SELECT id FROM "Stall" WHERE id = ${dto.stallId} FOR UPDATE`);
+          const lockedStall = await tx.stall.findFirst({
+            where: { id: dto.stallId, eventId: dto.eventId, active: true, archivedAt: null },
+            select: { id: true },
+          });
+          if (!lockedStall) throw new BadRequestException('A valid active stall is required');
+          const occupied = await tx.userScope.count({
+            where: { stallId: dto.stallId, user: { role: 'STALL' } },
+          });
+          if (occupied) throw new ConflictException('This stall already has an exhibitor account');
+        }
         // Hall Manager requests create the person without an ID; Admin assigns/generates on create or approve.
         const employeeCode = scope.role === 'HALL_MANAGER'
           ? null
@@ -1021,7 +1034,7 @@ export class WorkforceService {
       for (const pool of previousPools) {
         const waiting = await this.prisma.ticket.findFirst({
           where: { poolId: pool.poolId, status: 'QUEUED' },
-          orderBy: [{ queuePriorityOverrideAt: { sort: 'asc', nulls: 'last' } }, { createdAt: 'asc' }, { id: 'asc' }],
+          orderBy: serviceQueueOrderBy,
         });
         if (waiting) await this.tickets.route(waiting.id, scope.userId);
       }

@@ -696,4 +696,38 @@ test.describe.serial('isolated multi-role operational acceptance', () => {
     expect(activeAssignment?.staffId).toBe(person.id);
     await Promise.all([stall.close(), manager.close(), admin.close(), pendingStaff.close()]);
   });
+
+  test('17 service priority orders the queue and registrations stay on their own page', async ({ browser }) => {
+    await prisma.stall.update({ where: { id: ids.otherStall }, data: { servicePriority: 'HIGH' } });
+    const stall = await login(browser, emails.stall);
+    const staff = await login(browser, emails.staff);
+    const admin = await login(browser, emails.admin);
+    const first = await createTicket(stall);
+    expect(first.status).toBe('ASSIGNED');
+    const high = await createTicket(admin, 'ELECTRICAL', 'Lighting', ids.otherStall);
+    const medium = await createTicket(stall);
+    expect(high.status).toBe('QUEUED');
+    expect(medium.status).toBe('QUEUED');
+    expect((await (await admin.request.get(`/api/tickets/${high.id}`)).json()).servicePriority).toBe('HIGH');
+    await advanceToOtp(staff, first.id);
+    await closeWithOtp(stall, staff, first.id);
+    await expect.poll(async () => (await (await admin.request.get(`/api/tickets/${high.id}`)).json()).status).toBe('ASSIGNED');
+    expect((await (await admin.request.get(`/api/tickets/${medium.id}`)).json()).status).toBe('QUEUED');
+
+    const registrations = await admin.newPage();
+    await registrations.goto('/admin/registrations');
+    await expect(registrations.getByRole('heading', { name: 'Stall registrations' })).toBeVisible();
+    await expect(registrations.getByRole('heading', { name: 'Exhibitor accounts' })).toBeVisible();
+    await expect(registrations.getByRole('heading', { name: 'Staff' })).toBeVisible();
+    await expect(registrations.getByRole('heading', { name: 'Hall managers' })).toBeVisible();
+    const blocked = await admin.request.post(`/api/management/registrations/${ids.stall}/archive`, {
+      data: { reason: 'Open work should block archive' },
+    });
+    expect(blocked.status()).toBe(409);
+
+    const task = await staff.newPage();
+    await task.goto(`/staff/task/${high.id}`);
+    await expect(task.getByRole('button', { name: 'Accept task' })).toBeVisible();
+    await Promise.all([stall.close(), staff.close(), admin.close()]);
+  });
 });
