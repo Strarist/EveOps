@@ -1,5 +1,5 @@
-import { BadRequestException, Body, Controller, Get, Injectable, NotFoundException, Param, Patch, Post, Query, Res, StreamableFile, UseGuards } from '@nestjs/common';
-import type { AuthScope } from '@eveops/contracts';
+import { BadRequestException, Body, ConflictException, Controller, ForbiddenException, Get, Injectable, NotFoundException, Param, Patch, Post, Query, Res, StreamableFile, UseGuards } from '@nestjs/common';
+import { ACTIVE_TICKET_STATUSES, type AuthScope, type ServicePriority } from '@eveops/contracts';
 import type { Response } from 'express';
 import { Prisma } from '@prisma/client';
 import { Type } from 'class-transformer';
@@ -14,12 +14,14 @@ import {
   IsObject,
   IsOptional,
   IsString,
+  MaxLength,
   Min,
   MinLength,
 } from 'class-validator';
 import { hash } from 'bcryptjs';
 import { createReadStream, existsSync } from 'node:fs';
 import { basename, resolve } from 'node:path';
+import { Throttle } from '@nestjs/throttler';
 import { CurrentScope, SessionGuard } from './auth';
 import { requireAuthority } from './domain';
 import { PrismaService } from './prisma.service';
@@ -28,6 +30,7 @@ export class MetricsQueryDto {
   @IsOptional() @IsDateString() from?: string;
   @IsOptional() @IsDateString() to?: string;
   @IsOptional() @IsIn(['today', 'event', 'custom']) range?: 'today' | 'event' | 'custom';
+  @IsOptional() @IsString() eventId?: string;
 }
 
 export class UpdatePoolDto {
@@ -46,7 +49,24 @@ export class CreateMasterBodyDto {
   @IsOptional() @IsString() @MinLength(1) exhibitorName?: string;
   @IsOptional() @IsString() contact?: string;
   @IsOptional() @IsBoolean() active?: boolean;
+  @IsOptional() @IsIn(['HIGH', 'MEDIUM', 'LOW']) servicePriority?: ServicePriority;
   @IsOptional() @IsIn(['ACTIVE', 'INACTIVE']) status?: 'ACTIVE' | 'INACTIVE';
+}
+
+export class UpdateRegistrationDto {
+  @IsOptional() @IsString() @MinLength(1) @MaxLength(40) stallCode?: string;
+  @IsOptional() @IsString() @MinLength(1) @MaxLength(120) exhibitorName?: string;
+  @IsOptional() @IsString() @MaxLength(80) contact?: string;
+  @IsOptional() @IsIn(['HIGH', 'MEDIUM', 'LOW']) servicePriority?: ServicePriority;
+}
+
+export class TransferRegistrationDto {
+  @IsString() @MinLength(1) @MaxLength(64) destinationStallId!: string;
+  @IsString() @MinLength(3) @MaxLength(500) reason!: string;
+}
+
+export class ArchiveRegistrationDto {
+  @IsString() @MinLength(3) @MaxLength(500) reason!: string;
 }
 
 export class CreateAdminDto {
@@ -73,8 +93,9 @@ export class ManagementService {
 
   async metrics(scope: AuthScope, query: MetricsQueryDto = {}) {
     requireAuthority(scope.role, 'HALL_MANAGER');
+    if (query.eventId && !scope.eventIds.includes(query.eventId)) throw new ForbiddenException('Event is outside your scope');
     const where: Prisma.TicketWhereInput = {
-      eventId: { in: scope.eventIds },
+      eventId: query.eventId ?? { in: scope.eventIds },
       ...(scope.role === 'HALL_MANAGER' ? { hallId: { in: scope.hallIds } } : {}),
     };
     if (query.from || query.to || query.range === 'today') {
@@ -113,9 +134,6 @@ export class ManagementService {
       });
       return formatter.format(ticket.closedAt) === formatter.format(new Date());
     }).length;
-    const responseDurations = openTickets.flatMap((ticket) =>
-      ticket.firstAcceptedAt ? [Math.floor((ticket.firstAcceptedAt.getTime() - ticket.createdAt.getTime()) / 1000)] : [],
-    );
     const now = Date.now();
     const slaBreached = openTickets.filter((ticket) => {
       const responseBreached = !ticket.firstAcceptedAt && now - ticket.createdAt.getTime() > (ticket.pool?.responseTargetSeconds ?? 600) * 1000;
@@ -123,6 +141,121 @@ export class ManagementService {
       return responseBreached || resolutionBreached;
     }).length;
     const statusCounts = Object.fromEntries(statusGroups.map((group) => [group.status.toLowerCase(), group._count._all]));
+    const scopedEventIds = query.eventId ? [query.eventId] : scope.eventIds;
+    const createdFrom = where.createdAt && typeof where.createdAt === 'object' && 'gte' in where.createdAt ? where.createdAt.gte : undefined;
+    const createdTo = where.createdAt && typeof where.createdAt === 'object' && 'lte' in where.createdAt ? where.createdAt.lte : undefined;
+    const ticketScope = scopedEventIds.length
+      ? Prisma.sql`t."eventId" IN (${Prisma.join(scopedEventIds)})`
+      : Prisma.sql`FALSE`;
+    const hallScope = scope.role === 'HALL_MANAGER' && scope.hallIds.length
+      ? Prisma.sql`AND t."hallId" IN (${Prisma.join(scope.hallIds)})`
+      : Prisma.empty;
+    const dateScope = Prisma.sql`${createdFrom ? Prisma.sql`AND t."createdAt" >= ${createdFrom}` : Prisma.empty}${createdTo ? Prisma.sql`AND t."createdAt" <= ${createdTo}` : Prisma.empty}`;
+    const emptyBreakdown = scopedEventIds.length === 0 || (scope.role === 'HALL_MANAGER' && scope.hallIds.length === 0);
+    const [rates, durations, categoryGroups, halls, workforceLoad, oldestQueued, oldestAccepted, oldestInProgress] = emptyBreakdown
+      ? [{ total: 0, reopened: 0, complained: 0 }, { avgResponseSeconds: null, avgResolutionSeconds: null, medianResponseSeconds: null, p90ResponseSeconds: null, medianResolutionSeconds: null, p90ResolutionSeconds: null }, [], [], [], null, null, null]
+      : await Promise.all([
+        this.prisma.ticket.aggregate({
+          where: { ...where, status: { not: 'CANCELLED' } },
+          _count: { _all: true },
+        }).then(async (total) => {
+          const [reopened, complained] = await Promise.all([
+            this.prisma.ticket.count({ where: { ...where, reopenCount: { gt: 0 }, status: { not: 'CANCELLED' } } }),
+            this.prisma.ticket.count({ where: { ...where, status: { not: 'CANCELLED' }, complaints: { some: {} } } }),
+          ]);
+          return { total: total._count._all, reopened, complained };
+        }),
+        this.prisma.$queryRaw<Array<{
+          avgResponseSeconds: number | null;
+          avgResolutionSeconds: number | null;
+          medianResponseSeconds: number | null;
+          p90ResponseSeconds: number | null;
+          medianResolutionSeconds: number | null;
+          p90ResolutionSeconds: number | null;
+        }>>(Prisma.sql`
+          SELECT
+            (AVG(EXTRACT(EPOCH FROM (t."firstAcceptedAt" - t."createdAt"))) FILTER (WHERE t."firstAcceptedAt" IS NOT NULL))::double precision AS "avgResponseSeconds",
+            (AVG(EXTRACT(EPOCH FROM (t."closedAt" - t."createdAt"))) FILTER (WHERE t.status = 'CLOSED' AND t."closedAt" IS NOT NULL))::double precision AS "avgResolutionSeconds",
+            (percentile_cont(0.5) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM (t."firstAcceptedAt" - t."createdAt"))) FILTER (WHERE t."firstAcceptedAt" IS NOT NULL))::double precision AS "medianResponseSeconds",
+            (percentile_cont(0.9) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM (t."firstAcceptedAt" - t."createdAt"))) FILTER (WHERE t."firstAcceptedAt" IS NOT NULL))::double precision AS "p90ResponseSeconds",
+            (percentile_cont(0.5) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM (t."closedAt" - t."createdAt"))) FILTER (WHERE t.status = 'CLOSED' AND t."closedAt" IS NOT NULL))::double precision AS "medianResolutionSeconds",
+            (percentile_cont(0.9) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM (t."closedAt" - t."createdAt"))) FILTER (WHERE t.status = 'CLOSED' AND t."closedAt" IS NOT NULL))::double precision AS "p90ResolutionSeconds"
+          FROM "Ticket" t
+          WHERE ${ticketScope} ${hallScope} ${dateScope}
+        `).then((rows) => rows[0] ?? {
+          avgResponseSeconds: null,
+          avgResolutionSeconds: null,
+          medianResponseSeconds: null,
+          p90ResponseSeconds: null,
+          medianResolutionSeconds: null,
+          p90ResolutionSeconds: null,
+        }),
+        this.prisma.ticket.groupBy({
+          by: ['category'],
+          where: { ...where, status: { notIn: ['CLOSED', 'CANCELLED'] } },
+          _count: { _all: true },
+        }),
+        this.prisma.$queryRaw<Array<{ id: string; code: string; name: string; open: number; queued: number; overdue: number; escalated: number }>>(Prisma.sql`
+          SELECT
+            h.id,
+            h.code,
+            h.name,
+            COUNT(DISTINCT t.id) FILTER (WHERE t.status NOT IN ('CLOSED', 'CANCELLED'))::int AS open,
+            COUNT(DISTINCT t.id) FILTER (WHERE t.status = 'QUEUED')::int AS queued,
+            COUNT(DISTINCT t.id) FILTER (WHERE a.status::text IN ('ACTIVE', 'ACCEPTED') AND a."responseOverdueAt" IS NOT NULL)::int AS overdue,
+            COUNT(DISTINCT t.id) FILTER (WHERE t.status = 'ESCALATED')::int AS escalated
+          FROM "Hall" h
+          LEFT JOIN "Ticket" t ON t."hallId" = h.id AND t."eventId" = h."eventId" ${createdFrom ? Prisma.sql`AND t."createdAt" >= ${createdFrom}` : Prisma.empty} ${createdTo ? Prisma.sql`AND t."createdAt" <= ${createdTo}` : Prisma.empty}
+          LEFT JOIN "Assignment" a ON a."ticketId" = t.id
+          WHERE h."eventId" IN (${Prisma.join(scopedEventIds)})
+            ${scope.role === 'HALL_MANAGER' ? Prisma.sql`AND h.id IN (${Prisma.join(scope.hallIds)})` : Prisma.empty}
+          GROUP BY h.id, h.code, h.name
+          ORDER BY h.code ASC
+        `),
+        this.prisma.$queryRaw<Array<{ hallCode: string; category: string; onDuty: number; paused: number; offDuty: number; capacity: number; active: number }>>(Prisma.sql`
+          SELECT
+            COALESCE(h.code, 'EVENT') AS "hallCode",
+            sp.category,
+            COUNT(DISTINCT wm."userId") FILTER (WHERE wm.availability::text = 'ON_DUTY' AND u.status::text = 'ACTIVE' AND u."approvalStatus"::text = 'APPROVED')::int AS "onDuty",
+            COUNT(DISTINCT wm."userId") FILTER (WHERE wm.availability::text = 'PAUSED' AND u.status::text = 'ACTIVE' AND u."approvalStatus"::text = 'APPROVED')::int AS paused,
+            COUNT(DISTINCT wm."userId") FILTER (WHERE wm.availability::text IN ('OFF_DUTY', 'OFFLINE') AND u.status::text = 'ACTIVE' AND u."approvalStatus"::text = 'APPROVED')::int AS "offDuty",
+            COALESCE(SUM(wm.capacity) FILTER (WHERE wm.availability::text = 'ON_DUTY' AND u.status::text = 'ACTIVE' AND u."approvalStatus"::text = 'APPROVED'), 0)::int AS capacity,
+            COALESCE(SUM(load.active) FILTER (WHERE wm.availability::text = 'ON_DUTY' AND u.status::text = 'ACTIVE' AND u."approvalStatus"::text = 'APPROVED'), 0)::int AS active
+          FROM "WorkforceMembership" wm
+          JOIN "ServicePool" sp ON sp.id = wm."poolId"
+          JOIN "User" u ON u.id = wm."userId"
+          LEFT JOIN "Hall" h ON h.id = sp."hallId"
+          LEFT JOIN LATERAL (
+            SELECT COUNT(DISTINCT at.id)::int AS active
+            FROM "Assignment" asn
+            JOIN "Ticket" at ON at.id = asn."ticketId" AND at."poolId" = wm."poolId"
+            WHERE asn."staffId" = wm."userId" AND asn.status::text IN ('ACTIVE', 'ACCEPTED')
+          ) load ON true
+          WHERE wm."eventId" IN (${Prisma.join(scopedEventIds)})
+            ${scope.role === 'HALL_MANAGER' ? Prisma.sql`AND sp."hallId" IN (${Prisma.join(scope.hallIds)})` : Prisma.empty}
+          GROUP BY h.code, sp.category
+          ORDER BY h.code ASC, sp.category ASC
+        `),
+        this.prisma.ticket.findFirst({
+          where: { ...where, status: { in: ['NEW', 'QUEUED'] } },
+          orderBy: { createdAt: 'asc' },
+          select: { createdAt: true },
+        }),
+        this.prisma.ticket.findFirst({
+          where: { ...where, status: 'ACCEPTED' },
+          orderBy: { firstAcceptedAt: 'asc' },
+          select: { firstAcceptedAt: true },
+        }),
+        this.prisma.ticket.findFirst({
+          where: { ...where, status: 'IN_PROGRESS' },
+          orderBy: { firstStartedAt: 'asc' },
+          select: { firstStartedAt: true },
+        }),
+      ]);
+    const seconds = (value: number | null | undefined) => value == null || Number.isNaN(Number(value)) ? null : Math.floor(Number(value));
+    const ageSeconds = (value: Date | null | undefined) => value ? Math.floor((now - value.getTime()) / 1000) : null;
+    const onDutyCapacity = workforceLoad.reduce((sum, row) => sum + Number(row.capacity), 0);
+    const onDutyActive = workforceLoad.reduce((sum, row) => sum + Number(row.active), 0);
     return {
       open: openTickets.length,
       queued,
@@ -132,7 +265,35 @@ export class ManagementService {
       closedToday,
       slaBreached,
       oldestOutstandingSeconds: openTickets.length ? Math.floor((now - Math.min(...openTickets.map((ticket) => ticket.createdAt.getTime()))) / 1000) : null,
-      avgResponseSeconds: responseDurations.length ? Math.floor(responseDurations.reduce((sum, value) => sum + value, 0) / responseDurations.length) : null,
+      avgResponseSeconds: seconds(durations.avgResponseSeconds),
+      avgResolutionSeconds: seconds(durations.avgResolutionSeconds),
+      medianResponseSeconds: seconds(durations.medianResponseSeconds),
+      p90ResponseSeconds: seconds(durations.p90ResponseSeconds),
+      medianResolutionSeconds: seconds(durations.medianResolutionSeconds),
+      p90ResolutionSeconds: seconds(durations.p90ResolutionSeconds),
+      reopenRate: rates.total ? rates.reopened / rates.total : null,
+      complaintRate: rates.total ? rates.complained / rates.total : null,
+      staffUtilization: onDutyCapacity ? onDutyActive / onDutyCapacity : null,
+      oldestQueuedSeconds: ageSeconds(oldestQueued?.createdAt),
+      oldestAcceptedSeconds: ageSeconds(oldestAccepted?.firstAcceptedAt),
+      oldestInProgressSeconds: ageSeconds(oldestInProgress?.firstStartedAt),
+      categoryBacklog: categoryGroups.map((group) => ({ category: group.category, open: group._count._all })),
+      halls: halls.map((hall) => ({
+        ...hall,
+        open: Number(hall.open),
+        queued: Number(hall.queued),
+        overdue: Number(hall.overdue),
+        escalated: Number(hall.escalated),
+      })),
+      workforceLoad: workforceLoad.map((row) => ({
+        hallCode: row.hallCode,
+        category: row.category,
+        onDuty: Number(row.onDuty),
+        paused: Number(row.paused),
+        offDuty: Number(row.offDuty),
+        capacity: Number(row.capacity),
+        active: Number(row.active),
+      })),
       ...statusCounts,
     };
   }
@@ -328,7 +489,7 @@ export class ManagementService {
       },
       include: {
         actor: { select: { name: true, role: true } },
-        targetUser: { select: { name: true, employeeCode: true } },
+        targetUser: { select: { name: true, employeeCode: true, role: true } },
       },
       orderBy: { createdAt: 'desc' },
       take: 100,
@@ -349,7 +510,7 @@ export class ManagementService {
         eventType: event.action,
         createdAt: event.createdAt,
         actor: event.actor,
-        ticket: { publicNo: event.targetUser?.employeeCode ?? 'Workforce' },
+        ticket: { publicNo: event.targetUser?.role === 'STALL' ? 'Stall account' : (event.targetUser?.employeeCode ?? event.targetUser?.name ?? 'Account') },
         target: event.targetUser,
       })),
     ].sort((left, right) => right.createdAt.getTime() - left.createdAt.getTime()).slice(0, 200);
@@ -429,6 +590,7 @@ export class ManagementService {
             stallCode,
             exhibitorName,
             contact: body.contact?.trim() || null,
+            servicePriority: body.servicePriority ?? 'MEDIUM',
             active: body.active !== false,
           },
         });
@@ -443,6 +605,254 @@ export class ManagementService {
         },
       });
       return created;
+    });
+  }
+
+  async registrations(scope: AuthScope) {
+    requireAuthority(scope.role, 'ADMIN');
+    const stalls = await this.prisma.stall.findMany({
+      where: { eventId: { in: scope.eventIds } },
+      include: {
+        zone: { include: { hall: { select: { id: true, code: true, name: true } } } },
+        scopes: {
+          where: { user: { role: 'STALL' } },
+          select: { user: { select: { id: true, name: true, email: true, status: true, role: true } } },
+        },
+        _count: { select: { tickets: { where: { status: { in: [...ACTIVE_TICKET_STATUSES] } } } } },
+      },
+      orderBy: [{ zone: { hall: { name: 'asc' } } }, { stallCode: 'asc' }],
+    });
+    return stalls.map((stall) => ({
+      id: stall.id,
+      eventId: stall.eventId,
+      stallCode: stall.stallCode,
+      exhibitorName: stall.exhibitorName,
+      contact: stall.contact,
+      servicePriority: stall.servicePriority,
+      active: stall.active,
+      archivedAt: stall.archivedAt,
+      openTicketCount: stall._count.tickets,
+      zone: { id: stall.zone.id, code: stall.zone.code, hall: stall.zone.hall },
+      exhibitors: stall.scopes.map((scopeRow) => scopeRow.user),
+    }));
+  }
+
+  async updateRegistration(scope: AuthScope, stallId: string, body: UpdateRegistrationDto) {
+    requireAuthority(scope.role, 'ADMIN');
+    const stall = await this.requireStall(scope, stallId);
+    if (stall.archivedAt) throw new BadRequestException('Archived registrations cannot be edited');
+    const stallCode = body.stallCode?.trim();
+    const exhibitorName = body.exhibitorName?.trim();
+    if (body.stallCode !== undefined && !stallCode) throw new BadRequestException('Stall code is required');
+    if (body.exhibitorName !== undefined && !exhibitorName) throw new BadRequestException('Exhibitor name is required');
+    if (stallCode === undefined && exhibitorName === undefined && body.contact === undefined && !body.servicePriority) {
+      throw new BadRequestException('Nothing to update');
+    }
+    try {
+      return await this.prisma.$transaction(async (tx) => {
+        await this.lockStalls(tx, [stall.id]);
+        const current = await tx.stall.findUniqueOrThrow({ where: { id: stall.id } });
+        if (current.archivedAt) throw new BadRequestException('Archived registrations cannot be edited');
+        const updated = await tx.stall.update({
+          where: { id: stall.id },
+          data: {
+            ...(stallCode ? { stallCode } : {}),
+            ...(exhibitorName ? { exhibitorName } : {}),
+            ...(body.contact !== undefined ? { contact: body.contact.trim() || null } : {}),
+            ...(body.servicePriority ? { servicePriority: body.servicePriority } : {}),
+          },
+        });
+        await this.writeRegistrationAudit(tx, scope, stall.eventId, 'REGISTRATION_UPDATED', {
+          stallId: stall.id,
+          before: {
+            stallCode: current.stallCode,
+            exhibitorName: current.exhibitorName,
+            contact: current.contact,
+            servicePriority: current.servicePriority,
+          },
+          after: {
+            stallCode: updated.stallCode,
+            exhibitorName: updated.exhibitorName,
+            contact: updated.contact,
+            servicePriority: updated.servicePriority,
+          },
+        });
+        return updated;
+      });
+    } catch (error) {
+      if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002') {
+        throw new ConflictException('That stall code is already used in this zone');
+      }
+      throw error;
+    }
+  }
+
+  async transferExhibitor(scope: AuthScope, stallId: string, body: TransferRegistrationDto) {
+    requireAuthority(scope.role, 'ADMIN');
+    const reason = body.reason.trim();
+    if (reason.length < 3) throw new BadRequestException('A transfer reason is required');
+    if (body.destinationStallId === stallId) throw new BadRequestException('Choose a different stall');
+    const source = await this.requireStall(scope, stallId);
+    const destination = await this.requireStall(scope, body.destinationStallId);
+    if (source.eventId !== destination.eventId) throw new BadRequestException('Exhibitor transfer must stay inside the same event');
+    if (source.archivedAt || destination.archivedAt || !destination.active) {
+      throw new BadRequestException('Transfer requires an active destination registration');
+    }
+    await this.assertNoUnresolvedWork(source.id, 'Transfer');
+    await this.assertNoUnresolvedWork(destination.id, 'Transfer onto');
+    return this.prisma.$transaction(async (tx) => {
+      await this.lockStalls(tx, [source.id, destination.id]);
+      const sourceRow = await tx.stall.findUniqueOrThrow({
+        where: { id: source.id },
+        include: { zone: { select: { hallId: true } } },
+      });
+      const destinationRow = await tx.stall.findUniqueOrThrow({
+        where: { id: destination.id },
+        include: { zone: { select: { hallId: true } } },
+      });
+      if (sourceRow.eventId !== destinationRow.eventId) throw new BadRequestException('Exhibitor transfer must stay inside the same event');
+      if (sourceRow.archivedAt || destinationRow.archivedAt || !destinationRow.active) {
+        throw new BadRequestException('Transfer requires an active destination registration');
+      }
+      await this.assertNoUnresolvedWork(sourceRow.id, 'Transfer', tx);
+      await this.assertNoUnresolvedWork(destinationRow.id, 'Transfer onto', tx);
+      const exhibitors = await tx.userScope.findMany({
+        where: { stallId: sourceRow.id, user: { role: 'STALL' } },
+        select: { userId: true },
+      });
+      if (!exhibitors.length) throw new BadRequestException('This registration has no exhibitor account to transfer');
+      const destinationTaken = await tx.userScope.count({
+        where: { stallId: destinationRow.id, user: { role: 'STALL' } },
+      });
+      if (destinationTaken) throw new ConflictException('The destination stall already has an exhibitor account');
+      const userIds = exhibitors.map((row) => row.userId);
+      await tx.userScope.updateMany({
+        where: { stallId: sourceRow.id, userId: { in: userIds } },
+        data: { stallId: destinationRow.id, hallId: destinationRow.zone.hallId, eventId: destinationRow.eventId },
+      });
+      await tx.session.deleteMany({ where: { userId: { in: userIds } } });
+      await tx.pushSubscription.deleteMany({ where: { userId: { in: userIds } } });
+      const previousDestination = {
+        exhibitorName: destinationRow.exhibitorName,
+        contact: destinationRow.contact,
+      };
+      await tx.stall.update({
+        where: { id: destinationRow.id },
+        data: { exhibitorName: sourceRow.exhibitorName, contact: sourceRow.contact },
+      });
+      await tx.stall.update({
+        where: { id: sourceRow.id },
+        data: { contact: null },
+      });
+      await this.writeRegistrationAudit(tx, scope, sourceRow.eventId, 'EXHIBITOR_TRANSFERRED', {
+        reason,
+        userIds,
+        sourceStallId: sourceRow.id,
+        sourceStallCode: sourceRow.stallCode,
+        destinationStallId: destinationRow.id,
+        destinationStallCode: destinationRow.stallCode,
+        previousDestination,
+      });
+      return { transferred: true, userIds, sourceStallId: sourceRow.id, destinationStallId: destinationRow.id };
+    });
+  }
+
+  async archiveRegistration(scope: AuthScope, stallId: string, body: ArchiveRegistrationDto) {
+    requireAuthority(scope.role, 'ADMIN');
+    const reason = body.reason.trim();
+    if (reason.length < 3) throw new BadRequestException('An archive reason is required');
+    const stall = await this.requireStall(scope, stallId);
+    if (stall.archivedAt) throw new BadRequestException('This registration is already archived');
+    await this.assertNoUnresolvedWork(stall.id, 'Archive');
+    return this.prisma.$transaction(async (tx) => {
+      await this.lockStalls(tx, [stall.id]);
+      const current = await tx.stall.findUniqueOrThrow({ where: { id: stall.id } });
+      if (current.archivedAt) throw new BadRequestException('This registration is already archived');
+      await this.assertNoUnresolvedWork(current.id, 'Archive', tx);
+      const exhibitors = await tx.userScope.findMany({
+        where: { stallId: current.id, user: { role: 'STALL' } },
+        select: { userId: true },
+      });
+      const userIds = exhibitors.map((row) => row.userId);
+      if (userIds.length) {
+        await tx.userScope.deleteMany({ where: { stallId: current.id, userId: { in: userIds } } });
+        await tx.session.deleteMany({ where: { userId: { in: userIds } } });
+        await tx.pushSubscription.deleteMany({ where: { userId: { in: userIds } } });
+        const remaining = await tx.userScope.groupBy({
+          by: ['userId'],
+          where: { userId: { in: userIds } },
+        });
+        const stillScoped = new Set(remaining.map((row) => row.userId));
+        const toDisable = userIds.filter((userId) => !stillScoped.has(userId));
+        if (toDisable.length) {
+          await tx.user.updateMany({ where: { id: { in: toDisable }, role: 'STALL' }, data: { status: 'DISABLED' } });
+        }
+      }
+      const archived = await tx.stall.update({
+        where: { id: current.id },
+        data: { active: false, archivedAt: new Date(), contact: null },
+      });
+      await this.writeRegistrationAudit(tx, scope, current.eventId, 'REGISTRATION_ARCHIVED', {
+        reason,
+        stallId: current.id,
+        stallCode: current.stallCode,
+        revokedUserIds: userIds,
+      });
+      return archived;
+    });
+  }
+
+  private async requireStall(scope: AuthScope, stallId: string) {
+    const stall = await this.prisma.stall.findUnique({
+      where: { id: stallId },
+      include: { zone: { select: { hallId: true } } },
+    });
+    if (!stall || !scope.eventIds.includes(stall.eventId)) throw new NotFoundException('Registration is unavailable');
+    return stall;
+  }
+
+  private async assertNoUnresolvedWork(stallId: string, action: string, tx: Prisma.TransactionClient | PrismaService = this.prisma) {
+    const open = await tx.ticket.count({
+      where: { stallId, status: { in: [...ACTIVE_TICKET_STATUSES] } },
+    });
+    if (open > 0) {
+      throw new ConflictException(`${action} is blocked while this stall has unresolved tickets`);
+    }
+  }
+
+  private async lockStalls(tx: Prisma.TransactionClient, stallIds: string[]) {
+    for (const stallId of [...new Set(stallIds)].sort()) {
+      const rows = await tx.$queryRaw<Array<{ id: string }>>(Prisma.sql`SELECT id FROM "Stall" WHERE id = ${stallId} FOR UPDATE`);
+      if (!rows.length) throw new NotFoundException('Registration is unavailable');
+    }
+  }
+
+  private async writeRegistrationAudit(
+    tx: Prisma.TransactionClient,
+    scope: AuthScope,
+    eventId: string,
+    action: string,
+    metadata: Prisma.InputJsonObject,
+  ) {
+    const actor = await tx.user.findUniqueOrThrow({ where: { id: scope.userId }, select: { organizationId: true } });
+    await tx.managementAudit.create({
+      data: {
+        organizationId: actor.organizationId,
+        eventId,
+        actorId: scope.userId,
+        action,
+        metadata,
+      },
+    });
+    const aggregateId = [metadata.stallId, metadata.sourceStallId].find((value): value is string => typeof value === 'string') ?? eventId;
+    await tx.outboxEvent.create({
+      data: {
+        eventId,
+        aggregateType: 'Stall',
+        aggregateId,
+        eventType: action,
+        payload: { actorId: scope.userId, ...metadata },
+      },
     });
   }
 
@@ -571,6 +981,19 @@ export class ManagementController {
   @Get('exceptions') exceptions(@CurrentScope() scope: AuthScope) { return this.service.exceptions(scope); }
   @Get('audit') audit(@CurrentScope() scope: AuthScope, @Query() query: AuditQueryDto) { return this.service.audit(scope, query); }
   @Get('masters') masters(@CurrentScope() scope: AuthScope) { return this.service.masters(scope); }
+  @Get('registrations') registrations(@CurrentScope() scope: AuthScope) { return this.service.registrations(scope); }
+  @Throttle({ default: { limit: 20, ttl: 60000 } })
+  @Patch('registrations/:stallId') updateRegistration(@Param('stallId') stallId: string, @CurrentScope() scope: AuthScope, @Body() body: UpdateRegistrationDto) {
+    return this.service.updateRegistration(scope, stallId, body);
+  }
+  @Throttle({ default: { limit: 10, ttl: 60000 } })
+  @Post('registrations/:stallId/transfer') transferRegistration(@Param('stallId') stallId: string, @CurrentScope() scope: AuthScope, @Body() body: TransferRegistrationDto) {
+    return this.service.transferExhibitor(scope, stallId, body);
+  }
+  @Throttle({ default: { limit: 10, ttl: 60000 } })
+  @Post('registrations/:stallId/archive') archiveRegistration(@Param('stallId') stallId: string, @CurrentScope() scope: AuthScope, @Body() body: ArchiveRegistrationDto) {
+    return this.service.archiveRegistration(scope, stallId, body);
+  }
   @Patch('masters/pools/:id') updatePool(@Param('id') id: string, @CurrentScope() scope: AuthScope, @Body() body: UpdatePoolDto) { return this.service.updatePool(scope, id, body); }
   @Post('masters/:type') createMaster(@Param('type') type: 'hall' | 'zone' | 'stall', @CurrentScope() scope: AuthScope, @Body() body: CreateMasterBodyDto) {
     if (!['hall', 'zone', 'stall'].includes(type)) throw new BadRequestException('Unsupported master type');

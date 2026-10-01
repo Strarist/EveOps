@@ -6,6 +6,7 @@ import { unlink } from 'node:fs/promises';
 import { basename, resolve } from 'node:path';
 
 const prisma = new PrismaClient();
+const baseURL = process.env.E2E_BASE_URL ?? 'http://localhost:3000';
 const password = 'EveOpsE2E!2026';
 const runKey = `e2e-${process.pid}-${Date.now()}`;
 const ids = {
@@ -160,7 +161,7 @@ async function login(browser: Browser, email: string, portal: 'OPERATIONS' | 'GO
   await context.addCookies([{
     name: 'eveops_session',
     value: token,
-    url: 'http://localhost:3000',
+    url: baseURL,
     httpOnly: true,
     sameSite: 'Lax',
   }]);
@@ -209,7 +210,7 @@ test.describe.serial('isolated multi-role operational acceptance', () => {
     await expect.poll(async () => {
       try {
         const health = await fetch('http://localhost:4000/api/system/health');
-        const loginPage = await fetch('http://localhost:3000/login');
+        const loginPage = await fetch(`${baseURL}/login`);
         return health.ok && loginPage.ok;
       } catch {
         return false;
@@ -235,7 +236,7 @@ test.describe.serial('isolated multi-role operational acceptance', () => {
     const staffPage = await staff.newPage();
     await staffPage.goto('/staff');
     await expect(staffPage.getByText(ticket.publicNo)).toBeVisible();
-    await expect(staffPage.getByRole('button', { name: 'Accept assignment' })).toBeVisible();
+    await expect(staffPage.getByRole('button', { name: 'Accept task' }).first()).toBeVisible();
     await advanceToOtp(staff, ticket.id);
     const afterRequest = await (await staff.request.get(`/api/tickets/${ticket.id}`)).json() as { status: string; completionRequestedAt: string | null };
     expect(afterRequest.status).toBe('AWAITING_OTP');
@@ -253,8 +254,8 @@ test.describe.serial('isolated multi-role operational acceptance', () => {
     await expect(stallPage.locator('.otp-digits')).toBeVisible();
     const staffAwait = await staff.newPage();
     await staffAwait.goto('/staff');
-    await expect(staffAwait.getByText('Waiting for stall code')).toBeVisible();
-    await expect(staffAwait.getByRole('button', { name: 'Verify & close ticket' })).toBeVisible();
+    await expect(staffAwait.getByText("Waiting for stall's code")).toBeVisible();
+    await expect(staffAwait.getByRole('button', { name: 'Verify code' })).toBeVisible();
     await expect(staffAwait.locator('.otp-digits')).toHaveCount(0);
     await closeWithOtp(stall, staff, ticket.id);
     const detail = await admin.request.get(`/api/tickets/${ticket.id}`);
@@ -694,5 +695,39 @@ test.describe.serial('isolated multi-role operational acceptance', () => {
     });
     expect(activeAssignment?.staffId).toBe(person.id);
     await Promise.all([stall.close(), manager.close(), admin.close(), pendingStaff.close()]);
+  });
+
+  test('17 service priority orders the queue and registrations stay on their own page', async ({ browser }) => {
+    await prisma.stall.update({ where: { id: ids.otherStall }, data: { servicePriority: 'HIGH' } });
+    const stall = await login(browser, emails.stall);
+    const staff = await login(browser, emails.staff);
+    const admin = await login(browser, emails.admin);
+    const first = await createTicket(stall);
+    expect(first.status).toBe('ASSIGNED');
+    const high = await createTicket(admin, 'ELECTRICAL', 'Lighting', ids.otherStall);
+    const medium = await createTicket(stall);
+    expect(high.status).toBe('QUEUED');
+    expect(medium.status).toBe('QUEUED');
+    expect((await (await admin.request.get(`/api/tickets/${high.id}`)).json()).servicePriority).toBe('HIGH');
+    await advanceToOtp(staff, first.id);
+    await closeWithOtp(stall, staff, first.id);
+    await expect.poll(async () => (await (await admin.request.get(`/api/tickets/${high.id}`)).json()).status).toBe('ASSIGNED');
+    expect((await (await admin.request.get(`/api/tickets/${medium.id}`)).json()).status).toBe('QUEUED');
+
+    const registrations = await admin.newPage();
+    await registrations.goto('/admin/registrations');
+    await expect(registrations.getByRole('heading', { name: 'Stall registrations' })).toBeVisible();
+    await expect(registrations.getByRole('heading', { name: 'Exhibitor accounts' })).toBeVisible();
+    await expect(registrations.getByRole('heading', { name: 'Staff' })).toBeVisible();
+    await expect(registrations.getByRole('heading', { name: 'Hall managers' })).toBeVisible();
+    const blocked = await admin.request.post(`/api/management/registrations/${ids.stall}/archive`, {
+      data: { reason: 'Open work should block archive' },
+    });
+    expect(blocked.status()).toBe(409);
+
+    const task = await staff.newPage();
+    await task.goto(`/staff/task/${high.id}`);
+    await expect(task.getByRole('button', { name: 'Accept task' })).toBeVisible();
+    await Promise.all([stall.close(), staff.close(), admin.close()]);
   });
 });

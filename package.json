@@ -19,12 +19,14 @@
     "debug:ticket": "tsx scripts/debug-ticket.ts",
     "migration:preflight": "node scripts/migration-preflight.mjs",
     "verify:operations-fresh": "node scripts/verify-operations-fresh.mjs",
-    "lint": "eslint apps packages prisma/seed.ts e2e playwright.config.ts",
+    "lint": "eslint apps packages prisma/seed.ts e2e playwright.config.ts apps/web/public/sw.js",
     "typecheck": "tsc -p packages/contracts/tsconfig.json --noEmit && tsc -p packages/operations/tsconfig.json --noEmit && tsc -p apps/api/tsconfig.json --noEmit && tsc -p apps/worker/tsconfig.json --noEmit && tsc -p apps/web/tsconfig.json --noEmit && tsc -p tsconfig.e2e.json --noEmit",
     "db:generate": "prisma generate",
     "db:migrate": "prisma migrate dev",
     "db:deploy": "prisma migrate deploy",
-    "db:seed": "tsx prisma/seed.ts"
+    "db:seed": "tsx prisma/seed.ts",
+    "db:fixture:regression": "npm run db:fixture:regression -w @eveops/api",
+    "test:regression": "npm run test:regression -w @eveops/api"
   },
   "devDependencies": {
     "@eslint/js": "^9.39.5",

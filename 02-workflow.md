@@ -124,7 +124,7 @@ the engine may assign the next FIFO ticket.
 | 10 min expires without accept | Alert Hall Manager + Admin; flag response overdue      | ASSIGNMENT_RESPONSE_OVERDUE |
 | Manager reassigns             | Close previous assignment with reason; create new one  | ASSIGNMENT_REASSIGNED       |
 
-| **FIFO DEFINITION:** FIFO applies to waiting tickets within a compatible event/hall/service pool. A higher-priority operational override may move a ticket ahead only when performed by Hall Manager/Admin with a mandatory reason and audit event. |
+| **QUEUE DEFINITION:** Waiting tickets in a compatible event/hall/service pool are ordered by a reasoned Hall Manager/Admin override, then stall service priority HIGH, MEDIUM, LOW, then created_at, then ticket ID. The ticket stores the stall service priority from the moment it is created. Assigned work is not taken back. See `docs/priority-operations-notes.md`. |
 |-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 
 # 7. Snooze / no-response workflow

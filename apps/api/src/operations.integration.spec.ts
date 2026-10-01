@@ -1,8 +1,8 @@
 import { createHash } from 'node:crypto';
 import type { AuthScope } from '@eveops/contracts';
 import { PrismaService } from './prisma.service';
-import { ListTicketsDto, TicketService } from './tickets';
-import { WorkforceService } from './workforce';
+import { CreateTicketDto, ListTicketsDto, TicketService } from './tickets';
+import { CreatePersonDto, WorkforceService } from './workforce';
 import { ManagementService } from './management';
 
 describe('operational database invariants', () => {
@@ -87,6 +87,7 @@ describe('operational database invariants', () => {
 
   afterAll(async () => {
     await prisma.$transaction([
+      prisma.managementAudit.deleteMany({ where: { organizationId: ids.organization } }),
       prisma.notification.deleteMany({ where: { eventId: { in: [ids.event, ids.otherEvent] } } }),
       prisma.outboxEvent.deleteMany({ where: { eventId: { in: [ids.event, ids.otherEvent] } } }),
       prisma.complaint.deleteMany({ where: { eventId: { in: [ids.event, ids.otherEvent] } } }),
@@ -285,6 +286,11 @@ describe('operational database invariants', () => {
     expect(exceptions.some((ticket) => ticket.id === ticketId)).toBe(true);
     const metrics = await management.metrics(managerScope);
     expect(metrics.complaints).toBeGreaterThanOrEqual(1);
+    expect(metrics.halls.length).toBeGreaterThan(0);
+    expect(metrics.categoryBacklog.every((row) => row.open >= 0)).toBe(true);
+    expect(metrics.reopenRate === null || metrics.reopenRate >= 0).toBe(true);
+    expect(metrics.complaintRate).toBeGreaterThan(0);
+    expect(Array.isArray(metrics.workforceLoad)).toBe(true);
   });
 
   it('increments escalation level and records it in audit metadata', async () => {
@@ -475,5 +481,147 @@ describe('operational database invariants', () => {
     });
     const claims = await Promise.all([claim('worker-a'), claim('worker-b')]);
     expect(claims.flat()).toHaveLength(1);
+  });
+
+  it('assigns a newer high-priority ticket ahead of an older low-priority ticket without taking assigned work', async () => {
+    await releaseActiveAssignments();
+    await prisma.stall.update({ where: { id: ids.stall }, data: { servicePriority: 'LOW' } });
+    await prisma.stall.update({ where: { id: ids.otherStall }, data: { servicePriority: 'HIGH' } });
+    const snapshot = await tickets.create(Object.assign(new CreateTicketDto(), {
+      stallId: ids.otherStall,
+      category: 'ELECTRICAL',
+      subtype: 'Lighting',
+      description: 'Snapshot from stall priority',
+      priority: 'NORMAL',
+      idempotencyKey: `${key}-snapshot`,
+    }), adminScope);
+    expect(snapshot.servicePriority).toBe('HIGH');
+    await prisma.ticket.update({ where: { id: snapshot.id }, data: { status: 'CANCELLED' } });
+    const lowId = `${key}-priority-low`;
+    const highId = `${key}-priority-high`;
+    const assignedId = `${key}-priority-assigned`;
+    await prisma.ticket.create({ data: { ...ticketData(lowId, `${key}-prio-low`, 'QUEUED', new Date('2026-06-02T10:00:00Z')), servicePriority: 'LOW' } });
+    await prisma.ticket.create({ data: { ...ticketData(assignedId, `${key}-prio-assigned`, 'ASSIGNED', new Date('2026-06-02T09:00:00Z')), stallId: ids.otherStall, servicePriority: 'HIGH' } });
+    await prisma.assignment.create({
+      data: { eventId: ids.event, ticketId: assignedId, staffId: ids.secondStaffUser, activeTicketKey: assignedId },
+    });
+    await prisma.workforceMembership.updateMany({ where: { poolId: ids.pool, userId: ids.staffUser }, data: { availability: 'ON_DUTY' } });
+    await prisma.ticket.create({ data: { ...ticketData(highId, `${key}-prio-high`, 'NEW', new Date('2026-06-02T11:00:00Z')), stallId: ids.otherStall, servicePriority: 'HIGH' } });
+
+    await tickets.route(highId, ids.stallUser);
+
+    const [low, high, assigned] = await Promise.all([
+      prisma.ticket.findUniqueOrThrow({ where: { id: lowId } }),
+      prisma.ticket.findUniqueOrThrow({ where: { id: highId } }),
+      prisma.ticket.findUniqueOrThrow({ where: { id: assignedId } }),
+    ]);
+    expect(high.status).toBe('ASSIGNED');
+    expect(low.status).toBe('QUEUED');
+    expect(assigned.status).toBe('ASSIGNED');
+    expect(await prisma.assignment.count({ where: { ticketId: assignedId, status: { in: ['ACTIVE', 'ACCEPTED'] } } })).toBe(1);
+  });
+
+  it('lets a reasoned override stay ahead of a higher service priority', async () => {
+    await releaseActiveAssignments();
+    const overriddenId = `${key}-override-low`;
+    const highId = `${key}-override-high`;
+    await prisma.ticket.create({
+      data: {
+        ...ticketData(overriddenId, `${key}-override-low-no`, 'QUEUED', new Date('2026-06-03T12:00:00Z')),
+        servicePriority: 'LOW',
+        queuePriorityOverrideAt: new Date('2026-06-03T12:05:00Z'),
+      },
+    });
+    await prisma.ticket.create({
+      data: { ...ticketData(highId, `${key}-override-high-no`, 'QUEUED', new Date('2026-06-03T10:00:00Z')), stallId: ids.otherStall, servicePriority: 'HIGH' },
+    });
+    await prisma.workforceMembership.updateMany({ where: { poolId: ids.pool, userId: ids.staffUser }, data: { availability: 'ON_DUTY' } });
+
+    await tickets.route(highId, ids.stallUser);
+
+    expect((await prisma.ticket.findUniqueOrThrow({ where: { id: overriddenId } })).status).toBe('ASSIGNED');
+    expect((await prisma.ticket.findUniqueOrThrow({ where: { id: highId } })).status).toBe('QUEUED');
+  });
+
+  it('records a reasoned service-priority change for a waiting ticket and refuses assigned work', async () => {
+    const waitingId = `${key}-change-waiting`;
+    const assignedId = `${key}-change-assigned`;
+    await prisma.ticket.create({ data: { ...ticketData(waitingId, `${key}-change-waiting-no`, 'QUEUED', new Date()), servicePriority: 'LOW' } });
+    await prisma.ticket.create({ data: { ...ticketData(assignedId, `${key}-change-assigned-no`, 'ASSIGNED', new Date()), servicePriority: 'LOW' } });
+    const updated = await tickets.changePendingServicePriority(waitingId, managerScope, 'HIGH', 'Exhibitor is live on stage');
+    await expect(tickets.changePendingServicePriority(waitingId, staffScope, 'HIGH', 'Staff cannot reorder the queue')).rejects.toThrow('Insufficient authority');
+    expect(updated.servicePriority).toBe('HIGH');
+    expect(await prisma.ticketEvent.count({ where: { ticketId: waitingId, eventType: 'SERVICE_PRIORITY_CHANGED' } })).toBe(1);
+    await expect(tickets.changePendingServicePriority(assignedId, managerScope, 'HIGH', 'Should not move assigned work')).rejects.toThrow('waiting to be assigned');
+    expect((await prisma.ticket.findUniqueOrThrow({ where: { id: assignedId } })).servicePriority).toBe('LOW');
+  });
+
+  it('edits a registration, blocks transfer and archive while work is open, then preserves history', async () => {
+    const zone = await prisma.zone.findUniqueOrThrow({ where: { id: ids.zone } });
+    const emptyStall = await prisma.stall.create({
+      data: { eventId: ids.event, zoneId: zone.id, stallCode: `${key}-empty`, exhibitorName: 'Empty stall', servicePriority: 'LOW' },
+    });
+    const sourceStall = await prisma.stall.create({
+      data: { eventId: ids.event, zoneId: zone.id, stallCode: `${key}-source`, exhibitorName: 'Moving exhibitor', contact: '9990001111', servicePriority: 'MEDIUM' },
+    });
+    const exhibitor = await prisma.user.create({
+      data: { id: `${key}-moving-user`, organizationId: ids.organization, name: 'Moving exhibitor', email: `${key}-moving@example.test`, passwordHash: 'not-used', role: 'STALL' },
+    });
+    await prisma.userScope.create({ data: { userId: exhibitor.id, eventId: ids.event, hallId: ids.hall, stallId: sourceStall.id } });
+    await prisma.session.create({
+      data: { userId: exhibitor.id, tokenHash: `${key}-moving-session`, expiresAt: new Date(Date.now() + 3600_000) },
+    });
+    const historical = await prisma.ticket.create({
+      data: { ...ticketData(`${key}-history`, `${key}-history-no`, 'CLOSED', new Date()), stallId: sourceStall.id, closedAt: new Date() },
+    });
+    const openTicket = await prisma.ticket.create({
+      data: { ...ticketData(`${key}-open-reg`, `${key}-open-reg-no`, 'ASSIGNED', new Date()), stallId: ids.stall },
+    });
+
+    await expect(management.updateRegistration(adminScope, sourceStall.id, {})).rejects.toThrow('Nothing to update');
+    await expect(management.updateRegistration(adminScope, 'missing-registration', { exhibitorName: 'Outside scope' })).rejects.toThrow('unavailable');
+    await expect(management.archiveRegistration(managerScope, sourceStall.id, { reason: 'Managers cannot archive' })).rejects.toThrow('Insufficient authority');
+    const edited = await management.updateRegistration(adminScope, sourceStall.id, { exhibitorName: 'Renamed exhibitor', servicePriority: 'HIGH' });
+    expect(edited.exhibitorName).toBe('Renamed exhibitor');
+    expect(edited.servicePriority).toBe('HIGH');
+    expect((await prisma.ticket.findUniqueOrThrow({ where: { id: historical.id } })).stallId).toBe(sourceStall.id);
+    expect((await prisma.ticket.findUniqueOrThrow({ where: { id: historical.id } })).servicePriority).toBe('MEDIUM');
+
+    await expect(management.transferExhibitor(adminScope, ids.stall, { destinationStallId: emptyStall.id, reason: 'Move after the show' })).rejects.toThrow('unresolved');
+    await expect(management.archiveRegistration(adminScope, ids.stall, { reason: 'Booth packed up' })).rejects.toThrow('unresolved');
+    expect(openTicket.stallId).toBe(ids.stall);
+
+    const transferred = await management.transferExhibitor(adminScope, sourceStall.id, { destinationStallId: emptyStall.id, reason: 'Exhibitor moved halls' });
+    expect(transferred.destinationStallId).toBe(emptyStall.id);
+    expect(await prisma.session.count({ where: { userId: exhibitor.id } })).toBe(0);
+    expect((await prisma.userScope.findFirstOrThrow({ where: { userId: exhibitor.id } })).stallId).toBe(emptyStall.id);
+    expect((await prisma.stall.findUniqueOrThrow({ where: { id: emptyStall.id } })).contact).toBe('9990001111');
+    expect((await prisma.stall.findUniqueOrThrow({ where: { id: sourceStall.id } })).contact).toBeNull();
+    expect((await prisma.ticket.findUniqueOrThrow({ where: { id: historical.id } })).stallId).toBe(sourceStall.id);
+    await expect(workforce.createPerson(adminScope, {
+      name: 'Second exhibitor',
+      email: `${key}-second-exhibitor@example.test`,
+      password: 'temporary-password',
+      role: 'STALL',
+      eventId: ids.event,
+      stallId: emptyStall.id,
+    } as CreatePersonDto)).rejects.toThrow('exhibitor account');
+
+    const archived = await management.archiveRegistration(adminScope, sourceStall.id, { reason: 'Original booth is closed' });
+    expect(archived.archivedAt).not.toBeNull();
+    expect(archived.active).toBe(false);
+    await expect(management.updateRegistration(adminScope, sourceStall.id, { exhibitorName: 'Late edit' })).rejects.toThrow('Archived');
+    await expect(tickets.create(Object.assign(new CreateTicketDto(), {
+      stallId: sourceStall.id,
+      category: 'ELECTRICAL',
+      subtype: 'Lighting',
+      description: 'Archived stall must not accept new work',
+      priority: 'NORMAL',
+      idempotencyKey: `${key}-archived-create`,
+    }), adminScope)).rejects.toThrow('not active');
+    expect(await prisma.ticket.count({ where: { id: historical.id } })).toBe(1);
+    expect(await prisma.managementAudit.count({ where: { eventId: ids.event, action: { in: ['REGISTRATION_UPDATED', 'EXHIBITOR_TRANSFERRED', 'REGISTRATION_ARCHIVED'] } } })).toBe(3);
+
+    await prisma.user.delete({ where: { id: exhibitor.id } });
   });
 });

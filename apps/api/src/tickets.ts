@@ -1,11 +1,11 @@
-import { BadRequestException, Body, Controller, ForbiddenException, Get, Injectable, Param, Post, Query, Sse, UseGuards } from '@nestjs/common';
+import { BadRequestException, Body, ConflictException, Controller, ForbiddenException, Get, Injectable, NotFoundException, Param, Post, Query, Sse, UseGuards } from '@nestjs/common';
 import { IsBoolean, IsDateString, IsIn, IsInt, IsNotEmpty, IsOptional, IsString, Length, Matches, Max, Min } from 'class-validator';
 import { Transform, Type } from 'class-transformer';
 import { createCipheriv, createDecipheriv, createHash, randomBytes, randomInt } from 'node:crypto';
 import { ACTIVE_TICKET_STATUSES, TERMINAL_TICKET_STATUSES } from '@eveops/contracts';
 import type { AuthScope, TicketStatus } from '@eveops/contracts';
-import { routeTicket } from '@eveops/operations';
-import { Prisma, TicketPriority } from '@prisma/client';
+import { routeTicket, serviceQueueOrderBy } from '@eveops/operations';
+import { Prisma, ServicePriority, TicketPriority } from '@prisma/client';
 import { Throttle } from '@nestjs/throttler';
 import { CurrentScope, SessionGuard } from './auth';
 import { assertScope, assertTransition, requireAuthority } from './domain';
@@ -52,6 +52,11 @@ export class ReasonDto {
   @IsString() @Length(1, 500) reason!: string;
 }
 
+export class ServicePriorityDto {
+  @IsIn(['HIGH', 'MEDIUM', 'LOW']) servicePriority!: ServicePriority;
+  @IsString() @Length(1, 500) reason!: string;
+}
+
 export class PingDto {
   @IsString() @Length(1, 500) message!: string;
 }
@@ -79,7 +84,6 @@ async function createLifecycleNotifications(
       OR: [
         { stallId: ticket.stallId, user: { role: 'STALL' } },
         { hallId: ticket.hallId, user: { role: 'HALL_MANAGER' } },
-        { user: { role: { in: ['ADMIN', 'SUPER_ADMIN'] } } },
       ],
     },
     select: { userId: true },
@@ -91,6 +95,12 @@ async function createLifecycleNotifications(
   });
   const recipients = [...new Set([...scopes.map((item) => item.userId), ...(assignment ? [assignment.staffId] : [])])]
     .filter((recipientId) => recipientId !== actorId);
+  const stall = await tx.stall.findUnique({ where: { id: ticket.stallId }, select: { stallCode: true } });
+  const record = await tx.ticket.findUnique({ where: { id: ticket.id }, select: { publicNo: true, category: true } });
+  const stallCode = stall?.stallCode ?? 'stall';
+  const summary = type === 'TICKET_REOPENED'
+    ? `Ticket opened again · Stall ${stallCode}`
+    : `Update · Stall ${stallCode}`;
   await tx.notification.createMany({
     data: recipients.map((recipientId) => ({
       eventId: ticket.eventId,
@@ -98,7 +108,7 @@ async function createLifecycleNotifications(
       ticketId: ticket.id,
       type,
       dedupeKey: `${type.toLowerCase()}:${ticket.id}:${recipientId}:${ticket.version}`,
-      payload: { hallId: ticket.hallId, stallId: ticket.stallId },
+      payload: { hallId: ticket.hallId, stallId: ticket.stallId, stallCode, publicNo: record?.publicNo, category: record?.category, summary },
     })),
     skipDuplicates: true,
   });
@@ -275,6 +285,33 @@ export class TicketService {
     };
   }
 
+  async activity(id: string, scope: AuthScope, cursor?: string) {
+    const ticket = await this.prisma.ticket.findUnique({
+      where: { id },
+      select: { id: true, eventId: true, hallId: true, stallId: true, assignments: { select: { staffId: true } } },
+    });
+    if (!ticket) throw new BadRequestException('Ticket not found');
+    assertScope(scope, ticket);
+    if (scope.role === 'STAFF' && !ticket.assignments.some((assignment) => assignment.staffId === scope.userId)) {
+      throw new BadRequestException('Ticket is not assigned to this staff account');
+    }
+    const rows = await this.prisma.ticketEvent.findMany({
+      where: { ticketId: id },
+      orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
+      take: 21,
+      ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
+      select: { id: true, eventType: true, createdAt: true, actor: { select: { name: true } } },
+    });
+    const hasMore = rows.length > 20;
+    const items = (hasMore ? rows.slice(0, 20) : rows).map((event) => ({
+      id: event.id,
+      eventType: event.eventType,
+      createdAt: event.createdAt,
+      actorName: event.actor?.name ?? 'System',
+    }));
+    return { items, nextCursor: hasMore ? items.at(-1)?.id ?? null : null };
+  }
+
   async create(dto: CreateTicketDto, scope: AuthScope) {
     if (scope.role === 'STAFF') throw new BadRequestException('Staff cannot create stall tickets');
     const stallId = scope.role === 'STALL' ? scope.stallId : dto.stallId;
@@ -303,13 +340,24 @@ export class TicketService {
     let ticket;
     try {
       ticket = await this.prisma.$transaction(async (tx) => {
+      await tx.$queryRaw(Prisma.sql`SELECT id FROM "Stall" WHERE id = ${stall.id} FOR UPDATE`);
+      const currentStall = await tx.stall.findUnique({
+        where: { id: stall.id },
+        include: { zone: { include: { hall: true } } },
+      });
+      const currentEvent = currentStall
+        ? await tx.event.findUnique({ where: { id: currentStall.eventId }, select: { status: true } })
+        : null;
+      if (!currentStall?.active || currentStall.archivedAt || !currentStall.zone.active || !currentStall.zone.hall.active || currentEvent?.status !== 'ACTIVE') {
+        throw new BadRequestException('This stall location is not active for ticket creation');
+      }
       const sequence = await tx.event.update({
         where: { id: target.eventId },
         data: { ticketSequence: { increment: 1 } },
         select: { ticketSequence: true },
       });
       const created = await tx.ticket.create({
-        data: { publicNo: 'EV-' + String(sequence.ticketSequence).padStart(5, '0'), ...target, zoneId: stall.zoneId, poolId: pool.id, category: dto.category, subtype: dto.subtype, description: dto.description, priority: dto.priority, createdById: scope.userId, idempotencyKey: dto.idempotencyKey },
+        data: { publicNo: 'EV-' + String(sequence.ticketSequence).padStart(5, '0'), ...target, zoneId: currentStall.zoneId, poolId: pool.id, category: dto.category, subtype: dto.subtype, description: dto.description, priority: dto.priority, servicePriority: currentStall.servicePriority, createdById: scope.userId, idempotencyKey: dto.idempotencyKey },
       });
       await tx.ticketEvent.create({ data: { eventId: target.eventId, ticketId: created.id, eventType: 'TICKET_CREATED', actorId: scope.userId, toStatus: 'NEW', correlationId: requestCorrelationId() } });
       await tx.outboxEvent.create({ data: { eventId: target.eventId, aggregateType: 'Ticket', aggregateId: created.id, eventType: 'TICKET_CREATED', payload: { ticketId: created.id, ...target } } });
@@ -319,7 +367,6 @@ export class TicketService {
           OR: [
             { stallId: target.stallId, user: { role: 'STALL' } },
             { hallId: target.hallId, user: { role: 'HALL_MANAGER' } },
-            { user: { role: { in: ['ADMIN', 'SUPER_ADMIN'] } } },
           ],
         },
         select: { userId: true },
@@ -331,7 +378,14 @@ export class TicketService {
           ticketId: created.id,
           type: 'TICKET_CREATED',
           dedupeKey: 'ticket-created:' + created.id + ':' + userId,
-          payload: { hallId: target.hallId, stallId: target.stallId },
+          payload: {
+            hallId: target.hallId,
+            stallId: target.stallId,
+            stallCode: stall.stallCode,
+            publicNo: created.publicNo,
+            category: dto.category,
+            summary: `New request · Stall ${stall.stallCode} · ${dto.category === 'HOUSE_HELP' ? 'House Help' : dto.category === 'HALL_MANAGER' ? 'Hall Manager' : 'Electrical'}`,
+          },
         })),
         skipDuplicates: true,
       });
@@ -785,6 +839,64 @@ export class TicketService {
     });
   }
 
+  async changePendingServicePriority(id: string, scope: AuthScope, servicePriority: ServicePriority, reason: string) {
+    requireAuthority(scope.role, 'HALL_MANAGER');
+    if (!reason?.trim()) throw new BadRequestException('A reason is required to change service priority');
+    if (!['HIGH', 'MEDIUM', 'LOW'].includes(servicePriority)) throw new BadRequestException('Service priority must be HIGH, MEDIUM, or LOW');
+    return this.prisma.$transaction(async (tx) => {
+      const locked = await tx.$queryRaw<Array<{ id: string }>>(Prisma.sql`SELECT id FROM "Ticket" WHERE id = ${id} FOR UPDATE`);
+      if (!locked.length) throw new NotFoundException('Ticket is unavailable');
+      const ticket = await tx.ticket.findUniqueOrThrow({ where: { id } });
+      assertScope(scope, ticket);
+      if (!['NEW', 'QUEUED', 'REOPENED'].includes(ticket.status)) {
+        throw new BadRequestException('Service priority can change only while the ticket is waiting to be assigned');
+      }
+      if (ticket.servicePriority === servicePriority) throw new BadRequestException('Service priority is unchanged');
+      let updated;
+      try {
+        updated = await tx.ticket.update({
+          where: { id, version: ticket.version },
+          data: { servicePriority, version: { increment: 1 } },
+        });
+      } catch (error) {
+        if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2025') {
+          throw new ConflictException('This ticket changed before the priority update. Refresh and try again');
+        }
+        throw error;
+      }
+      const correlationId = requestCorrelationId();
+      await tx.ticketEvent.create({
+        data: {
+          eventId: ticket.eventId,
+          ticketId: id,
+          eventType: 'SERVICE_PRIORITY_CHANGED',
+          actorId: scope.userId,
+          fromStatus: ticket.status,
+          toStatus: ticket.status,
+          correlationId,
+          metadata: { reason, from: ticket.servicePriority, to: servicePriority },
+        },
+      });
+      await tx.outboxEvent.create({
+        data: {
+          eventId: ticket.eventId,
+          aggregateType: 'Ticket',
+          aggregateId: id,
+          eventType: 'SERVICE_PRIORITY_CHANGED',
+          payload: {
+            ticketId: id,
+            eventId: ticket.eventId,
+            hallId: ticket.hallId,
+            stallId: ticket.stallId,
+            version: updated.version,
+            correlationId,
+          },
+        },
+      });
+      return updated;
+    });
+  }
+
   async ping(id: string, scope: AuthScope, message: string) {
     requireAuthority(scope.role, 'HALL_MANAGER');
     if (!message.trim()) throw new BadRequestException('Ping message is required');
@@ -835,7 +947,7 @@ export class TicketService {
     if (!poolId) return;
     const waiting = await this.prisma.ticket.findFirst({
       where: { poolId, status: 'QUEUED' },
-      orderBy: [{ queuePriorityOverrideAt: { sort: 'asc', nulls: 'last' } }, { createdAt: 'asc' }, { id: 'asc' }],
+      orderBy: serviceQueueOrderBy,
     });
     if (waiting) await this.route(waiting.id, undefined, requestCorrelationId());
   }
@@ -881,6 +993,9 @@ export class TicketService {
 export class TicketController {
   constructor(private readonly service: TicketService, private readonly realtime: RealtimeService) {}
   @Get() list(@CurrentScope() scope: AuthScope, @Query() query: ListTicketsDto) { return this.service.list(scope, query); }
+  @Get(':id/activity') activity(@Param('id') id: string, @CurrentScope() scope: AuthScope, @Query('cursor') cursor?: string) {
+    return this.service.activity(id, scope, cursor);
+  }
   @Get(':id') detail(@Param('id') id: string, @CurrentScope() scope: AuthScope) { return this.service.detail(id, scope); }
   @Post() create(@Body() dto: CreateTicketDto, @CurrentScope() scope: AuthScope) { return this.service.create(dto, scope); }
   @Post(':id/transition') transition(@Param('id') id: string, @Body() body: TransitionTicketDto, @CurrentScope() scope: AuthScope) { return this.service.transition(id, body.to, scope, body.reason); }
@@ -898,6 +1013,11 @@ export class TicketController {
   @Post(':id/override-close') override(@Param('id') id: string, @Body() body: ReasonDto, @CurrentScope() scope: AuthScope) { return this.service.overrideClose(id, scope, body.reason); }
   @Post(':id/prioritize')
   prioritize(@Param('id') id: string, @Body() body: ReasonDto, @CurrentScope() scope: AuthScope) { return this.service.prioritizeQueued(id, scope, body.reason); }
+  @Throttle({ default: { limit: 20, ttl: 60000 } })
+  @Post(':id/service-priority')
+  servicePriority(@Param('id') id: string, @Body() body: ServicePriorityDto, @CurrentScope() scope: AuthScope) {
+    return this.service.changePendingServicePriority(id, scope, body.servicePriority, body.reason);
+  }
   @Post(':id/ping')
   ping(@Param('id') id: string, @Body() body: PingDto, @CurrentScope() scope: AuthScope) { return this.service.ping(id, scope, body.message); }
   @Sse('stream/live') stream(@CurrentScope() scope: AuthScope) { return this.realtime.stream(scope); }

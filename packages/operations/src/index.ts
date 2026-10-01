@@ -8,6 +8,14 @@ export type RoutingResult = { requested: Ticket; changed: RoutingChange[] };
 
 const transitionsToAssigned = new Set<TicketStatus>(['NEW', 'QUEUED', 'REOPENED']);
 
+/** Reasoned override, then HIGH → MEDIUM → LOW, then creation time, then id. */
+export const serviceQueueOrderBy = [
+  { queuePriorityOverrideAt: { sort: 'asc' as const, nulls: 'last' as const } },
+  { servicePriority: 'asc' as const },
+  { createdAt: 'asc' as const },
+  { id: 'asc' as const },
+];
+
 export async function routeTicket(database: DatabaseClient, ticketId: string, actorId?: string, correlationId: string = randomUUID()): Promise<RoutingResult> {
   return database.$transaction(async (tx) => {
     const initial = await tx.ticket.findUniqueOrThrow({ where: { id: ticketId } });
@@ -59,15 +67,11 @@ export async function routeTicket(database: DatabaseClient, ticketId: string, ac
         left.lastAvailableAt.getTime() - right.lastAvailableAt.getTime() ||
         left.userId.localeCompare(right.userId),
       )[0];
-    const waiting = await tx.ticket.findFirst({
-      where: { poolId: requestedTicket.poolId, status: 'QUEUED' },
-      orderBy: [
-        { queuePriorityOverrideAt: { sort: 'asc', nulls: 'last' } },
-        { createdAt: 'asc' },
-        { id: 'asc' },
-      ],
+    const candidates = await tx.ticket.findMany({
+      where: { poolId: requestedTicket.poolId, status: { in: ['NEW', 'QUEUED', 'REOPENED'] } },
+      orderBy: serviceQueueOrderBy,
     });
-    const selectedTicket = selectedStaff ? waiting ?? requestedTicket : undefined;
+    const selectedTicket = selectedStaff ? candidates[0] : undefined;
     const now = new Date();
     const changed: RoutingChange[] = [];
 
@@ -112,6 +116,10 @@ export async function routeTicket(database: DatabaseClient, ticketId: string, ac
         where: { eventId: selectedTicket.eventId, stallId: selectedTicket.stallId, user: { role: 'STALL' } },
         select: { userId: true },
       });
+      const stall = await tx.stall.findUnique({
+        where: { id: selectedTicket.stallId },
+        select: { stallCode: true, zone: { select: { code: true, hall: { select: { name: true } } } } },
+      });
       const assignmentRecipients = [...new Set([selectedStaff.userId, ...stallRecipients.map((scope) => scope.userId)])];
       await tx.notification.createMany({
         data: assignmentRecipients.map((recipientId) => ({
@@ -120,7 +128,17 @@ export async function routeTicket(database: DatabaseClient, ticketId: string, ac
           ticketId: selectedTicket.id,
           type: 'TICKET_ASSIGNED',
           dedupeKey: `ticket-assigned:${selectedTicket.id}:${recipientId}:${selectedTicket.version}`,
-          payload: { hallId: selectedTicket.hallId },
+          payload: {
+            hallId: selectedTicket.hallId,
+            stallCode: stall?.stallCode,
+            hallName: stall?.zone.hall.name,
+            zone: stall?.zone.code,
+            category: selectedTicket.category,
+            priority: selectedTicket.priority,
+            issue: selectedTicket.description.slice(0, 140),
+            publicNo: selectedTicket.publicNo,
+            summary: `New task · Stall ${stall?.stallCode ?? ''}`.trim(),
+          },
         })),
         skipDuplicates: true,
       });

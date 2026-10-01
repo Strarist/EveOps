@@ -109,14 +109,16 @@ CANCELLED with reason.
 - Available staff selection uses least active load, then longest idle as
   deterministic tie-breaker.
 
-- If nobody is eligible/available, the ticket enters FIFO queue for that
-  compatible pool.
+- If nobody is eligible/available, the ticket waits in the compatible
+  pool queue.
 
-- FIFO order is created_at ascending, then ticket ID ascending as
-  deterministic tie-breaker.
+- Queue order is a reasoned manual override, then stall service priority
+  HIGH, MEDIUM, LOW, then created_at, then ticket ID. The ticket keeps
+  the stall priority captured at creation. See
+  `docs/priority-operations-notes.md`.
 
-- Manual queue priority override requires Hall Manager/Admin permission
-  and a mandatory reason.
+- Manual queue override, and a change to a waiting ticket's service
+  priority, require Hall Manager/Admin permission and a mandatory reason.
 
 - Reassignment closes the previous Assignment record; history is never
   overwritten.
@@ -376,7 +378,7 @@ rebuildable from the immutable timeline.
 | Can Hall Manager emergency-close without OTP? | No by default; Admin/SuperAdmin only with reason.               |
 | Can staff snooze more than once?              | No by default.                                                  |
 | Staff active-ticket capacity                  | 1 for field staff unless service requires parallel tasks.       |
-| Priority levels                               | Normal + Urgent only; priority override requires manager/admin. |
+| Priority levels                               | Ticket urgency stays Normal + Urgent. Stall service priority is High, Medium, or Low and orders the waiting queue after a reasoned override. |
 | Exact response/resolution SLAs                | Configure per service after operational workshop.               |
 | Notification channels beyond in-app           | Add based on venue connectivity and business cost.              |
 | Post-event retention period                   | Set organization policy before first live deployment.           |
