@@ -1,3 +1,13 @@
+/** Minimum length for account passwords on sign-in, rotation, and account creation. */
+export const PASSWORD_MIN_LENGTH = 4;
+
+/** bcrypt only stores the first 72 bytes. Longer passwords are rejected instead of being truncated. */
+export const PASSWORD_MAX_BYTES = 72;
+
+/** Newly chosen passwords must contain a letter and a number. Sign-in does not re-check this. */
+export const NEW_PASSWORD_PATTERN = /^(?=.*[A-Za-z])(?=.*\d).+$/;
+export const NEW_PASSWORD_MESSAGE = 'Password must include at least one letter and one number';
+
 export const ROLES = ['STALL', 'STAFF', 'HALL_MANAGER', 'ADMIN', 'SUPER_ADMIN'] as const;
 export type Role = (typeof ROLES)[number];
 

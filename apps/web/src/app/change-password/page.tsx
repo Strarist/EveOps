@@ -1,6 +1,6 @@
 'use client';
 
-import type { Role } from '@eveops/contracts';
+import { NEW_PASSWORD_PATTERN, PASSWORD_MAX_BYTES, PASSWORD_MIN_LENGTH, type Role } from '@eveops/contracts';
 import { FormEvent, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { apiErrorMessage, apiFetch } from '../../lib/api-client';
@@ -68,19 +68,19 @@ export default function ChangePasswordPage() {
         <div className="login-card">
           <span className="eyebrow">Security</span>
           <h2 id="change-password-heading">Change password</h2>
-          <p>Choose a password with at least 10 characters, including a letter and a number.</p>
+          <p>Choose a password of 4 to 72 characters, including a letter and a number.</p>
           <form onSubmit={(event) => void submit(event)}>
             <label>
               Current / temporary password
-              <input name="currentPassword" type="password" autoComplete="current-password" required minLength={8} />
+              <input name="currentPassword" type="password" autoComplete="current-password" required minLength={PASSWORD_MIN_LENGTH} maxLength={PASSWORD_MAX_BYTES} />
             </label>
             <label>
               New password
-              <input name="newPassword" type="password" autoComplete="new-password" required minLength={10} />
+              <input name="newPassword" type="password" autoComplete="new-password" required minLength={PASSWORD_MIN_LENGTH} maxLength={PASSWORD_MAX_BYTES} pattern={NEW_PASSWORD_PATTERN.source} title="Include at least one letter and one number" />
             </label>
             <label>
               Confirm new password
-              <input name="confirmPassword" type="password" autoComplete="new-password" required minLength={10} />
+              <input name="confirmPassword" type="password" autoComplete="new-password" required minLength={PASSWORD_MIN_LENGTH} maxLength={PASSWORD_MAX_BYTES} pattern={NEW_PASSWORD_PATTERN.source} title="Include at least one letter and one number" />
             </label>
             {error && <div className="form-error" role="alert">{error}</div>}
             <button className="primary" type="submit" disabled={loading}>

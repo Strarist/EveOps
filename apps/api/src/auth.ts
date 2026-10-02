@@ -1,13 +1,14 @@
 import { CanActivate, Controller, ExecutionContext, ForbiddenException, Get, Injectable, Post, Body, UnauthorizedException, BadRequestException, UseGuards, Res, Req, createParamDecorator } from '@nestjs/common';
 import type { Request, Response } from 'express';
 import { createHash, randomBytes } from 'node:crypto';
-import { compare, hash } from 'bcryptjs';
+import { hash } from 'bcryptjs';
 import { Throttle } from '@nestjs/throttler';
 import { Transform } from 'class-transformer';
-import { IsEmail, IsIn, IsOptional, IsString, Matches, MinLength } from 'class-validator';
+import { IsEmail, IsIn, IsOptional, IsString } from 'class-validator';
 import type { AuthScope } from '@eveops/contracts';
 import { PrismaService } from './prisma.service';
 import { assertPortalRole } from './domain';
+import { IsAcceptedPassword, IsNewPassword, passwordMatches } from './password-policy';
 
 export const CurrentScope = createParamDecorator((_data: unknown, context: ExecutionContext) => context.switchToHttp().getRequest().scope);
 
@@ -17,7 +18,7 @@ export class LoginDto {
   email!: string;
 
   @IsString()
-  @MinLength(8)
+  @IsAcceptedPassword()
   password!: string;
 
   @IsOptional()
@@ -27,14 +28,11 @@ export class LoginDto {
 
 export class ChangePasswordDto {
   @IsString()
-  @MinLength(8)
+  @IsAcceptedPassword()
   currentPassword!: string;
 
   @IsString()
-  @MinLength(10)
-  @Matches(/^(?=.*[A-Za-z])(?=.*\d).+$/, {
-    message: 'New password must include at least one letter and one number',
-  })
+  @IsNewPassword()
   newPassword!: string;
 }
 
@@ -133,7 +131,8 @@ export class AuthController {
     @Res({ passthrough: true }) response: Response,
   ) {
     const user = await this.prisma.user.findUnique({ where: { email: body.email } });
-    if (!user || !(await compare(body.password, user.passwordHash))) throw new UnauthorizedException('Invalid credentials');
+    const matches = await passwordMatches(body.password, user?.passwordHash);
+    if (!user || !matches) throw new UnauthorizedException('Invalid credentials');
     if (user.approvalStatus === 'PENDING_APPROVAL') {
       throw new ForbiddenException('Your staff account is awaiting Admin approval.');
     }
@@ -215,7 +214,7 @@ export class AuthController {
       throw new BadRequestException('New password must be different from the current password');
     }
     const user = await this.prisma.user.findUniqueOrThrow({ where: { id: scope.userId } });
-    if (!(await compare(body.currentPassword, user.passwordHash))) {
+    if (!(await passwordMatches(body.currentPassword, user.passwordHash))) {
       throw new UnauthorizedException('Current password is incorrect');
     }
     const passwordHash = await hash(body.newPassword, 12);

@@ -25,6 +25,7 @@ import { createReadStream, existsSync } from 'node:fs';
 import { basename, resolve } from 'node:path';
 import { Throttle } from '@nestjs/throttler';
 import { CurrentScope, SessionGuard } from './auth';
+import { IsNewPassword } from './password-policy';
 import { requireAuthority } from './domain';
 import { PrismaService } from './prisma.service';
 import { stallCodeConflictMessage } from './stall-conflict';
@@ -93,7 +94,7 @@ export class CreateExhibitorLoginDto {
 export class CreateAdminDto {
   @IsString() @MinLength(2) name!: string;
   @IsEmail() email!: string;
-  @IsString() @MinLength(12) password!: string;
+  @IsString() @IsNewPassword() password!: string;
   @IsArray() @ArrayMinSize(1) @IsString({ each: true }) eventIds!: string[];
 }
 

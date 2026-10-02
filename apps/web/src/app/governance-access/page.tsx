@@ -1,5 +1,6 @@
 'use client';
 
+import { PASSWORD_MAX_BYTES, PASSWORD_MIN_LENGTH } from '@eveops/contracts';
 import { FormEvent, useState } from 'react';
 import { useRouter } from 'next/navigation';
 
@@ -60,7 +61,7 @@ export default function GovernanceAccessPage() {
             </label>
             <label>
               Password
-              <input name="password" type="password" autoComplete="current-password" required minLength={8} />
+              <input name="password" type="password" autoComplete="current-password" required minLength={PASSWORD_MIN_LENGTH} maxLength={PASSWORD_MAX_BYTES} />
             </label>
             {error && <div className="form-error" role="alert">{error}</div>}
             <button className="primary" type="submit" disabled={loading}>

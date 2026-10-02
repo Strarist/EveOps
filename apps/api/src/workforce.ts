@@ -34,6 +34,7 @@ import {
 } from 'class-validator';
 import { hash } from 'bcryptjs';
 import { CurrentScope, SessionGuard } from './auth';
+import { IsNewPassword } from './password-policy';
 import { assertScope, assertTransition, requireAuthority } from './domain';
 import { PrismaService } from './prisma.service';
 import { RealtimeService } from './realtime';
@@ -59,7 +60,7 @@ export class CreatePersonDto {
   @IsString() @MinLength(2) name!: string;
   @IsEmail() email!: string;
   @IsOptional() @IsString() phone?: string;
-  @IsString() @MinLength(10) password!: string;
+  @IsString() @IsNewPassword() password!: string;
   @IsIn([...MANAGED_ROLES]) role!: ManagedRole;
   @IsString() eventId!: string;
   @IsOptional() @IsString() hallId?: string;
@@ -75,7 +76,7 @@ export class UpdatePersonDto {
   @IsOptional() @IsString() phone?: string;
   @IsOptional() @IsIn(['ACTIVE', 'DISABLED']) status?: UserStatus;
   @IsOptional() @Type(() => Number) @IsInt() @Min(1) @Max(20) capacity?: number;
-  @IsOptional() @IsString() @MinLength(10) password?: string;
+  @IsOptional() @IsString() @IsNewPassword() password?: string;
   @IsOptional() @IsString() hallId?: string;
   @IsOptional() @IsString() serviceCategory?: string;
   @IsOptional() @IsString() serviceSubtype?: string;
