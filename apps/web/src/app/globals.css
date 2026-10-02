@@ -73,9 +73,14 @@ button:disabled { cursor: wait; opacity: .65; }
 .metric.critical strong, .red { color: var(--red); }
 .workspace { display: grid; grid-template-columns: minmax(560px, 1fr) minmax(290px, 350px); gap: .9rem; align-items: start; }
 .operations, .drawer, .portfolio-list { border: 1px solid var(--line); border-radius: 9px; background: var(--white); overflow: hidden; }
-.section-title { min-height: 64px; padding: .9rem 1.05rem; display: flex; align-items: center; justify-content: space-between; gap: 1rem; }
+.section-title { min-height: 64px; padding: .9rem 1.05rem; display: flex; align-items: flex-start; justify-content: space-between; gap: 1rem; flex-wrap: wrap; }
 .section-title h2 { margin: 0; font-size: .98rem; }
-.section-title p { margin: .2rem 0 0; color: var(--muted); font-size: .72rem; }
+.section-title p { margin: .2rem 0 0; color: var(--muted); font-size: .78rem; line-height: 1.45; max-width: 40rem; }
+.manager-list { display: grid; gap: .65rem; padding: .85rem; }
+.manager-card { display: grid; gap: .25rem; width: 100%; min-height: 44px; padding: .9rem; text-align: left; border: 1px solid var(--line); border-radius: 10px; background: var(--white); }
+.manager-card.selected { border-color: var(--teal); background: var(--teal-soft); }
+.manager-card strong { font-size: 1rem; overflow-wrap: anywhere; }
+.manager-card span { color: var(--muted); font-size: .82rem; overflow-wrap: anywhere; }
 .section-title > span { color: var(--muted); font-size: .78rem; }
 .section-title .link { border: 0; background: none; color: var(--teal); }
 .filters { padding: 0 1.05rem .8rem; display: flex; gap: .45rem; overflow-x: auto; }
@@ -278,6 +283,12 @@ a.ticket-link .ticket-card, a.ticket-link .recent { margin-bottom: 0; }
   .portfolio-list article button { grid-column: 1 / -1; }
 }
 
+@media (max-width: 1024px) {
+  .portfolio-list article { grid-template-columns: 1fr 1fr; }
+  .portfolio-list article > div:first-child { grid-column: 1 / -1; }
+  .portfolio-list article button { grid-column: auto; }
+}
+
 @media (max-width: 767px) {
   .login-page { grid-template-columns: 1fr; }
   .login-brand { min-height: 34dvh; padding: 1.5rem; }
@@ -300,6 +311,17 @@ a.ticket-link .ticket-card, a.ticket-link .recent { margin-bottom: 0; }
   .portfolio-hero { grid-template-columns: repeat(2, 1fr); }
   .portfolio-list article { grid-template-columns: 1fr 1fr; }
   .portfolio-list article > div:first-child { grid-column: 1 / -1; }
+  .sidebar.hall-manager { grid-template-columns: 1fr auto; align-items: center; }
+  .sidebar.hall-manager nav { grid-column: 1 / -1; flex-wrap: wrap; overflow: visible; }
+  .sidebar.hall-manager nav button { flex: 1 1 calc(50% - .35rem); min-height: 44px; }
+  .sidebar.hall-manager .user { display: none; }
+  .sidebar.hall-manager .logout { justify-self: end; min-width: 44px; }
+  .filters { flex-direction: column; overflow: visible; }
+  .filters input { margin-left: 0; min-width: 0; }
+  .manager-focus .operations { display: none; }
+  .topbar, .top-actions { flex-wrap: wrap; align-items: flex-start; }
+  .drawer-actions { display: flex; flex-wrap: wrap; }
+  .drawer-actions button { min-height: 44px; }
 }
 
 .stall-hero { margin: .2rem 0; font-size: 1.8rem; font-weight: 800; letter-spacing: -.03em; }

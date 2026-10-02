@@ -33,6 +33,7 @@ type Ticket = {
   cancelledAt?: string | null;
   progressLabel?: string;
   slaState: 'On track' | 'Response overdue' | 'SLA breached';
+  queuePriorityOverrideAt?: string | null;
   capabilities: {
     advanceHallManagerWork: boolean;
     verifyStallOtp?: boolean;
@@ -70,6 +71,7 @@ type ApiTicket = {
   queueState?: 'QUEUED' | 'ASSIGNED' | 'NONE';
   nextAction: 'NONE' | 'WAIT_FOR_ASSIGNMENT' | 'VERIFY_OTP' | 'WAIT_FOR_OTP_VERIFICATION' | 'STAFF_VERIFY_OTP' | 'STALL_VERIFY_OTP' | 'ASSIGNEE_ACTION' | 'ROUTE';
   slaState?: 'ON_TRACK' | 'RESPONSE_OVERDUE' | 'SLA_BREACHED';
+  queuePriorityOverrideAt?: string | null;
   capabilities: {
     advanceHallManagerWork: boolean;
     verifyStallOtp?: boolean;
@@ -140,6 +142,7 @@ function mapTicket(ticket: ApiTicket): Ticket {
     currentCycleStartedAt: ticket.currentCycleStartedAt,
     cancelledAt: ticket.cancelledAt,
     slaState: ticket.slaState === 'SLA_BREACHED' ? 'SLA breached' : ticket.slaState === 'RESPONSE_OVERDUE' ? 'Response overdue' : 'On track',
+    queuePriorityOverrideAt: ticket.queuePriorityOverrideAt ?? null,
     capabilities: ticket.capabilities ?? { advanceHallManagerWork: false, verifyStallOtp: false, emergencyClose: false },
   };
 }
@@ -1187,9 +1190,44 @@ function StaffTaskDetail({ ticket, loading, error, actionPending, otpValue, otpE
 }
 
 const navByRole: Record<'HALL_MANAGER' | 'ADMIN', string[]> = {
-  HALL_MANAGER: ['Hall overview', 'Live tickets', 'Staff', 'Exceptions', 'Search'],
+  HALL_MANAGER: ['Attention', 'Tickets', 'Queue', 'Staff'],
   ADMIN: ['Command center', 'Tickets', 'Halls / Zones / Stalls', 'Workforce', 'Reports', 'Masters', 'Audit'],
 };
+
+function attentionReason(ticket: Ticket): string | null {
+  if (ticket.status === 'COMPLAINT_RAISED') return 'The stall reported a problem';
+  if (ticket.status === 'ESCALATED') return 'Escalated and waiting for a decision';
+  if (ticket.slaState === 'SLA breached') return 'Past the resolution target';
+  if (ticket.slaState === 'Response overdue') return 'Waiting too long for a response';
+  if (ticket.priority) return 'Marked urgent';
+  if (ticket.status === 'REOPENED' || (ticket.reopenCount > 0 && ['NEW', 'QUEUED', 'ASSIGNED', 'SNOOZED'].includes(ticket.status))) return 'Opened again';
+  if (ticket.status === 'NEW') return 'Just raised';
+  if (ticket.status === 'AWAITING_OTP') return 'Waiting for the stall to confirm completion';
+  if (ticket.status === 'ASSIGNED' || ticket.status === 'SNOOZED') return 'Assigned and not yet started';
+  return null;
+}
+
+function managementStatusIsSuccess(message: string) {
+  return message.startsWith('Export queued')
+    || message.startsWith('Created ')
+    || message.includes('sent for Admin approval')
+    || message.startsWith('Staff approved')
+    || message.startsWith('Staff request rejected')
+    || message.endsWith('created.')
+    || message.startsWith('SLA targets')
+    || message.includes('Temporary password must be changed')
+    || message.startsWith('Completion verified');
+}
+
+function managerNextStep(ticket: Ticket): string {
+  if (ticket.status === 'AWAITING_OTP' && ticket.capabilities.verifyStallOtp) return 'Enter the completion code';
+  if (ticket.status === 'QUEUED') return 'Move it ahead in the queue, with a reason';
+  if (['ASSIGNED', 'SNOOZED', 'ACCEPTED'].includes(ticket.status)) return 'Message the worker or reassign';
+  if (ticket.status === 'COMPLAINT_RAISED' || ticket.status === 'CLOSED' || ticket.status === 'ESCALATED') return 'Reopen with a reason';
+  if (ticket.status === 'IN_PROGRESS') return 'Follow the worker, or escalate with a reason';
+  if (ticket.status === 'NEW' || ticket.status === 'REOPENED') return 'It assigns when a free worker is on duty';
+  return 'Open the ticket';
+}
 
 type TimingRecord = {
   id: string;
@@ -1329,7 +1367,7 @@ function eventTime(value: string | null | undefined, timezone = 'UTC') {
   return new Intl.DateTimeFormat('en-IN', { timeZone: timezone, dateStyle: 'medium', timeStyle: 'short' }).format(new Date(value));
 }
 
-function TicketDrawer({ ticket, timing, detail, eligibleStaff, onPing, onReassign, onReopen, onEscalate, onOverrideClose, onAdvance, onPrioritize, onSetServicePriority, onCancel, onVerifyOtp, canAdmin, canAdvance, canEmergencyClose, canVerifyOtp }: {
+function TicketDrawer({ ticket, timing, detail, eligibleStaff, onPing, onReassign, onReopen, onEscalate, onOverrideClose, onAdvance, onPrioritize, onSetServicePriority, onCancel, onVerifyOtp, canAdmin, canAdvance, canEmergencyClose, canVerifyOtp, activityOpen = false, onBack, actionError }: {
   ticket: Ticket;
   timing?: TimingRecord;
   detail?: TicketDetail;
@@ -1348,6 +1386,9 @@ function TicketDrawer({ ticket, timing, detail, eligibleStaff, onPing, onReassig
   canAdvance: boolean;
   canEmergencyClose: boolean;
   canVerifyOtp?: boolean;
+  activityOpen?: boolean;
+  onBack?: () => void;
+  actionError?: string;
 }) {
   const [pendingAction, setPendingAction] = useState<'ping' | 'reassign' | 'reopen' | 'escalate' | 'override' | 'prioritize' | 'service-priority' | 'cancel' | null>(null);
   const [submitting, setSubmitting] = useState(false);
@@ -1369,18 +1410,23 @@ function TicketDrawer({ ticket, timing, detail, eligibleStaff, onPing, onReassig
     ['Completion requested', timing?.completionRequestedAt ?? detail?.completionRequestedAt, timing?.activeWorkSeconds != null ? duration(timing.activeWorkSeconds) + ' work duration' : null],
     ['Closed', ticket.status === 'CLOSED' ? (timing?.closedAt ?? detail?.closedAt) : null, ticket.status === 'CLOSED' && timing?.otpWaitSeconds != null ? duration(timing.otpWaitSeconds) + ' verification wait' : (ticket.status === 'AWAITING_OTP' ? 'Pending verification' : null)],
   ];
+  const overrideEvent = [...(detail?.events ?? [])].reverse().find((event) => event.eventType === 'QUEUE_PRIORITY_OVERRIDDEN');
+  const overrideReason = overrideEvent && overrideEvent.metadata && typeof overrideEvent.metadata === 'object' && 'reason' in overrideEvent.metadata
+    ? String((overrideEvent.metadata as { reason?: unknown }).reason ?? '')
+    : '';
   return (
     <aside className="drawer" aria-label={'Ticket ' + ticket.no + ' detail'}>
+      {onBack ? <button type="button" onClick={onBack}>Back to the list</button> : null}
       <div className="drawer-head"><div><span className="eyebrow">{ticket.no}</span><h2>{ticket.service}</h2></div><Status value={ticket.status} audience="manager" /></div>
       <p className="description">{ticket.description}</p>
       <div className="ticket-meta"><TimingFacts ticket={ticket} /></div>
-      <div className="drawer-location location-emphasis"><span>{ticket.locationParts.hall} · {ticket.locationParts.zone}</span><strong>Stall {ticket.locationParts.stall}</strong>{ticket.servicePriority && <span>Service priority {ticket.servicePriority}</span>}</div>
+      <div className="drawer-location location-emphasis"><span>{ticket.locationParts.hall} · {ticket.locationParts.zone}</span><strong>Stall {ticket.locationParts.stall}</strong>{ticket.servicePriority && <span>Stall priority {ticket.servicePriority}</span>}{ticket.priority ? <span>Urgent</span> : null}<span>SLA {ticket.slaState}</span>{ticket.queuePriorityOverrideAt ? <span>Moved ahead in the queue{overrideReason ? `: ${overrideReason}` : ''}</span> : null}</div>
       <div className="cycles"><h3>Assignment</h3><div><strong>{detail?.currentAssignee?.name ?? detail?.lastAssignee?.name ?? ticket.assignee}</strong><span>{detail?.currentAssignee ? 'Current assignee' : (detail?.lastAssignee ? 'Last assignee' : 'Queue / ownership')}</span></div></div>
       <div className="timing"><h3>Service timing</h3><div className="timing-strip"><span><b>{duration(timing?.raiseToAssignSeconds)}</b>Dispatch</span><span><b>{duration(timing?.assignToAcceptSeconds)}</b>Response</span><span><b>{duration(timing?.mobilizationSeconds)}</b>Mobilize</span><span><b>{duration(timing?.activeWorkSeconds)}</b>Work</span><span><b>{duration(timing?.otpWaitSeconds)}</b>OTP wait</span><span><b>{duration(timing?.totalResolutionSeconds)}</b>Total</span></div></div>
       <div className="timeline"><h3>Lifecycle milestones</h3>{milestones.map(([event, time, relative], index) => <div key={event} className="timeline-item"><i className={time ? 'active' : ''}></i><div><strong>{event}</strong><span>{time ? eventTime(time, timing?.eventTimezone) : (event === 'Closed' && ticket.status === 'AWAITING_OTP' ? 'Pending verification' : '—')}</span>{relative && <span>{relative}</span>}</div><time>{index === 0 ? 'Event time' : ''}</time></div>)}</div>
       {!!timing?.workCycles.length && <div className="cycles"><h3>Work cycles</h3>{timing.workCycles.map((cycle) => <div key={cycle.attempt}><strong>Attempt {cycle.attempt}</strong><span>{eventTime(cycle.assignedAt, timing.eventTimezone)} · {cycle.releasedAt ? 'Completed/released' : 'Active'}</span></div>)}</div>}
       {!!detail?.complaints.length && <div className="cycles"><h3>Complaints</h3>{detail.complaints.map((complaint) => <div key={complaint.id}><strong>{complaint.reasonCode.replaceAll('_', ' ')}</strong><span>{complaint.comment || 'No additional note'} · {eventTime(complaint.createdAt, timing?.eventTimezone)}</span></div>)}</div>}
-      <details className="complaint-disclosure"><summary>Activity</summary><TicketActivity ticketId={ticket.id} /></details>
+      {activityOpen ? <section aria-label="Activity"><TicketActivity ticketId={ticket.id} /></section> : <details className="complaint-disclosure"><summary>Activity</summary><TicketActivity ticketId={ticket.id} /></details>}
       {canVerifyOtp && ticket.status === 'AWAITING_OTP' && onVerifyOtp && (
         <StaffOtpEntry
           value={otpValue}
@@ -1408,11 +1454,11 @@ function TicketDrawer({ ticket, timing, detail, eligibleStaff, onPing, onReassig
       )}
       <div className="drawer-actions">
         {canAdvance && ticket.service.startsWith('HALL MANAGER') && ['ASSIGNED', 'SNOOZED', 'ACCEPTED', 'IN_PROGRESS'].includes(ticket.status) && <button className="primary" onClick={onAdvance}>{ticket.status === 'ACCEPTED' ? 'Start work' : ticket.status === 'IN_PROGRESS' ? 'Request completion' : 'Accept'}</button>}
-        {['ASSIGNED', 'SNOOZED', 'ACCEPTED'].includes(ticket.status) && <><button onClick={() => setPendingAction('ping')}>Ping staff</button><button onClick={() => setPendingAction('reassign')}>Reassign</button></>}
-        {['CLOSED', 'COMPLAINT_RAISED'].includes(ticket.status) && <button onClick={() => setPendingAction('reopen')}>Reopen</button>}
-        {ticket.status === 'QUEUED' && <button onClick={() => setPendingAction('prioritize')}>Move ahead</button>}
-        {['NEW', 'QUEUED', 'REOPENED'].includes(ticket.status) && <button onClick={() => setPendingAction('service-priority')}>Set service priority</button>}
-        {['SNOOZED', 'IN_PROGRESS', 'COMPLAINT_RAISED'].includes(ticket.status) && <button className="critical-button" onClick={() => setPendingAction('escalate')}>Escalate</button>}
+        {['ASSIGNED', 'SNOOZED', 'ACCEPTED'].includes(ticket.status) && <><button onClick={() => setPendingAction('ping')}>Message the worker</button><button onClick={() => setPendingAction('reassign')}>Reassign worker</button></>}
+        {['CLOSED', 'COMPLAINT_RAISED', 'ESCALATED'].includes(ticket.status) && <button onClick={() => setPendingAction('reopen')}>Reopen with a reason</button>}
+        {ticket.status === 'QUEUED' && <button onClick={() => setPendingAction('prioritize')}>Move ahead in the queue</button>}
+        {['NEW', 'QUEUED', 'REOPENED'].includes(ticket.status) && <button onClick={() => setPendingAction('service-priority')}>Change stall priority</button>}
+        {['SNOOZED', 'IN_PROGRESS', 'COMPLAINT_RAISED'].includes(ticket.status) && <button className="critical-button" onClick={() => setPendingAction('escalate')}>Escalate with a reason</button>}
         {canEmergencyClose && ['AWAITING_OTP', 'ESCALATED'].includes(ticket.status) && <button className="critical-button" onClick={() => setPendingAction('override')}>Emergency close</button>}
         {canAdmin && ['NEW', 'QUEUED'].includes(ticket.status) && <button className="critical-button" onClick={() => setPendingAction('cancel')}>Cancel</button>}
       </div>
@@ -1439,7 +1485,8 @@ function TicketDrawer({ ticket, timing, detail, eligibleStaff, onPing, onReassig
         {pendingAction === 'reassign' && <label>Eligible worker<select name="staffId" required disabled={submitting}><option value="">Choose worker</option>{eligibleStaff.map((membership) => <option key={membership.user.id} value={membership.user.id}>{membership.user.name}{membership.user.employeeCode ? ` · ${membership.user.employeeCode}` : ''} · {membership.pool.category} {membership.pool.subtype}</option>)}</select></label>}
         {pendingAction === 'service-priority' && <label>Service priority<select name="servicePriority" required defaultValue={ticket.servicePriority ?? 'MEDIUM'} disabled={submitting}><option value="HIGH">High</option><option value="MEDIUM">Medium</option><option value="LOW">Low</option></select></label>}
         <label>{pendingAction === 'ping' ? 'Message' : 'Required reason'}<textarea name="reason" required minLength={3} maxLength={500} disabled={submitting} /></label>
-        <div><button type="button" disabled={submitting} onClick={() => setPendingAction(null)}>Back</button><button className={['override', 'cancel'].includes(pendingAction) ? 'critical-button' : 'primary'} type="submit" disabled={submitting}>{submitting ? 'Confirming…' : 'Confirm action'}</button></div>
+        {actionError ? <p className="form-error" role="alert">{actionError}</p> : null}
+        <div><button type="button" disabled={submitting} onClick={() => setPendingAction(null)}>Back</button><button className={['override', 'cancel'].includes(pendingAction) ? 'critical-button' : 'primary'} type="submit" disabled={submitting}>{submitting ? 'Saving…' : 'Confirm'}</button></div>
       </form>}
     </aside>
   );
@@ -1469,6 +1516,16 @@ export function ManagementWorkspace({ role }: { role: 'HALL_MANAGER' | 'ADMIN' }
     ...(debouncedSearch ? { search: debouncedSearch } : {}),
   }).toString();
   const { items, total, nextCursor, loading, error: loadError, refresh, loadMore, connection, lastUpdatedAt } = useApiTickets(ticketQuery);
+  const queueQuery = new URLSearchParams({
+    view: 'queued',
+    limit: role === 'HALL_MANAGER' ? '50' : '1',
+    ...(role === 'HALL_MANAGER' && categoryFilter ? { category: categoryFilter } : {}),
+    ...(role === 'HALL_MANAGER' && hallFilter ? { hallId: hallFilter } : {}),
+    ...(role === 'HALL_MANAGER' && debouncedSearch ? { search: debouncedSearch } : {}),
+  }).toString();
+  const attentionQuery = role === 'HALL_MANAGER' ? 'view=active&limit=100' : 'view=active&limit=1';
+  const { items: queuedItems, total: queueTotal, nextCursor: queueCursor, loading: queueLoading, error: queueError, refresh: refreshQueue, loadMore: loadMoreQueue } = useApiTickets(queueQuery);
+  const { items: attentionSource, nextCursor: attentionCursor, loading: attentionLoading, error: attentionError, refresh: refreshAttention, loadMore: loadMoreAttention } = useApiTickets(attentionQuery);
   const [timings, setTimings] = useState<Record<string, TimingRecord>>({});
   const [liveMetrics, setLiveMetrics] = useState<OperationalMetrics>({});
   const [detail, setDetail] = useState<TicketDetail>();
@@ -1553,7 +1610,7 @@ export function ManagementWorkspace({ role }: { role: 'HALL_MANAGER' | 'ADMIN' }
     setExports([]);
   });
   const title = role === 'HALL_MANAGER' ? (profile?.scopes[0]?.hall?.name ?? 'Hall') + ' operations' : 'Event command center';
-  const showLive = ['Command center', 'Hall overview', 'Tickets', 'Live tickets', 'Search'].includes(activeSection);
+  const showLive = role === 'HALL_MANAGER' ? activeSection === 'Tickets' : ['Command center', 'Tickets'].includes(activeSection);
   const showCommand = activeSection === 'Command center' || activeSection === 'Hall overview';
   const hallOptions = liveMetrics.halls ?? [];
   const filtersActive = Boolean(statusFilter || categoryFilter || hallFilter || createdFrom || createdTo || search);
@@ -1567,9 +1624,21 @@ export function ManagementWorkspace({ role }: { role: 'HALL_MANAGER' | 'ADMIN' }
     { label: 'Avg. response', value: duration(liveMetrics.avgResponseSeconds) },
   ];
 
+  const attentionItems = role === 'HALL_MANAGER' ? attentionSource.filter((ticket) => attentionReason(ticket)) : [];
+
   useEffect(() => {
+    if (role === 'HALL_MANAGER') {
+      setSelected((current) => {
+        if (!current) return null;
+        return items.find((ticket) => ticket.id === current.id)
+          ?? attentionSource.find((ticket) => ticket.id === current.id)
+          ?? queuedItems.find((ticket) => ticket.id === current.id)
+          ?? current;
+      });
+      return;
+    }
     setSelected((current) => current ? items.find((ticket) => ticket.id === current.id) ?? null : items[0] ?? null);
-  }, [items]);
+  }, [items, attentionSource, queuedItems, role]);
 
   const loadManagement = useCallback(async () => {
     try {
@@ -1674,7 +1743,7 @@ export function ManagementWorkspace({ role }: { role: 'HALL_MANAGER' | 'ADMIN' }
   }, [lastUpdatedAt]);
   async function openManagerAlert(alert: { ticketId?: string | null }) {
     setManagerToast(null);
-    setActiveSection(role === 'ADMIN' ? 'Tickets' : 'Live tickets');
+    setActiveSection('Tickets');
     if (!alert.ticketId) return;
     const existing = items.find((ticket) => ticket.id === alert.ticketId);
     if (existing) { setSelected(existing); return; }
@@ -1698,7 +1767,7 @@ export function ManagementWorkspace({ role }: { role: 'HALL_MANAGER' | 'ADMIN' }
     });
     if (!response.ok) { setManagementError(await apiErrorMessage(response, 'Ticket action failed')); return false; }
     setManagementError('');
-    await refresh();
+    await Promise.all([refresh(), refreshQueue(), refreshAttention()]);
     return true;
   }
 
@@ -1719,7 +1788,7 @@ export function ManagementWorkspace({ role }: { role: 'HALL_MANAGER' | 'ADMIN' }
       return false;
     }
     setManagementError('');
-    await refresh();
+    await Promise.all([refresh(), refreshQueue(), refreshAttention()]);
     return true;
   }
 
@@ -1955,13 +2024,54 @@ export function ManagementWorkspace({ role }: { role: 'HALL_MANAGER' | 'ADMIN' }
     if (mastersResponse.ok) setMasters(await mastersResponse.json());
   }
 
+  const eligibleStaff = workforce.filter((membership) => membership.availability === 'ON_DUTY' && (membership.user.approvalStatus ?? 'APPROVED') === 'APPROVED' && membership.user.status !== 'DISABLED');
+  const ticketPanel = selected ? (
+    <TicketDrawer
+      ticket={selected}
+      timing={timings[selected.id]}
+      detail={detail}
+      canAdmin={role === 'ADMIN'}
+      canEmergencyClose={selected.capabilities.emergencyClose}
+      canAdvance={selected.capabilities.advanceHallManagerWork}
+      canVerifyOtp={!!selected.capabilities.verifyStallOtp}
+      eligibleStaff={eligibleStaff}
+      activityOpen={role === 'HALL_MANAGER'}
+      onBack={role === 'HALL_MANAGER' ? () => setSelected(null) : undefined}
+      actionError={managementError && !managementStatusIsSuccess(managementError) ? managementError : ''}
+      onAdvance={() => void runTicketAction('/transition', { to: selected.status === 'ACCEPTED' ? 'IN_PROGRESS' : selected.status === 'IN_PROGRESS' ? 'AWAITING_OTP' : 'ACCEPTED' })}
+      onPing={(message) => runTicketAction('/ping', { message })}
+      onReassign={reassignSelected}
+      onReopen={(reason) => transitionSelected('REOPENED', reason)}
+      onEscalate={(reason) => transitionSelected('ESCALATED', reason)}
+      onPrioritize={(reason) => runTicketAction('/prioritize', { reason })}
+      onSetServicePriority={(servicePriority, reason) => runTicketAction('/service-priority', { servicePriority, reason })}
+      onCancel={(reason) => transitionSelected('CANCELLED', reason)}
+      onOverrideClose={(reason) => runTicketAction('/override-close', { reason })}
+      onVerifyOtp={async (otp) => {
+        const response = await apiFetch('/api/tickets/' + selected.id + '/otp/verify', {
+          method: 'POST',
+          credentials: 'include',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ otp }),
+        });
+        if (!response.ok) {
+          setManagementError(await apiErrorMessage(response, 'Could not verify the completion code'));
+          return false;
+        }
+        setManagementError('Completion verified. Ticket closed.');
+        await Promise.all([refresh(), refreshQueue(), refreshAttention()]);
+        return true;
+      }}
+    />
+  ) : null;
+
   return (
     <OperationalClock timeZone={profile?.scopes[0]?.event.timezone}>
     <div className="app-shell">
-      <aside className="sidebar">
+      <aside className={role === 'HALL_MANAGER' ? 'sidebar hall-manager' : 'sidebar'}>
         <div className="brand"><span>E</span>EveOps</div>
         <nav aria-label={role === 'ADMIN' ? 'Admin navigation' : 'Hall Manager navigation'}>
-          {navByRole[role].map((item) => <button className={activeSection === item ? 'active' : ''} onClick={() => setActiveSection(item)} key={item}>{item}{item === 'Live tickets' && <i>{liveMetrics.open ?? '—'}</i>}{item === 'Exceptions' && <i>{liveMetrics.open == null && liveMetrics.queued == null ? '—' : (liveMetrics.overdue ?? 0) + (liveMetrics.escalated ?? 0) + (liveMetrics.complaints ?? 0)}</i>}{(item === 'Workforce' || item === 'Staff') && role === 'ADMIN' && pendingApprovals.length > 0 && <i>{pendingApprovals.length}</i>}</button>)}
+          {navByRole[role].map((item) => <button className={activeSection === item ? 'active' : ''} aria-current={activeSection === item ? 'page' : undefined} onClick={() => { setActiveSection(item); if (role === 'HALL_MANAGER') { setSelected(null); window.scrollTo({ top: 0 }); } }} key={item}>{item}{item === 'Attention' && attentionItems.length > 0 ? <i>{attentionItems.length}</i> : null}{item === 'Workforce' && role === 'ADMIN' && pendingApprovals.length > 0 && <i>{pendingApprovals.length}</i>}</button>)}
           {role === 'ADMIN' && <Link href="/admin/registrations">Registrations</Link>}
         </nav>
         <div className="user"><span>{role === 'ADMIN' ? 'AD' : 'HM'}</span><div><strong>{profile?.name ?? (role === 'ADMIN' ? 'Event Admin' : 'Hall Manager')}</strong><small>{role.replace('_', ' ')}</small></div></div>
@@ -1971,13 +2081,13 @@ export function ManagementWorkspace({ role }: { role: 'HALL_MANAGER' | 'ADMIN' }
         <header className="topbar"><div><span className="eyebrow">{profile?.scopes[0]?.event.name ?? 'EveOps event'} · {connection === 'live' ? 'Live' : 'Reconnecting'}</span><h1>{title}</h1></div><div className="top-actions"><span>{profile?.scopes[0]?.hall?.name ?? 'All scoped halls'}</span><button onClick={() => void loadNotifications()}>Notifications · {notifications.filter((notification) => !notification.readAt).length}</button></div></header>
         {role === 'HALL_MANAGER' && profile?.id ? <WorkAlertHost userId={profile.id} /> : null}
         {managerToast && <div className="alert-line" role="status"><span>{managerToast.text}</span><button type="button" onClick={() => void openManagerAlert(managerToast)}>Open</button><button type="button" onClick={() => setManagerToast(null)}>Dismiss</button></div>}
-        {managementError && <div className={managementError.startsWith('Export queued') || managementError.startsWith('Created ') || managementError.includes('sent for Admin approval') || managementError.startsWith('Staff approved') || managementError.startsWith('Staff request rejected') || managementError.endsWith('created.') || managementError.startsWith('SLA targets') || managementError.includes('Temporary password must be changed') || managementError.startsWith('Completion verified') ? 'alert-line' : 'form-error'} role="status">{managementError}</div>}
+        {managementError && <div className={managementStatusIsSuccess(managementError) ? 'alert-line' : 'form-error'} role="status">{managementError}</div>}
         {showNotifications && <section className="notification-panel">{notifications.length ? notifications.slice(0, 10).map((notification) => <button key={notification.id} onClick={() => void apiFetch('/api/notifications/' + notification.id + '/read', { method: 'PATCH', credentials: 'include' }).then(() => loadNotifications())}><strong>{notification.type.replaceAll('_', ' ')}</strong><span>{eventTime(notification.sentAt)}</span></button>) : <p className="empty-state">No notifications.</p>}</section>}
-        <section className="metric-grid" aria-label="Operational metrics">{metrics.map((metric) => <article key={metric.label} className={metric.critical ? 'metric critical' : 'metric'}><span>{metric.label}</span><strong>{metric.value}</strong><small>Updated live</small></article>)}</section>
+        {role !== 'HALL_MANAGER' && <section className="metric-grid" aria-label="Operational metrics">{metrics.map((metric) => <article key={metric.label} className={metric.critical ? 'metric critical' : 'metric'}><span>{metric.label}</span><strong>{metric.value}</strong><small>Updated live</small></article>)}</section>}
         {showCommand && <CommandInsights metrics={liveMetrics} />}
         {(activeSection === 'Staff' || activeSection === 'Workforce') && (() => {
           const visibleWorkforce = workforce.filter((membership) => workforceFilter === 'ALL' || membership.user.approvalStatus === workforceFilter);
-          return <section className="portfolio-list"><div className="section-title"><div><h2>Workforce</h2><p>{role === 'HALL_MANAGER' ? 'Create Electrical or House Help staff for Admin approval. Ticket age is never edited here.' : 'Approve Hall Manager staff requests and manage event workforce identities.'}</p></div><div className="drawer-actions"><select aria-label="Approval filter" value={workforceFilter} onChange={(event) => setWorkforceFilter(event.target.value as typeof workforceFilter)}><option value="ALL">All</option><option value="PENDING_APPROVAL">Pending approval</option><option value="APPROVED">Approved</option><option value="REJECTED">Rejected</option></select><button onClick={() => { const next = !showAddPerson; setShowAddPerson(next); setPersonFormError(''); if (next) { setPersonRole('STAFF'); setPersonServiceCategory('HOUSE_HELP'); const halls = role === 'ADMIN' ? masters.flatMap((event) => event.halls).filter((hall) => hall.active !== false) : (profile?.scopes.flatMap((scope) => scope.hall ? [{ id: scope.hall.id, code: scope.hall.code, name: scope.hall.name }] : []) ?? []); setPersonHallId(halls[0]?.id ?? ''); if (role === 'ADMIN' && !masters.length) void apiFetch('/api/management/masters', { credentials: 'include', cache: 'no-store' }).then(async (response) => { if (response.ok) setMasters(await response.json() as typeof masters); }); } }}>{showAddPerson ? 'Close form' : (role === 'HALL_MANAGER' ? 'Add Staff' : 'Add person')}</button></div></div>{role === 'ADMIN' && !!pendingApprovals.length && <div className="portfolio-list"><div className="section-title"><div><h2>Pending approvals</h2><p>{pendingApprovals.length} awaiting review</p></div></div>{pendingApprovals.map((person) => <article key={person.id}><div><strong>{person.name}</strong><span>{person.employeeCode ?? 'No public ID'} · {person.memberships[0]?.pool.category ?? 'Staff'}</span></div><div><span>Requested by</span><strong>{person.requestedBy?.name ?? 'Hall Manager'}</strong></div><div><span>Created</span><strong>{eventTime(person.createdAt)}</strong></div><div className="drawer-actions"><button className="primary" type="button" onClick={() => void approvePerson(person.id)}>Approve</button><button className="critical-button" type="button" onClick={() => void rejectPerson(person.id)}>{rejectUserId === person.id ? 'Confirm reject' : 'Reject'}</button></div>{rejectUserId === person.id && <form className="authority-action" onSubmit={(event) => { event.preventDefault(); void rejectPerson(person.id); }}><label>Rejection reason<span aria-hidden="true"> *</span><input value={rejectReason} onChange={(change) => setRejectReason(change.target.value)} required minLength={3} /></label>{rejectError && <p className="form-error" role="alert">{rejectError}</p>}<div className="drawer-actions"><button type="button" onClick={() => { setRejectUserId(null); setRejectError(''); }}>Cancel</button><button className="critical-button" type="submit">Submit rejection</button></div></form>}</article>)}</div>}{showAddPerson && (() => {
+          return <section className="portfolio-list"><div className="section-title"><div><h2>Workforce</h2><p>{role === 'HALL_MANAGER' ? 'Request Electrical or House Help staff. An Admin approves them before they can sign in. Stall registration and exhibitor logins stay with Admin.' : 'Approve Hall Manager staff requests and manage event workforce identities.'}</p></div><div className="drawer-actions"><select aria-label="Approval filter" value={workforceFilter} onChange={(event) => setWorkforceFilter(event.target.value as typeof workforceFilter)}><option value="ALL">All</option><option value="PENDING_APPROVAL">Pending approval</option><option value="APPROVED">Approved</option><option value="REJECTED">Rejected</option></select><button onClick={() => { const next = !showAddPerson; setShowAddPerson(next); setPersonFormError(''); if (next) { setPersonRole('STAFF'); setPersonServiceCategory('HOUSE_HELP'); const halls = role === 'ADMIN' ? masters.flatMap((event) => event.halls).filter((hall) => hall.active !== false) : (profile?.scopes.flatMap((scope) => scope.hall ? [{ id: scope.hall.id, code: scope.hall.code, name: scope.hall.name }] : []) ?? []); setPersonHallId(halls[0]?.id ?? ''); if (role === 'ADMIN' && !masters.length) void apiFetch('/api/management/masters', { credentials: 'include', cache: 'no-store' }).then(async (response) => { if (response.ok) setMasters(await response.json() as typeof masters); }); } }}>{showAddPerson ? 'Close form' : (role === 'HALL_MANAGER' ? 'Add Staff' : 'Add person')}</button></div></div>{role === 'ADMIN' && !!pendingApprovals.length && <div className="portfolio-list"><div className="section-title"><div><h2>Pending approvals</h2><p>{pendingApprovals.length} awaiting review</p></div></div>{pendingApprovals.map((person) => <article key={person.id}><div><strong>{person.name}</strong><span>{person.employeeCode ?? 'No public ID'} · {person.memberships[0]?.pool.category ?? 'Staff'}</span></div><div><span>Requested by</span><strong>{person.requestedBy?.name ?? 'Hall Manager'}</strong></div><div><span>Created</span><strong>{eventTime(person.createdAt)}</strong></div><div className="drawer-actions"><button className="primary" type="button" onClick={() => void approvePerson(person.id)}>Approve</button><button className="critical-button" type="button" onClick={() => void rejectPerson(person.id)}>{rejectUserId === person.id ? 'Confirm reject' : 'Reject'}</button></div>{rejectUserId === person.id && <form className="authority-action" onSubmit={(event) => { event.preventDefault(); void rejectPerson(person.id); }}><label>Rejection reason<span aria-hidden="true"> *</span><input value={rejectReason} onChange={(change) => setRejectReason(change.target.value)} required minLength={3} /></label>{rejectError && <p className="form-error" role="alert">{rejectError}</p>}<div className="drawer-actions"><button type="button" onClick={() => { setRejectUserId(null); setRejectError(''); }}>Cancel</button><button className="critical-button" type="submit">Submit rejection</button></div></form>}</article>)}</div>}{showAddPerson && (() => {
             const adminHalls = masters.flatMap((event) => event.halls).filter((hall) => hall.active !== false);
             const hmHalls = profile?.scopes.flatMap((scope) => scope.hall ? [{ id: scope.hall.id, code: scope.hall.code, name: scope.hall.name }] : []) ?? [];
             const hallOptions = role === 'ADMIN' ? adminHalls : hmHalls;
@@ -2044,9 +2154,9 @@ export function ManagementWorkspace({ role }: { role: 'HALL_MANAGER' | 'ADMIN' }
                 <button className="primary" type="submit" disabled={personSubmitting || hallOptions.length === 0}>{personSubmitting ? 'Creating…' : 'Create account'}</button>
               </div>
             </form>;
-          })()}{visibleWorkforce.length ? visibleWorkforce.map((membership) => <article key={membership.user.id + membership.pool.category + membership.pool.subtype}><div><strong>{membership.user.name}</strong><span>{membership.user.employeeCode ?? 'No public ID'}{membership.user.email ? (' · ' + membership.user.email) : ''}</span></div><div><span>Service</span><strong>{membership.pool.category} · {membership.pool.subtype}</strong></div><div><span>Availability</span><strong>{membership.availability.replaceAll('_', ' ')}</strong></div><div><span>Load</span><strong>{membership.activeAssignmentCount ?? membership.activeCount ?? 0}/{membership.capacity ?? 1}</strong></div><div><span>Approval</span><strong>{(membership.user.approvalStatus ?? 'APPROVED').replaceAll('_', ' ')}</strong></div><div><span>Account</span><strong>{membership.user.status ?? 'ACTIVE'}</strong></div>{membership.user.rejectionReason && <div><span>Rejection</span><strong>{membership.user.rejectionReason}</strong></div>}{role === 'ADMIN' && membership.user.approvalStatus === 'PENDING_APPROVAL' && <div className="drawer-actions"><button className="primary" type="button" onClick={() => void approvePerson(membership.user.id)}>Approve</button><button className="critical-button" type="button" onClick={() => void rejectPerson(membership.user.id)}>{rejectUserId === membership.user.id ? 'Confirm reject' : 'Reject'}</button></div>}{rejectUserId === membership.user.id && <form className="authority-action" onSubmit={(event) => { event.preventDefault(); void rejectPerson(membership.user.id); }}><label>Rejection reason<span aria-hidden="true"> *</span><input value={rejectReason} onChange={(change) => setRejectReason(change.target.value)} required minLength={3} /></label>{rejectError && <p className="form-error" role="alert">{rejectError}</p>}<div className="drawer-actions"><button type="button" onClick={() => { setRejectUserId(null); setRejectError(''); }}>Cancel</button><button className="critical-button" type="submit">Submit rejection</button></div></form>}<div className="drawer-actions">{capacityEditUserId === membership.user.id ? <form className="authority-action" onSubmit={(event) => { event.preventDefault(); const nextCapacity = Number(capacityValue); if (Number.isInteger(nextCapacity) && nextCapacity >= 1) void updatePersonCapacity(membership.user.id, nextCapacity); }}><label>Capacity<span aria-hidden="true"> *</span><input type="number" min={1} max={20} value={capacityValue} onChange={(change) => setCapacityValue(change.target.value)} required /></label><div className="drawer-actions"><button type="button" onClick={() => setCapacityEditUserId(null)}>Cancel</button><button className="primary" type="submit">Save capacity</button></div></form> : <button type="button" onClick={() => { setCapacityEditUserId(membership.user.id); setCapacityValue(String(membership.capacity ?? 1)); }}>Edit capacity</button>}<button type="button" onClick={() => void updatePersonStatus(membership.user.id, membership.user.status === 'DISABLED' ? 'ACTIVE' : 'DISABLED')}>{membership.user.status === 'DISABLED' ? 'Activate' : 'Deactivate'}</button></div></article>) : <p className="empty-state">No workforce identities match this filter.</p>}</section>;
+          })()}{visibleWorkforce.length ? visibleWorkforce.map((membership) => <article key={membership.user.id + membership.pool.category + membership.pool.subtype}><div><strong>{membership.user.name}</strong><span>{membership.user.employeeCode ?? 'No public ID'}{membership.user.email ? (' · ' + membership.user.email) : ''}</span></div><div><span>Service</span><strong>{serviceLabel(membership.pool.category)} · {membership.pool.subtype}</strong></div><div><span>Availability</span><strong>{membership.availability.toLowerCase().replaceAll('_', ' ').replace(/\b\w/g, (letter) => letter.toUpperCase())}</strong></div><div><span>Load</span><strong>{membership.activeAssignmentCount ?? membership.activeCount ?? 0}/{membership.capacity ?? 1}</strong></div><div><span>Approval</span><strong>{(membership.user.approvalStatus ?? 'APPROVED').replaceAll('_', ' ')}</strong></div><div><span>Account</span><strong>{membership.user.status ?? 'ACTIVE'}</strong></div>{membership.user.rejectionReason && <div><span>Rejection</span><strong>{membership.user.rejectionReason}</strong></div>}{role === 'ADMIN' && membership.user.approvalStatus === 'PENDING_APPROVAL' && <div className="drawer-actions"><button className="primary" type="button" onClick={() => void approvePerson(membership.user.id)}>Approve</button><button className="critical-button" type="button" onClick={() => void rejectPerson(membership.user.id)}>{rejectUserId === membership.user.id ? 'Confirm reject' : 'Reject'}</button></div>}{rejectUserId === membership.user.id && <form className="authority-action" onSubmit={(event) => { event.preventDefault(); void rejectPerson(membership.user.id); }}><label>Rejection reason<span aria-hidden="true"> *</span><input value={rejectReason} onChange={(change) => setRejectReason(change.target.value)} required minLength={3} /></label>{rejectError && <p className="form-error" role="alert">{rejectError}</p>}<div className="drawer-actions"><button type="button" onClick={() => { setRejectUserId(null); setRejectError(''); }}>Cancel</button><button className="critical-button" type="submit">Submit rejection</button></div></form>}<div className="drawer-actions">{capacityEditUserId === membership.user.id ? <form className="authority-action" onSubmit={(event) => { event.preventDefault(); const nextCapacity = Number(capacityValue); if (Number.isInteger(nextCapacity) && nextCapacity >= 1) void updatePersonCapacity(membership.user.id, nextCapacity); }}><label>Capacity<span aria-hidden="true"> *</span><input type="number" min={1} max={20} value={capacityValue} onChange={(change) => setCapacityValue(change.target.value)} required /></label><div className="drawer-actions"><button type="button" onClick={() => setCapacityEditUserId(null)}>Cancel</button><button className="primary" type="submit">Save capacity</button></div></form> : <button type="button" onClick={() => { setCapacityEditUserId(membership.user.id); setCapacityValue(String(membership.capacity ?? 1)); }}>Edit capacity</button>}<button type="button" onClick={() => void updatePersonStatus(membership.user.id, membership.user.status === 'DISABLED' ? 'ACTIVE' : 'DISABLED')}>{membership.user.status === 'DISABLED' ? 'Activate' : 'Deactivate'}</button></div></article>) : <p className="empty-state">No workforce identities match this filter.</p>}</section>;
         })()}
-        {activeSection === 'Exceptions' && <section className="portfolio-list"><div className="section-title"><div><h2>Exception inbox</h2><p>Queued, overdue, complaint, reopened, and escalated tickets</p></div></div>{exceptions.length ? exceptions.map((ticket) => <div key={ticket.id}><TicketCard ticket={ticket} /><div className="drawer-actions"><button type="button" onClick={() => { setSelected(ticket); setActiveSection(role === 'ADMIN' ? 'Tickets' : 'Live tickets'); }}>Open ticket</button></div></div>) : <p className="empty-state">No unresolved exceptions.</p>}</section>}
+        {activeSection === 'Exceptions' && <section className="portfolio-list"><div className="section-title"><div><h2>Exception inbox</h2><p>Queued, overdue, complaint, reopened, and escalated tickets</p></div></div>{exceptions.length ? exceptions.map((ticket) => <div key={ticket.id}><TicketCard ticket={ticket} /><div className="drawer-actions"><button type="button" onClick={() => { setSelected(ticket); setActiveSection('Tickets'); }}>Open ticket</button></div></div>) : <p className="empty-state">No unresolved exceptions.</p>}</section>}
         {activeSection === 'Audit' && <section className="portfolio-list"><div className="section-title"><div><h2>Audit history</h2><p>Append-only scoped operational events</p></div></div>{auditEvents.map((event) => <article key={event.id}><div><strong>{event.ticket.publicNo}</strong><span>{event.actor?.name ?? 'System'}</span></div><div><span>Action</span><strong>{event.eventType.replaceAll('_', ' ')}</strong></div><div><span>Server time</span><strong>{eventTime(event.createdAt)}</strong></div></article>)}</section>}
         {(activeSection === 'Masters' || activeSection === 'Halls / Zones / Stalls') && <section className="portfolio-list"><div className="section-title"><div><h2>Event setup</h2><p>Halls, zones, stalls, and service timing</p></div><div className="drawer-actions"><button type="button" onClick={() => { setMasterForm(masterForm === 'hall' ? null : 'hall'); setMasterFormError(''); }}>Add hall</button><button type="button" onClick={() => { setMasterForm(masterForm === 'zone' ? null : 'zone'); setMasterFormError(''); }}>Add zone</button><button type="button" onClick={() => { setMasterForm(masterForm === 'stall' ? null : 'stall'); setMasterFormError(''); }}>Add stall</button></div></div>
           {masterForm === 'hall' && <form className="authority-action" onSubmit={(event) => void createMaster(event)}><label>Hall code<span aria-hidden="true"> *</span><input name="code" required minLength={1} /></label><label>Hall name<span aria-hidden="true"> *</span><input name="name" required minLength={1} /></label><label>Status<select name="status" defaultValue="ACTIVE"><option value="ACTIVE">Active</option><option value="INACTIVE">Inactive</option></select></label>{masterFormError && <p className="form-error" role="alert">{masterFormError}</p>}<div className="drawer-actions"><button type="button" onClick={() => setMasterForm(null)}>Cancel</button><button className="primary" type="submit" disabled={masterSubmitting}>{masterSubmitting ? 'Saving…' : 'Create hall'}</button></div></form>}
@@ -2054,27 +2164,28 @@ export function ManagementWorkspace({ role }: { role: 'HALL_MANAGER' | 'ADMIN' }
           {masterForm === 'stall' && <form className="authority-action" onSubmit={(event) => void createMaster(event)}><label>Zone<span aria-hidden="true"> *</span><select name="zoneId" required>{masters.flatMap((event) => event.halls.flatMap((hall) => hall.zones.map((zone) => <option key={zone.id} value={zone.id}>{hall.name} · {zone.code}</option>)))}</select></label><label>Stall code<span aria-hidden="true"> *</span><input name="stallCode" required minLength={1} /></label><label>Exhibitor<span aria-hidden="true"> *</span><input name="exhibitorName" required minLength={1} /></label><label>Contact<input name="contact" /></label><label>Service priority<select name="servicePriority" defaultValue="MEDIUM"><option value="HIGH">High</option><option value="MEDIUM">Medium</option><option value="LOW">Low</option></select></label><label>Active<select name="active" defaultValue="true"><option value="true">Active</option><option value="false">Inactive</option></select></label>{masterFormError && <p className="form-error" role="alert">{masterFormError}</p>}<div className="drawer-actions"><button type="button" onClick={() => setMasterForm(null)}>Cancel</button><button className="primary" type="submit" disabled={masterSubmitting}>{masterSubmitting ? 'Saving…' : 'Create stall'}</button></div></form>}
           {!masters.length ? <p className="empty-state">No master hierarchy is available for your event scope.</p> : masters.map((event) => <div key={event.id}><article><div><strong>{event.name}</strong><span>{event.timezone ? `Timezone ${event.timezone}` : 'Event masters'}</span></div><div><span>Halls</span><strong>{event.halls.length}</strong></div><div><span>Zones</span><strong>{event.halls.reduce((sum, hall) => sum + hall.zones.length, 0)}</strong></div><div><span>Stalls</span><strong>{event.halls.reduce((sum, hall) => sum + hall.zones.reduce((zoneSum, zone) => zoneSum + zone.stalls.length, 0), 0)}</strong></div></article>{event.halls.map((hall) => <article key={hall.id}><div><strong>{hall.name}</strong><span>{hall.zones.length} zones · {hall.zones.reduce((sum, zone) => sum + zone.stalls.length, 0)} stalls</span></div><div><span>Zones</span><strong>{hall.zones.map((zone) => zone.code).join(', ') || 'None'}</strong></div><div><span>Stalls</span><strong>{hall.zones.flatMap((zone) => zone.stalls.map((stall) => stall.stallCode)).join(', ') || 'None'}</strong></div></article>)}{event.pools.map((pool) => <article key={pool.id}><div><strong>{pool.category} · {pool.subtype}</strong><span>{pool.active ? 'Active' : 'Inactive'}</span></div><div><span>Response SLA</span><strong>{duration(pool.responseTargetSeconds)}</strong></div><div><span>Resolution SLA</span><strong>{duration(pool.resolutionTargetSeconds)}</strong></div>{slaEditPoolId === pool.id ? <form className="authority-action" onSubmit={(formEvent) => void updatePool(formEvent, pool)}><label>Response target (seconds)<span aria-hidden="true"> *</span><input name="responseTargetSeconds" type="number" min={1} required defaultValue={pool.responseTargetSeconds} /></label><label>Resolution target (seconds)<span aria-hidden="true"> *</span><input name="resolutionTargetSeconds" type="number" min={1} required defaultValue={pool.resolutionTargetSeconds} /></label>{slaFormError && <p className="form-error" role="alert">{slaFormError}</p>}<div className="drawer-actions"><button type="button" onClick={() => setSlaEditPoolId(null)}>Cancel</button><button className="primary" type="submit" disabled={slaSubmitting}>{slaSubmitting ? 'Saving…' : 'Save SLA'}</button></div></form> : <button type="button" onClick={() => { setSlaEditPoolId(pool.id); setSlaFormError(''); }}>Edit SLA</button>}</article>)}</div>)}</section>}
         {(activeSection === 'Reports') && <section className="portfolio-list"><div className="section-title"><div><h2>Reports</h2><p>Scoped metrics for the selected creation range, plus authorized CSV export jobs</p></div><div className="drawer-actions"><label className="sr-only" htmlFor="report-range">Report range</label><select id="report-range" aria-label="Report range" value={reportRange} onChange={(event) => setReportRange(event.target.value as 'live' | 'today' | 'custom')}><option value="live">All tickets in scope</option><option value="today">Created today</option><option value="custom">Custom range</option></select>{reportRange === 'custom' && <><label className="sr-only" htmlFor="report-from">From</label><input id="report-from" aria-label="Report from" type="datetime-local" value={reportFrom} onChange={(event) => setReportFrom(event.target.value)} /><label className="sr-only" htmlFor="report-to">To</label><input id="report-to" aria-label="Report to" type="datetime-local" value={reportTo} onChange={(event) => setReportTo(event.target.value)} /></>}<button type="button" onClick={() => void exportView()}>Queue CSV export</button></div></div><CommandInsights metrics={liveMetrics} />{exports.length ? exports.map((job) => <article key={job.id}><div><strong>{job.format}</strong><span>{eventTime(job.createdAt)}</span></div><div><span>Status</span><strong>{job.status}</strong></div><div><span>Rows</span><strong>{job.rowCount ?? 'Pending'}</strong></div>{job.status === 'READY' && <a href={'/api/management/exports/' + job.id + '/download'}>Download</a>}</article>) : <p className="empty-state">No export jobs yet. Queue an export from Live operations or Reports.</p>}</section>}
-        {showLive && <section className="workspace">
+        {role === 'HALL_MANAGER' && activeSection === 'Attention' && <section className={selected ? 'workspace manager-focus' : 'workspace'} aria-label="Needs attention">
           <div className="operations">
-            <div className="section-title"><div><h2>Live operations</h2><p>{total} scoped tickets · server-authoritative status</p></div>{role === 'ADMIN' && <button onClick={() => void exportView()}>Export view</button>}</div>
-            <div className="filters"><select aria-label="Status filter" value={statusFilter} onChange={(event) => setStatusFilter(event.target.value)}><option value="">All statuses</option>{Object.keys(statusLabels).map((status) => <option key={status} value={status}>{statusLabels[status as TicketStatus]}</option>)}</select><select aria-label="Service filter" value={categoryFilter} onChange={(event) => setCategoryFilter(event.target.value)}><option value="">All services</option><option value="ELECTRICAL">Electrical</option><option value="HOUSE_HELP">House Help</option><option value="HALL_MANAGER">Hall Manager</option></select>{hallOptions.length > 1 && <select aria-label="Hall filter" value={hallFilter} onChange={(event) => setHallFilter(event.target.value)}><option value="">All halls</option>{hallOptions.map((hall) => <option key={hall.id} value={hall.id}>{hall.code} · {hall.name}</option>)}</select>}<label className="sr-only" htmlFor="created-from">Created from</label><input id="created-from" aria-label="Created from" type="datetime-local" value={createdFrom} onChange={(event) => setCreatedFrom(event.target.value)} /><label className="sr-only" htmlFor="created-to">Created to</label><input id="created-to" aria-label="Created to" type="datetime-local" value={createdTo} onChange={(event) => setCreatedTo(event.target.value)} /><label className="sr-only" htmlFor="ticket-search">Search tickets</label><input id="ticket-search" value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search ticket or stall" autoFocus={activeSection === 'Search'} />{filtersActive && <button type="button" onClick={() => { setStatusFilter(''); setCategoryFilter(''); setHallFilter(''); setCreatedFrom(''); setCreatedTo(''); setSearch(''); }}>Clear filters</button>}</div>
-            {loading ? <p className="empty-state">Loading live operations…</p> : loadError ? <p className="form-error">{loadError}</p> : !items.length ? <p className="empty-state">{filtersActive ? 'No tickets match these filters.' : 'No tickets match the current scope.'}{filtersActive && <> <button type="button" onClick={() => { setStatusFilter(''); setCategoryFilter(''); setHallFilter(''); setCreatedFrom(''); setCreatedTo(''); setSearch(''); }}>Clear filters</button></>}</p> : <><div className="table-wrap"><table><thead><tr><th>Ticket</th><th>Location / issue</th><th>Status</th><th>Timing</th><th>Response</th><th>Total</th><th>Assignee</th><th>SLA</th></tr></thead><tbody>{items.map((ticket) => <tr key={ticket.no} tabIndex={0} className={selected?.no === ticket.no ? 'selected' : ''} onClick={() => setSelected(ticket)} onKeyDown={(event) => { if (event.key === 'Enter') setSelected(ticket); }}><td><strong>{ticket.no}</strong><small>{ticket.service}</small></td><td><strong>{ticket.location}</strong><small>{ticket.description}</small></td><td><Status value={ticket.status} /></td><td className={ticket.priority ? 'red' : ''}><TimingFacts ticket={ticket} /></td><td>{duration(timings[ticket.id]?.assignToAcceptSeconds)}</td><td>{duration(timings[ticket.id]?.totalResolutionSeconds)}</td><td>{ticket.assignee}</td><td><span className={ticket.slaState === 'On track' ? 'sla' : 'sla breach'}>{ticket.slaState}</span></td></tr>)}</tbody></table></div>{nextCursor && <button onClick={() => void loadMore()}>Load more</button>}</>}
+            <div className="section-title"><div><h2>Needs attention</h2><p>Newly raised, reopened, complained, escalated, urgent, and overdue work. Waiting tickets stay in Queue.</p></div></div>
+            {attentionLoading ? <p className="empty-state">Loading work that needs attention…</p> : attentionError ? <p className="form-error" role="alert">{attentionError}</p> : !attentionItems.length ? <p className="empty-state">Nothing needs attention right now.</p> : <div className="manager-list">{attentionItems.map((ticket) => <button type="button" key={ticket.id} className={selected?.id === ticket.id ? 'manager-card selected' : 'manager-card'} onClick={() => setSelected(ticket)}><strong>{attentionReason(ticket)}</strong><span>{ticket.location}</span><span>{ticket.service}</span><span>{ticket.no} · {statusLabels[ticket.status]}</span><span>Next: {managerNextStep(ticket)}</span></button>)}</div>}{attentionCursor && <button type="button" onClick={() => void loadMoreAttention()}>Load more</button>}
           </div>
-          {selected && <TicketDrawer ticket={selected} timing={timings[selected.id]} detail={detail} canAdmin={role === 'ADMIN'} canEmergencyClose={selected.capabilities.emergencyClose} canAdvance={selected.capabilities.advanceHallManagerWork} canVerifyOtp={!!selected.capabilities.verifyStallOtp} eligibleStaff={workforce.filter((membership) => membership.availability === 'ON_DUTY' && (membership.user.approvalStatus ?? 'APPROVED') === 'APPROVED' && membership.user.status !== 'DISABLED')} onAdvance={() => void runTicketAction('/transition', { to: selected.status === 'ACCEPTED' ? 'IN_PROGRESS' : selected.status === 'IN_PROGRESS' ? 'AWAITING_OTP' : 'ACCEPTED' })} onPing={(message) => runTicketAction('/ping', { message })} onReassign={reassignSelected} onReopen={(reason) => transitionSelected('REOPENED', reason)} onEscalate={(reason) => transitionSelected('ESCALATED', reason)} onPrioritize={(reason) => runTicketAction('/prioritize', { reason })} onSetServicePriority={(servicePriority, reason) => runTicketAction('/service-priority', { servicePriority, reason })} onCancel={(reason) => transitionSelected('CANCELLED', reason)} onOverrideClose={(reason) => runTicketAction('/override-close', { reason })} onVerifyOtp={async (otp) => {
-            const response = await apiFetch('/api/tickets/' + selected.id + '/otp/verify', {
-              method: 'POST',
-              credentials: 'include',
-              headers: { 'content-type': 'application/json' },
-              body: JSON.stringify({ otp }),
-            });
-            if (!response.ok) {
-              setManagementError(await apiErrorMessage(response, 'Could not verify the completion code'));
-              return false;
-            }
-            setManagementError('Completion verified. Ticket closed.');
-            await refresh();
-            return true;
-          }} />}
+          {ticketPanel}
+        </section>}
+        {role === 'HALL_MANAGER' && activeSection === 'Queue' && <section className={selected ? 'workspace manager-focus' : 'workspace'} aria-label="Waiting queue">
+          <div className="operations">
+            <div className="section-title"><div><h2>Waiting queue</h2><p>{queueTotal} waiting · moved-ahead tickets, then high, medium, and low stall priority, then oldest. Urgency does not change this order. Assigned work stays with the worker.</p></div></div>
+            <div className="filters"><select aria-label="Queue service" value={categoryFilter} onChange={(event) => setCategoryFilter(event.target.value)}><option value="">All services</option><option value="ELECTRICAL">Electrical</option><option value="HOUSE_HELP">House Help</option><option value="HALL_MANAGER">Hall Manager</option></select>{hallOptions.length > 1 && <select aria-label="Queue hall" value={hallFilter} onChange={(event) => setHallFilter(event.target.value)}><option value="">All halls</option>{hallOptions.map((hall) => <option key={hall.id} value={hall.id}>{hall.code} · {hall.name}</option>)}</select>}<label className="sr-only" htmlFor="queue-search">Find a waiting ticket</label><input id="queue-search" value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Ticket number or stall" />{(categoryFilter || hallFilter || search) && <button type="button" onClick={() => { setCategoryFilter(''); setHallFilter(''); setSearch(''); }}>Clear filters</button>}</div>
+            {queueLoading ? <p className="empty-state">Loading the waiting queue…</p> : queueError ? <p className="form-error" role="alert">{queueError}</p> : !queuedItems.length ? <p className="empty-state">{categoryFilter || hallFilter || search ? 'No waiting tickets match this search.' : 'No tickets are waiting in the queue.'}</p> : <><div className="manager-list">{queuedItems.map((ticket, index) => <button type="button" key={ticket.id} className={selected?.id === ticket.id ? 'manager-card selected' : 'manager-card'} onClick={() => setSelected(ticket)}><span className="eyebrow">Queue {index + 1}</span><strong>{ticket.no} · Stall {ticket.locationParts.stall}</strong><span>{ticket.location}</span><span>{ticket.service} · {statusLabels[ticket.status]}</span><span>{ticket.queuePriorityOverrideAt ? 'Moved ahead' : `${ticket.servicePriority ?? 'MEDIUM'} stall priority`}{ticket.priority ? ' · Urgent' : ''}</span></button>)}</div>{queueCursor && <button type="button" onClick={() => void loadMoreQueue()}>Load more</button>}</>}
+          </div>
+          {ticketPanel}
+        </section>}
+        {showLive && <section className={role === 'HALL_MANAGER' && selected ? 'workspace manager-focus' : 'workspace'}>
+          <div className="operations">
+            <div className="section-title"><div><h2>{role === 'HALL_MANAGER' ? 'Tickets' : 'Live operations'}</h2><p>{role === 'HALL_MANAGER' ? `${total} tickets in this hall. Open one for the full activity log.` : `${total} scoped tickets · server-authoritative status`}</p></div>{role === 'ADMIN' && <button onClick={() => void exportView()}>Export view</button>}</div>
+            <div className="filters"><select aria-label="Status filter" value={statusFilter} onChange={(event) => setStatusFilter(event.target.value)}><option value="">All statuses</option>{Object.keys(statusLabels).map((status) => <option key={status} value={status}>{statusLabels[status as TicketStatus]}</option>)}</select><select aria-label="Service filter" value={categoryFilter} onChange={(event) => setCategoryFilter(event.target.value)}><option value="">All services</option><option value="ELECTRICAL">Electrical</option><option value="HOUSE_HELP">House Help</option><option value="HALL_MANAGER">Hall Manager</option></select>{hallOptions.length > 1 && <select aria-label="Hall filter" value={hallFilter} onChange={(event) => setHallFilter(event.target.value)}><option value="">All halls</option>{hallOptions.map((hall) => <option key={hall.id} value={hall.id}>{hall.code} · {hall.name}</option>)}</select>}<label className="sr-only" htmlFor="created-from">Created from</label><input id="created-from" aria-label="Created from" type="datetime-local" value={createdFrom} onChange={(event) => setCreatedFrom(event.target.value)} /><label className="sr-only" htmlFor="created-to">Created to</label><input id="created-to" aria-label="Created to" type="datetime-local" value={createdTo} onChange={(event) => setCreatedTo(event.target.value)} /><label className="sr-only" htmlFor="ticket-search">Search tickets</label><input id="ticket-search" value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search ticket or stall" autoFocus={activeSection === 'Search'} />{filtersActive && <button type="button" onClick={() => { setStatusFilter(''); setCategoryFilter(''); setHallFilter(''); setCreatedFrom(''); setCreatedTo(''); setSearch(''); }}>Clear filters</button>}</div>
+            {loading ? <p className="empty-state">Loading live operations…</p> : loadError ? <p className="form-error">{loadError}</p> : !items.length ? <p className="empty-state">{filtersActive ? 'No tickets match these filters.' : 'No tickets match the current scope.'}{filtersActive && <> <button type="button" onClick={() => { setStatusFilter(''); setCategoryFilter(''); setHallFilter(''); setCreatedFrom(''); setCreatedTo(''); setSearch(''); }}>Clear filters</button></>}</p> : role === 'HALL_MANAGER' ? <><div className="manager-list">{items.map((ticket) => <button type="button" key={ticket.id} className={selected?.id === ticket.id ? 'manager-card selected' : 'manager-card'} onClick={() => setSelected(ticket)}><strong>{ticket.no} · Stall {ticket.locationParts.stall}</strong><span>{ticket.location}</span><span>{ticket.service}</span><span>{statusLabels[ticket.status]} · {ticket.assignee}</span><TimingFacts ticket={ticket} /></button>)}</div>{nextCursor && <button type="button" onClick={() => void loadMore()}>Load more</button>}</> : <><div className="table-wrap"><table><thead><tr><th>Ticket</th><th>Location / issue</th><th>Status</th><th>Timing</th><th>Response</th><th>Total</th><th>Assignee</th><th>SLA</th></tr></thead><tbody>{items.map((ticket) => <tr key={ticket.no} tabIndex={0} className={selected?.no === ticket.no ? 'selected' : ''} onClick={() => setSelected(ticket)} onKeyDown={(event) => { if (event.key === 'Enter') setSelected(ticket); }}><td><strong>{ticket.no}</strong><small>{ticket.service}</small></td><td><strong>{ticket.location}</strong><small>{ticket.description}</small></td><td><Status value={ticket.status} /></td><td className={ticket.priority ? 'red' : ''}><TimingFacts ticket={ticket} /></td><td>{duration(timings[ticket.id]?.assignToAcceptSeconds)}</td><td>{duration(timings[ticket.id]?.totalResolutionSeconds)}</td><td>{ticket.assignee}</td><td><span className={ticket.slaState === 'On track' ? 'sla' : 'sla breach'}>{ticket.slaState}</span></td></tr>)}</tbody></table></div>{nextCursor && <button type="button" onClick={() => void loadMore()}>Load more</button>}</>}
+          </div>
+          {ticketPanel}
         </section>}
       </main>
     </div>

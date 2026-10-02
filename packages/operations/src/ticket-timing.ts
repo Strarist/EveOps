@@ -107,7 +107,16 @@ export function lifecycleTiming(events: Array<{ eventType: string; createdAt: Da
   };
 }
 
+/** Reasoned override, then HIGH → MEDIUM → LOW, then creation time, then id. Incident urgency is not part of this order. */
+export const serviceQueueOrderBy = [
+  { queuePriorityOverrideAt: { sort: 'asc' as const, nulls: 'last' as const } },
+  { servicePriority: 'asc' as const },
+  { createdAt: 'asc' as const },
+  { id: 'asc' as const },
+];
+
 export function ticketListOrder(view?: string) {
+  if (view === 'queued') return serviceQueueOrderBy;
   if (view === 'closed') {
     return [
       { closedAt: { sort: 'desc' as const, nulls: 'last' as const } },

@@ -38,7 +38,7 @@ export class ListTicketsDto {
   @IsOptional() @IsDateString() createdTo?: string;
   @IsOptional() @IsString() search?: string;
   @IsOptional() @IsString() cursor?: string;
-  @IsOptional() @IsIn(['active', 'closed', 'all']) view: 'active' | 'closed' | 'all' = 'all';
+  @IsOptional() @IsIn(['active', 'closed', 'all', 'queued']) view: 'active' | 'closed' | 'all' | 'queued' = 'all';
   @IsOptional() @Type(() => Number) @IsInt() @Min(1) @Max(100) limit = 50;
 }
 
@@ -165,7 +165,8 @@ export class TicketService {
         : { some: { staffId: scope.userId, status: { in: ['ACTIVE', 'ACCEPTED'] } } };
     }
     if (scope.role === 'HALL_MANAGER') where.hallId = { in: scope.hallIds };
-    if (query.status) where.status = query.status;
+    if (query.view === 'queued') where.status = 'QUEUED';
+    else if (query.status) where.status = query.status;
     else if (query.view === 'active') where.status = { in: [...ACTIVE_TICKET_STATUSES] };
     else if (query.view === 'closed') where.status = 'CLOSED';
     if (query.category) where.category = query.category;
@@ -216,7 +217,7 @@ export class TicketService {
             select: { eventType: true, createdAt: true },
           },
         },
-        orderBy: ticketListOrder(query.view),
+        orderBy: ticketListOrder(query.view), // queued view uses service-queue precedence
         take: query.limit + 1,
         ...(query.cursor ? { cursor: { id: query.cursor }, skip: 1 } : {}),
       }),

@@ -92,7 +92,9 @@ describe('ticket timing display', () => {
       { createdAt: 'asc' },
       { id: 'asc' },
     ]);
-    expect(ticketListOrder('active').some((rule) => 'createdAt' in rule)).toBe(true);
+    expect(ticketListOrder('queued')).toEqual(serviceQueueOrderBy);
+    expect(ticketListOrder('active').some((rule) => 'priority' in rule)).toBe(true);
+    expect(ticketListOrder('active').some((rule) => 'servicePriority' in rule)).toBe(false);
     expect(ticketListOrder('closed')[0]).toEqual({ closedAt: { sort: 'desc', nulls: 'last' } });
   });
 

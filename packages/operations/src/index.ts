@@ -1,5 +1,6 @@
 import { Prisma, PrismaClient, TicketStatus, type Ticket } from '@prisma/client';
 import { fanOutTicketAlerts } from './alert-fanout';
+import { serviceQueueOrderBy } from './ticket-timing';
 import { randomUUID } from 'node:crypto';
 
 export { assertEffectiveDatabase, effectiveDatabaseName, publishedDatabaseName } from './database-guard';
@@ -14,6 +15,7 @@ export {
   operationalNow,
   serverClockOffset,
   shouldRefreshForTicketEvent,
+  serviceQueueOrderBy,
   ticketListOrder,
 } from './ticket-timing';
 export type { TicketTimingDisplay, TicketTimingInput, TimingFact } from './ticket-timing';
@@ -45,14 +47,6 @@ export type RoutingChange = { ticket: Ticket; assigneeId?: string };
 export type RoutingResult = { requested: Ticket; changed: RoutingChange[] };
 
 const transitionsToAssigned = new Set<TicketStatus>(['NEW', 'QUEUED', 'REOPENED']);
-
-/** Reasoned override, then HIGH → MEDIUM → LOW, then creation time, then id. */
-export const serviceQueueOrderBy = [
-  { queuePriorityOverrideAt: { sort: 'asc' as const, nulls: 'last' as const } },
-  { servicePriority: 'asc' as const },
-  { createdAt: 'asc' as const },
-  { id: 'asc' as const },
-];
 
 export async function routeTicket(database: DatabaseClient, ticketId: string, actorId?: string, correlationId: string = randomUUID()): Promise<RoutingResult> {
   return database.$transaction(async (tx) => {

@@ -194,6 +194,13 @@ const isolated = (() => {
     expect(waiting.map((ticket) => ticket.id)).toEqual([olderLow.id, newerHigh.id, ...[equalA.id, equalB.id].sort()]);
     expect(olderLow.priority).toBe('URGENT');
     expect(newerHigh.priority).toBe('NORMAL');
+    const overrideCookie = await sessionCookie(prisma, hall.manager.id);
+    const overrideList = await api(baseUrl, '/api/tickets?view=queued&limit=50', overrideCookie);
+    expect(overrideList.status).toBe(200);
+    const overrideBody = await overrideList.json() as { items: Array<{ id: string; status: string }> };
+    const focus = new Set(waiting.map((ticket) => ticket.id));
+    expect(overrideBody.items.filter((item) => focus.has(item.id)).map((item) => item.id)).toEqual(waiting.map((ticket) => ticket.id));
+    expect(overrideBody.items.every((item) => item.status === 'QUEUED')).toBe(true);
 
     await workforce.availability(staffScope(worker), 'ON_DUTY');
     const assigned = await prisma.assignment.findFirstOrThrow({
@@ -212,8 +219,18 @@ const isolated = (() => {
     const stalls = stallsIn(lab, 'H4');
     const low = await createCase(tickets, stalls[0], 'ELECTRICAL', 'Lighting', 'Low work waiting behind high', 'NORMAL', 'case-drain-low');
     const high = await createCase(tickets, stalls[1], 'ELECTRICAL', 'Lighting', 'High work selected on duty', 'NORMAL', 'case-drain-high');
-    await prisma.ticket.update({ where: { id: low.id }, data: { servicePriority: 'LOW', createdAt: new Date('2026-10-01T01:00:00Z') } });
-    await prisma.ticket.update({ where: { id: high.id }, data: { servicePriority: 'HIGH', createdAt: new Date('2026-10-01T02:00:00Z') } });
+    await prisma.ticket.update({ where: { id: low.id }, data: { servicePriority: 'LOW', priority: 'URGENT', createdAt: new Date('2026-10-01T01:00:00Z') } });
+    await prisma.ticket.update({ where: { id: high.id }, data: { servicePriority: 'HIGH', priority: 'NORMAL', createdAt: new Date('2026-10-01T02:00:00Z') } });
+    const managerCookie = await sessionCookie(prisma, hall.manager.id);
+    const listed = await api(baseUrl, '/api/tickets?view=queued&category=ELECTRICAL&limit=50', managerCookie);
+    expect(listed.status).toBe(200);
+    const queuedBody = await listed.json() as { items: Array<{ id: string; status: string; priority: string; servicePriority: string }> };
+    expect(queuedBody.items.every((item) => item.status === 'QUEUED')).toBe(true);
+    expect(queuedBody.items.filter((item) => item.id === low.id || item.id === high.id).map((item) => item.id)).toEqual([high.id, low.id]);
+    expect(queuedBody.items.find((item) => item.id === low.id)?.priority).toBe('URGENT');
+    const otherHall = lab.managers.find((person) => person.hallCode === 'H1');
+    const outside = await api(baseUrl, `/api/tickets?view=queued&hallId=${otherHall?.hallId}`, managerCookie);
+    expect(outside.status).toBe(403);
     await workforce.availability(staffScope(primary), 'ON_DUTY');
     expect((await prisma.ticket.findUniqueOrThrow({ where: { id: high.id } })).status).toBe('ASSIGNED');
     expect((await prisma.ticket.findUniqueOrThrow({ where: { id: low.id } })).status).toBe('QUEUED');
