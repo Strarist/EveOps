@@ -33,8 +33,9 @@ test('electrician and house help task lists stay usable', async ({ browser }) =>
   await expect(page.getByRole('heading', { name: 'Completed tasks' })).toBeVisible();
   await page.getByRole('link', { name: 'Availability' }).click();
   await expect(page.getByRole('heading', { name: 'Availability' })).toBeVisible();
-  await expect(page.getByRole('button', { name: 'Turn sound on' })).toBeVisible();
-  await expect(page.getByRole('button', { name: 'Turn sound off' })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Enable work alerts and continue' })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Turn sound on' })).toHaveCount(0);
+  await expect(page.getByRole('button', { name: 'Turn sound off' })).toHaveCount(0);
   await electrician.close();
 
   const house = await browser.newContext();

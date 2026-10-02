@@ -4,7 +4,7 @@ import { Transform, Type } from 'class-transformer';
 import { createCipheriv, createDecipheriv, createHash, randomBytes, randomInt } from 'node:crypto';
 import { ACTIVE_TICKET_STATUSES, TERMINAL_TICKET_STATUSES } from '@eveops/contracts';
 import type { AuthScope, TicketStatus } from '@eveops/contracts';
-import { lifecycleTiming, presentActivity, projectTicketForRole, routeTicket, serviceQueueOrderBy, ticketListOrder } from '@eveops/operations';
+import { fanOutTicketAlerts, lifecycleTiming, presentActivity, projectTicketForRole, routeTicket, serviceQueueOrderBy, ticketListOrder } from '@eveops/operations';
 import { Prisma, ServicePriority, TicketPriority } from '@prisma/client';
 import { Throttle } from '@nestjs/throttler';
 import { CurrentScope, SessionGuard } from './auth';
@@ -74,43 +74,28 @@ export class ComplaintDto {
 
 async function createLifecycleNotifications(
   tx: Prisma.TransactionClient,
-  ticket: { id: string; eventId: string; hallId: string; stallId: string; version: number },
+  ticket: { id: string; eventId: string; hallId: string; stallId: string; version: number; category?: string; publicNo?: string | null },
   type: string,
   actorId?: string,
 ) {
-  const scopes = await tx.userScope.findMany({
-    where: {
+  const record = ticket.category
+    ? ticket
+    : await tx.ticket.findUnique({ where: { id: ticket.id }, select: { publicNo: true, category: true } });
+  const broadcast = ['TICKET_REOPENED', 'COMPLAINT_RAISED', 'TICKET_ESCALATED'].includes(type);
+  await fanOutTicketAlerts(tx, {
+    type,
+    mode: broadcast ? 'broadcast' : 'lifecycle',
+    actorId,
+    eventToken: String(ticket.version),
+    ticket: {
+      id: ticket.id,
       eventId: ticket.eventId,
-      OR: [
-        { stallId: ticket.stallId, user: { role: 'STALL' } },
-        { hallId: ticket.hallId, user: { role: 'HALL_MANAGER' } },
-      ],
+      hallId: ticket.hallId,
+      stallId: ticket.stallId,
+      version: ticket.version,
+      category: record?.category ?? ticket.category ?? 'HOUSE_HELP',
+      publicNo: record?.publicNo ?? ticket.publicNo ?? null,
     },
-    select: { userId: true },
-  });
-  const assignment = await tx.assignment.findFirst({
-    where: { ticketId: ticket.id, status: { in: ['ACTIVE', 'ACCEPTED'] } },
-    select: { staffId: true },
-    orderBy: { assignedAt: 'desc' },
-  });
-  const recipients = [...new Set([...scopes.map((item) => item.userId), ...(assignment ? [assignment.staffId] : [])])]
-    .filter((recipientId) => recipientId !== actorId);
-  const stall = await tx.stall.findUnique({ where: { id: ticket.stallId }, select: { stallCode: true } });
-  const record = await tx.ticket.findUnique({ where: { id: ticket.id }, select: { publicNo: true, category: true } });
-  const stallCode = stall?.stallCode ?? 'stall';
-  const summary = type === 'TICKET_REOPENED'
-    ? `Ticket opened again · Stall ${stallCode}`
-    : `Update · Stall ${stallCode}`;
-  await tx.notification.createMany({
-    data: recipients.map((recipientId) => ({
-      eventId: ticket.eventId,
-      recipientId,
-      ticketId: ticket.id,
-      type,
-      dedupeKey: `${type.toLowerCase()}:${ticket.id}:${recipientId}:${ticket.version}`,
-      payload: { hallId: ticket.hallId, stallId: ticket.stallId, stallCode, publicNo: record?.publicNo, category: record?.category, summary },
-    })),
-    skipDuplicates: true,
   });
 }
 
@@ -376,33 +361,19 @@ export class TicketService {
       });
       await tx.ticketEvent.create({ data: { eventId: target.eventId, ticketId: created.id, eventType: 'TICKET_CREATED', actorId: scope.userId, toStatus: 'NEW', correlationId: requestCorrelationId() } });
       await tx.outboxEvent.create({ data: { eventId: target.eventId, aggregateType: 'Ticket', aggregateId: created.id, eventType: 'TICKET_CREATED', payload: { ticketId: created.id, ...target } } });
-      const recipients = await tx.userScope.findMany({
-        where: {
+      await fanOutTicketAlerts(tx, {
+        type: 'TICKET_CREATED',
+        mode: 'broadcast',
+        eventToken: String(created.version),
+        ticket: {
+          id: created.id,
           eventId: target.eventId,
-          OR: [
-            { stallId: target.stallId, user: { role: 'STALL' } },
-            { hallId: target.hallId, user: { role: 'HALL_MANAGER' } },
-          ],
+          hallId: target.hallId,
+          stallId: target.stallId,
+          version: created.version,
+          category: dto.category,
+          publicNo: created.publicNo,
         },
-        select: { userId: true },
-      });
-      await tx.notification.createMany({
-        data: recipients.map(({ userId }) => ({
-          eventId: target.eventId,
-          recipientId: userId,
-          ticketId: created.id,
-          type: 'TICKET_CREATED',
-          dedupeKey: 'ticket-created:' + created.id + ':' + userId,
-          payload: {
-            hallId: target.hallId,
-            stallId: target.stallId,
-            stallCode: stall.stallCode,
-            publicNo: created.publicNo,
-            category: dto.category,
-            summary: `New request · Stall ${stall.stallCode} · ${dto.category === 'HOUSE_HELP' ? 'House Help' : dto.category === 'HALL_MANAGER' ? 'Hall Manager' : 'Electrical'}`,
-          },
-        })),
-        skipDuplicates: true,
       });
       return created;
       });

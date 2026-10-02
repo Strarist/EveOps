@@ -201,24 +201,54 @@ export function presentActivity(
 export function presentNotification(
   notification: { id: string; ticketId: string | null; type: string; sentAt: Date | string; readAt: Date | string | null; payload: unknown },
   role: string,
+  live?: { status?: string | null; assigneeIds?: string[]; viewerId?: string },
 ) {
-  if (isOperationalRole(role)) return notification;
+  if (isOperationalRole(role)) {
+    const payload = notification.payload && typeof notification.payload === 'object' && !Array.isArray(notification.payload)
+      ? { ...(notification.payload as Record<string, unknown>) }
+      : null;
+    const terminal = live?.status === 'CLOSED' || live?.status === 'CANCELLED';
+    if (payload && terminal) payload.actionable = false;
+    const rest = Object.fromEntries(
+      Object.entries(notification as Record<string, unknown>).filter(([key]) => key !== 'ticket'),
+    ) as typeof notification;
+    return payload ? { ...rest, payload } : rest;
+  }
   const payload = notification.payload && typeof notification.payload === 'object' && !Array.isArray(notification.payload)
     ? notification.payload as Record<string, unknown>
     : {};
   const summary = typeof payload.summary === 'string' && payload.summary.trim()
     ? payload.summary.trim()
     : 'Update';
+  const audience = typeof payload.audience === 'string' ? payload.audience : '';
+  const terminal = live?.status === 'CLOSED' || live?.status === 'CANCELLED';
+  const viewerId = live?.viewerId ?? '';
+  const lostAssignment = (audience === 'assignment' || audience === 'own')
+    && viewerId.length > 0
+    && Array.isArray(live?.assigneeIds)
+    && !live.assigneeIds.includes(viewerId);
+  const summaryOnly = role === 'STAFF' && (audience === 'team' || lostAssignment);
+  const presented: Record<string, unknown> = {
+    summary,
+    ...(typeof payload.publicNo === 'string' ? { publicNo: payload.publicNo } : {}),
+    ...(typeof payload.stallCode === 'string' ? { stallCode: payload.stallCode } : {}),
+  };
+  if (audience) {
+    presented.audience = summaryOnly ? 'team' : audience;
+    presented.tone = payload.tone === 'assignment' && !summaryOnly ? 'assignment' : 'operational';
+    presented.actionable = payload.actionable === true && !terminal && !lostAssignment;
+    presented.href = summaryOnly
+      ? `/staff/alerts/${notification.id}`
+      : role === 'STAFF'
+        ? `/staff/task/${notification.ticketId}`
+        : `/stall/ticket/${notification.ticketId}`;
+  }
   return {
     id: notification.id,
-    ticketId: notification.ticketId,
+    ticketId: summaryOnly ? null : notification.ticketId,
     type: notification.type,
     sentAt: notification.sentAt,
     readAt: notification.readAt,
-    payload: {
-      summary,
-      ...(typeof payload.publicNo === 'string' ? { publicNo: payload.publicNo } : {}),
-      ...(typeof payload.stallCode === 'string' ? { stallCode: payload.stallCode } : {}),
-    },
+    payload: presented,
   };
 }

@@ -4,7 +4,7 @@ import Link from 'next/link';
 import { FormEvent, useCallback, useEffect, useRef, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { apiErrorMessage, apiFetch } from '../lib/api-client';
-import { bindAlertUser, stopSound } from '../lib/sounds';
+import { releaseWorkAlerts } from '../lib/work-alerts';
 
 type ServicePriority = 'HIGH' | 'MEDIUM' | 'LOW';
 
@@ -78,8 +78,7 @@ export function RegistrationsView() {
   useEffect(() => { void load(); }, [load]);
 
   async function logout() {
-    stopSound();
-    bindAlertUser('');
+    releaseWorkAlerts();
     await globalThis.fetch('/api/auth/logout', { method: 'POST', credentials: 'include' });
     router.replace('/login');
     router.refresh();

@@ -1,4 +1,5 @@
 import { Prisma, PrismaClient, TicketStatus, type Ticket } from '@prisma/client';
+import { fanOutTicketAlerts } from './alert-fanout';
 import { randomUUID } from 'node:crypto';
 
 export { assertEffectiveDatabase, effectiveDatabaseName, publishedDatabaseName } from './database-guard';
@@ -24,6 +25,19 @@ export {
   publicProgressLabel,
   staffTaskLabel,
 } from './ticket-audience';
+export {
+  alertHref,
+  assignmentSummary,
+  decideAlertDelivery,
+  exhibitorSummary,
+  isHallBroadcast,
+  serviceCategoryLabel,
+  teamBroadcastSummary,
+} from './alert-audience';
+export type { AlertAudience, AlertTone, DeliveryLane, DeliverySubject, DeliveryTicket } from './alert-audience';
+export { claimTabPlayback, cuesToRing, enqueueCues, planAlertSetup } from './alert-session';
+export type { AlertCue, AudioChoice, PermissionChoice } from './alert-session';
+export { fanOutTicketAlerts };
 
 type DatabaseClient = Pick<PrismaClient, '$transaction'>;
 
@@ -136,35 +150,13 @@ export async function routeTicket(database: DatabaseClient, ticketId: string, ac
           activeTicketKey: selectedTicket.id,
         },
       });
-      const stallRecipients = await tx.userScope.findMany({
-        where: { eventId: selectedTicket.eventId, stallId: selectedTicket.stallId, user: { role: 'STALL' } },
-        select: { userId: true },
-      });
-      const stall = await tx.stall.findUnique({
-        where: { id: selectedTicket.stallId },
-        select: { stallCode: true, zone: { select: { code: true, hall: { select: { name: true } } } } },
-      });
-      const assignmentRecipients = [...new Set([selectedStaff.userId, ...stallRecipients.map((scope) => scope.userId)])];
-      await tx.notification.createMany({
-        data: assignmentRecipients.map((recipientId) => ({
-          eventId: selectedTicket.eventId,
-          recipientId,
-          ticketId: selectedTicket.id,
-          type: 'TICKET_ASSIGNED',
-          dedupeKey: `ticket-assigned:${selectedTicket.id}:${recipientId}:${selectedTicket.version}`,
-          payload: {
-            hallId: selectedTicket.hallId,
-            stallCode: stall?.stallCode,
-            hallName: stall?.zone.hall.name,
-            zone: stall?.zone.code,
-            category: selectedTicket.category,
-            priority: selectedTicket.priority,
-            issue: selectedTicket.description.slice(0, 140),
-            publicNo: selectedTicket.publicNo,
-            summary: `New task · Stall ${stall?.stallCode ?? ''}`.trim(),
-          },
-        })),
-        skipDuplicates: true,
+      await fanOutTicketAlerts(tx, {
+        type: 'TICKET_ASSIGNED',
+        mode: 'assignment',
+        actorId,
+        assigneeId: selectedStaff.userId,
+        eventToken: `${selectedTicket.version}`,
+        ticket: selectedTicket,
       });
       const assigned = await tx.ticket.update({
         where: { id: selectedTicket.id, version: selectedTicket.version },

@@ -8,7 +8,8 @@ import { describeTicketTiming, shouldRefreshForTicketEvent } from '@eveops/ticke
 import { apiFetch, apiErrorMessage, AUTH_LOST_EVENT, subscribeRealtime } from '../lib/api-client';
 import { activitySentence, serviceLabel } from '../lib/activity-copy';
 import { noteServerTime, ServerClockProvider, useOperationalNow } from '../lib/server-clock';
-import { bindAlertUser, enableSound, playOnce, playRepeatAlert, setSoundEnabled, silenceAlert, silencedAlerts, soundEnabled, stopSound, testSound } from '../lib/sounds';
+import { clearPushForLogout, releaseWorkAlerts } from '../lib/work-alerts';
+import { WorkAlertHost } from './work-alerts';
 
 type Ticket = {
   id: string;
@@ -319,17 +320,8 @@ function Status({ value, audience = 'manager' }: { value: TicketStatus; audience
 function LogoutButton() {
   const router = useRouter();
   async function logout() {
-    stopSound();
-    bindAlertUser('');
-    const endpoint = window.localStorage.getItem('eveops-push-endpoint');
-    if (endpoint) {
-      await apiFetch('/api/notifications/push-subscription', {
-        method: 'DELETE',
-        credentials: 'include',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ endpoint, p256dh: 'placeholder', auth: 'placeholder' }),
-      }).catch(() => undefined);
-    }
+    await clearPushForLogout();
+    releaseWorkAlerts();
     await globalThis.fetch('/api/auth/logout', { method: 'POST', credentials: 'include' });
     router.replace('/login');
     router.refresh();
@@ -915,11 +907,8 @@ export function StaffWorkspace({ focusId }: { focusId?: string } = {}) {
     setOtpError('');
     setOtpSuccess('');
   });
-  const [soundOn, setSoundOn] = useState(false);
-  const [silenced, setSilenced] = useState<string[]>([]);
   const ordered = [...items].sort((left, right) => left.no.localeCompare(right.no));
   const focused = focusId ? (ordered.find((ticket) => ticket.id === focusId) ?? history.find((ticket) => ticket.id === focusId)) : undefined;
-  const incoming = ordered.filter((ticket) => ['ASSIGNED', 'SNOOZED'].includes(ticket.status) && !silenced.includes(ticket.id));
 
   useEffect(() => {
     setOtpValue('');
@@ -939,19 +928,6 @@ export function StaffWorkspace({ focusId }: { focusId?: string } = {}) {
     if (sectionQuery === 'completed') setSection('history');
     if (sectionQuery === 'availability') setSection('availability');
   }, [sectionQuery]);
-  useEffect(() => {
-    if (!profile?.id) return;
-    bindAlertUser(profile.id);
-    setSoundOn(soundEnabled());
-    setSilenced(silencedAlerts());
-  }, [profile?.id]);
-  const incomingId = incoming[0]?.id;
-  useEffect(() => {
-    if (!incomingId || !soundOn) return;
-    void playRepeatAlert('assign:' + incomingId, 20000);
-    return () => stopSound();
-  }, [incomingId, soundOn]);
-
   async function setAvailabilityValue(value: 'ON_DUTY' | 'PAUSED' | 'OFF_DUTY') {
     setActionPending(true);
     const response = await apiFetch('/api/workforce/availability', {
@@ -991,7 +967,6 @@ export function StaffWorkspace({ focusId }: { focusId?: string } = {}) {
       return;
     }
     setActionError('');
-    stopSound();
     await refresh();
     await refreshWorkload();
     setActionPending(false);
@@ -1010,7 +985,6 @@ export function StaffWorkspace({ focusId }: { focusId?: string } = {}) {
       return;
     }
     setActionError('');
-    stopSound();
     await refresh();
     setActionPending(false);
     setPendingTicketId(null);
@@ -1072,18 +1046,7 @@ export function StaffWorkspace({ focusId }: { focusId?: string } = {}) {
           />
         ) : (
           <>
-            {!focusId && !!incoming.length && (
-              <div className="task-alert" role="status">
-                <strong>{incoming.length > 1 ? `${incoming.length} new tasks` : 'New task'}</strong>
-                <p className="stall-hero">Stall {incoming[0].locationParts.stall}</p>
-                <p>{incoming[0].locationParts.hall} · Zone {incoming[0].locationParts.zone}</p>
-                <div className="ticket-actions">
-                  <a className="secondary-action" href={'/staff/task/' + incoming[0].id}>View task</a>
-                  <button type="button" onClick={() => { silenceAlert(incoming[0].id); setSilenced(silencedAlerts()); }}>Stop sound</button>
-                </div>
-                <p className="otp-hint">Stopping the sound leaves the task on your list. It does not accept the task.</p>
-              </div>
-            )}
+            {profile?.id ? <WorkAlertHost userId={profile.id} /> : null}
             {section === 'task' && (
               <section className="staff-board" aria-label="Active tasks">
                 <div className="section-title"><div><h2>Active tasks</h2><p>{ordered.length ? `${ordered.length} on your list` : 'Nothing active'}</p></div></div>
@@ -1101,17 +1064,10 @@ export function StaffWorkspace({ focusId }: { focusId?: string } = {}) {
             {section === 'availability' && (
               <section className="availability-panel">
                 <div className="section-title"><h2>Availability</h2></div>
-                <p>Choose whether you can take new tasks. Tasks already assigned to you stay on your list.</p>
+                <p>Choose whether you can take new tasks. Tasks already assigned to you stay on your list. {workload.activeCount} active now.</p>
                 <button type="button" className={availability === 'ON_DUTY' ? 'primary' : 'secondary-action'} disabled={actionPending} onClick={() => void setAvailabilityValue('ON_DUTY')}>{actionPending ? 'Saving…' : 'On duty · ready for new tasks'}</button>
                 <button type="button" className={availability === 'PAUSED' ? 'primary' : 'secondary-action'} disabled={actionPending} onClick={() => void setAvailabilityValue('PAUSED')}>{actionPending ? 'Saving…' : 'Paused · finish current tasks, no new ones'}</button>
                 <button type="button" className={availability === 'OFF_DUTY' ? 'primary' : 'secondary-action'} disabled={actionPending} onClick={() => void setAvailabilityValue('OFF_DUTY')}>{actionPending ? 'Saving…' : 'Off duty · not available'}</button>
-                <h3>Sound</h3>
-                <p>{soundOn ? 'Sound is on for new tasks on this account.' : 'Sound is off for this account. New tasks still show on screen.'}</p>
-                <button type="button" onClick={() => void enableSound().then((ok) => setSoundOn(ok))}>Turn sound on</button>
-                <button type="button" onClick={() => { setSoundEnabled(false); setSoundOn(false); stopSound(); }}>Turn sound off</button>
-                <button type="button" onClick={() => void testSound().then((ok) => setSoundOn(ok))}>Play a test</button>
-                <p className="otp-hint">This browser can play the sound while EveOps is open. A second tab may also play it once. iPhone and iPad do not keep a looping sound after you leave the app or lock the screen.</p>
-                <PushOptIn />
               </section>
             )}
           </>
@@ -1713,7 +1669,6 @@ export function ManagementWorkspace({ role }: { role: 'HALL_MANAGER' | 'ADMIN' }
         if (!fresh) return;
         for (const row of rows) seenManagerAlerts.current.add(row.id);
         setManagerToast({ text: fresh.payload?.summary ?? (fresh.type === 'TICKET_REOPENED' ? 'Ticket opened again' : 'New request'), ticketId: fresh.ticketId });
-        if (soundEnabled()) void playOnce('manager:' + fresh.id);
       })
       .catch(() => undefined);
   }, [lastUpdatedAt]);
@@ -2014,6 +1969,7 @@ export function ManagementWorkspace({ role }: { role: 'HALL_MANAGER' | 'ADMIN' }
       </aside>
       <main className="management">
         <header className="topbar"><div><span className="eyebrow">{profile?.scopes[0]?.event.name ?? 'EveOps event'} · {connection === 'live' ? 'Live' : 'Reconnecting'}</span><h1>{title}</h1></div><div className="top-actions"><span>{profile?.scopes[0]?.hall?.name ?? 'All scoped halls'}</span><button onClick={() => void loadNotifications()}>Notifications · {notifications.filter((notification) => !notification.readAt).length}</button></div></header>
+        {role === 'HALL_MANAGER' && profile?.id ? <WorkAlertHost userId={profile.id} /> : null}
         {managerToast && <div className="alert-line" role="status"><span>{managerToast.text}</span><button type="button" onClick={() => void openManagerAlert(managerToast)}>Open</button><button type="button" onClick={() => setManagerToast(null)}>Dismiss</button></div>}
         {managementError && <div className={managementError.startsWith('Export queued') || managementError.startsWith('Created ') || managementError.includes('sent for Admin approval') || managementError.startsWith('Staff approved') || managementError.startsWith('Staff request rejected') || managementError.endsWith('created.') || managementError.startsWith('SLA targets') || managementError.includes('Temporary password must be changed') || managementError.startsWith('Completion verified') ? 'alert-line' : 'form-error'} role="status">{managementError}</div>}
         {showNotifications && <section className="notification-panel">{notifications.length ? notifications.slice(0, 10).map((notification) => <button key={notification.id} onClick={() => void apiFetch('/api/notifications/' + notification.id + '/read', { method: 'PATCH', credentials: 'include' }).then(() => loadNotifications())}><strong>{notification.type.replaceAll('_', ' ')}</strong><span>{eventTime(notification.sentAt)}</span></button>) : <p className="empty-state">No notifications.</p>}</section>}

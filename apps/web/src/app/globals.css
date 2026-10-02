@@ -304,6 +304,8 @@ a.ticket-link .ticket-card, a.ticket-link .recent { margin-bottom: 0; }
 
 .stall-hero { margin: .2rem 0; font-size: 1.8rem; font-weight: 800; letter-spacing: -.03em; }
 .where-line { margin: 0 0 .4rem; color: var(--muted); }
+.work-alert-bar { display: flex; margin: .4rem 0 .2rem; }
+.work-alert-bar button { min-height: 44px; }
 .task-alert { display: grid; gap: .35rem; margin: .6rem 0; padding: .9rem; border: 1px solid #e2b15a; border-radius: 10px; background: var(--amber-soft); }
 .task-alert .ticket-actions { display: grid; gap: .45rem; }
 .task-alert a, .task-alert button { min-height: 48px; }

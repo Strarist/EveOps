@@ -17,7 +17,7 @@ import {
   UseGuards,
 } from '@nestjs/common';
 import type { AuthScope, Role } from '@eveops/contracts';
-import { serviceQueueOrderBy } from '@eveops/operations';
+import { fanOutTicketAlerts, serviceQueueOrderBy } from '@eveops/operations';
 import { Availability, Prisma, UserStatus } from '@prisma/client';
 import { Type } from 'class-transformer';
 import {
@@ -1008,23 +1008,20 @@ export class WorkforceService {
           payload: { ticketId, eventId: ticket.eventId, hallId: ticket.hallId, stallId: ticket.stallId, assigneeId: staffId, previousAssigneeId: active?.staffId ?? null },
         },
       });
-      await tx.notification.create({
-        data: {
+      await fanOutTicketAlerts(tx, {
+        type: 'TICKET_ASSIGNED',
+        mode: 'assignment',
+        actorId: scope.userId,
+        assigneeId: staffId,
+        eventToken: assignment.id,
+        ticket: {
+          id: ticketId,
           eventId: ticket.eventId,
-          recipientId: staffId,
-          ticketId,
-          type: 'TICKET_ASSIGNED',
-          dedupeKey: `ticket-reassigned:${ticketId}:${assignment.id}:${staffId}`,
-          payload: {
-            hallId: ticket.hallId,
-            stallCode: (await tx.stall.findUnique({ where: { id: ticket.stallId }, select: { stallCode: true } }))?.stallCode,
-            category: ticket.category,
-            priority: ticket.priority,
-            issue: ticket.description.slice(0, 140),
-            publicNo: ticket.publicNo,
-            summary: 'New task',
-            previousStaffId: active?.staffId ?? null,
-          },
+          hallId: ticket.hallId,
+          stallId: ticket.stallId,
+          version: ticket.version + 1,
+          category: ticket.category,
+          publicNo: ticket.publicNo,
         },
       });
       return { assignment, previousStaffId: active?.staffId };

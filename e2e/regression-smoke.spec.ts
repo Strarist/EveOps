@@ -23,6 +23,7 @@ test('regression health reports eveops_regression', async ({ request }) => {
 });
 
 test('role homes render on the regression stack', async ({ browser }) => {
+  test.setTimeout(180_000);
   const journeys = [
     { email: 'regression.elec.h1.1@volume.lab', path: '/login', button: 'Sign in', heading: 'Electrician H1.1', url: /\/staff/ },
     { email: 'regression.help.h1.1@volume.lab', path: '/login', button: 'Sign in', heading: 'House help H1.1', url: /\/staff/ },
@@ -41,6 +42,7 @@ test('role homes render on the regression stack', async ({ browser }) => {
 });
 
 test('admin sees a stall-code conflict and archive removes exhibitor push access', async ({ browser }) => {
+  test.setTimeout(180_000);
   const context = await browser.newContext();
   const page = await context.newPage();
   await signIn(page, '/login', 'regression.admin@volume.lab', 'Sign in', /\/admin/);

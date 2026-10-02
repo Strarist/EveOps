@@ -430,19 +430,82 @@ const isolated = (() => {
     const manager = lab.managers.find((person) => person.hallCode === 'H4')!;
     const other = lab.managers.find((person) => person.hallCode === 'H2')!;
     const worker = staffBy(lab, 'H4', 'HOUSE_HELP', 2);
+    const electrician = staffBy(lab, 'H4', 'ELECTRICAL', 1);
+    const offDutyElectrician = staffBy(lab, 'H4', 'ELECTRICAL', 2);
+    const offDutyHelp = staffBy(lab, 'H4', 'HOUSE_HELP', 1);
+    await prisma.workforceMembership.updateMany({ where: { userId: { in: [worker.id, electrician.id] } }, data: { availability: 'ON_DUTY', capacity: 4 } });
     const created = await createCase(tickets, stall, 'HOUSE_HELP', 'General', 'Manager alert for a new request', 'NORMAL', 'case-alert');
     const createdAlerts = await prisma.notification.findMany({ where: { ticketId: created.id, type: 'TICKET_CREATED' } });
-    expect(createdAlerts.map((alert) => alert.recipientId)).toContain(manager.id);
+    expect(createdAlerts.map((alert) => alert.recipientId).sort()).toEqual([electrician.id, manager.id, stall.userId, worker.id].sort());
     expect(createdAlerts.map((alert) => alert.recipientId)).not.toContain(other.id);
+    expect(createdAlerts.map((alert) => alert.recipientId)).not.toContain(offDutyElectrician.id);
+    expect(createdAlerts.map((alert) => alert.recipientId)).not.toContain(offDutyHelp.id);
     expect(createdAlerts.map((alert) => alert.recipientId)).not.toContain(lab.admin.id);
+    const teamCopy = createdAlerts.find((alert) => alert.recipientId === electrician.id);
+    expect(teamCopy?.payload).toMatchObject({ audience: 'team', summary: 'New request · Stall H4-01 · House Help' });
+    expect(JSON.stringify(teamCopy?.payload)).not.toMatch(/Your new task|slaState|servicePriority/);
+    await expect(tickets.detail(created.id, staffScope(electrician))).rejects.toThrow(/not assigned/i);
+    await expect(tickets.transition(created.id, 'ACCEPTED', staffScope(electrician))).rejects.toThrow(/current assignee/i);
     const assignedAlerts = await prisma.notification.findMany({ where: { ticketId: created.id, type: 'TICKET_ASSIGNED' } });
-    expect(assignedAlerts.map((alert) => alert.recipientId)).toContain(worker.id);
+    expect(assignedAlerts.map((alert) => alert.recipientId).sort()).toEqual([manager.id, stall.userId, worker.id].sort());
+    expect(assignedAlerts.find((alert) => alert.recipientId === worker.id)?.payload).toMatchObject({ audience: 'assignment' });
+    expect(assignedAlerts.find((alert) => alert.recipientId === stall.userId)?.payload).toMatchObject({ audience: 'stall', summary: 'Staff assigned.' });
     const duplicateKeys = await prisma.notification.groupBy({
       by: ['dedupeKey'],
       where: { ticketId: created.id },
       _count: { _all: true },
     });
     expect(duplicateKeys.every((row) => row._count._all === 1)).toBe(true);
+    await prisma.workforceMembership.updateMany({ where: { userId: { in: [worker.id, electrician.id] } }, data: { capacity: 1 } });
+  });
+
+  it('keeps a paused assignee, drops a disabled account, and rechecks duty before push', async () => {
+    const stall = stallsIn(lab, 'H3')[1];
+    const manager = lab.managers.find((person) => person.hallId === stall.hallId)!;
+    const worker = staffBy(lab, 'H3', 'HOUSE_HELP', 1);
+    const electrician = staffBy(lab, 'H3', 'ELECTRICAL', 2);
+    const offDuty = staffBy(lab, 'H3', 'ELECTRICAL', 1);
+    await prisma.workforceMembership.updateMany({
+      where: { userId: { in: [worker.id, electrician.id] } },
+      data: { availability: 'ON_DUTY', capacity: 4 },
+    });
+    const created = await createCase(tickets, stall, 'HOUSE_HELP', 'General', 'Paused worker still hears the complaint', 'NORMAL', 'case-paused-alert');
+    const assignee = staffScope(worker);
+    await tickets.transition(created.id, 'ACCEPTED', assignee);
+    await tickets.transition(created.id, 'IN_PROGRESS', assignee);
+    await tickets.transition(created.id, 'AWAITING_OTP', assignee);
+    await workforce.availability(assignee, 'PAUSED');
+    await prisma.workforceMembership.updateMany({ where: { userId: offDuty.id }, data: { availability: 'ON_DUTY' } });
+    await prisma.user.update({ where: { id: offDuty.id }, data: { status: 'DISABLED' } });
+    try {
+      await tickets.complaint(created.id, stallScope(stall), 'WORK_INCOMPLETE', 'Still blocked', 'case-paused-alert-note');
+      const alerts = await prisma.notification.findMany({ where: { ticketId: created.id, type: 'COMPLAINT_RAISED' } });
+      const ids = alerts.map((alert) => alert.recipientId);
+      expect(ids).toContain(worker.id);
+      expect(ids).toContain(electrician.id);
+      expect(ids).toContain(manager.id);
+      expect(ids).not.toContain(offDuty.id);
+      expect(ids).not.toContain(lab.managers.find((person) => person.hallCode === 'H1')!.id);
+      expect(alerts.find((alert) => alert.recipientId === worker.id)?.payload).toMatchObject({
+        audience: 'own',
+        summary: expect.stringContaining('Problem reported'),
+      });
+      const team = alerts.find((alert) => alert.recipientId === electrician.id)!;
+      await prisma.workforceMembership.updateMany({ where: { userId: electrician.id }, data: { availability: 'OFF_DUTY' } });
+      await prisma.pushSubscription.create({
+        data: { userId: electrician.id, endpoint: 'https://push.example.test/phase2-off-duty', p256dh: 'regression-p256dh-key', auth: 'regression-auth' },
+      });
+      const sent: string[] = [];
+      await deliverNotificationPush(prisma as never, team.id, async () => { sent.push('sent'); });
+      expect(sent).toEqual([]);
+      expect((await prisma.notification.findUniqueOrThrow({ where: { id: team.id } })).pushAttempts).toBe(5);
+    } finally {
+      await workforce.availability(assignee, 'ON_DUTY');
+      await prisma.workforceMembership.updateMany({ where: { userId: { in: [worker.id, electrician.id] } }, data: { availability: 'ON_DUTY', capacity: 1 } });
+      await prisma.user.update({ where: { id: offDuty.id }, data: { status: 'ACTIVE' } });
+      await prisma.workforceMembership.updateMany({ where: { userId: offDuty.id }, data: { availability: 'OFF_DUTY' } });
+      await prisma.pushSubscription.deleteMany({ where: { endpoint: 'https://push.example.test/phase2-off-duty' } });
+    }
   });
 
   it('rejects a repeated accept and keeps the ticket identity on retry', async () => {

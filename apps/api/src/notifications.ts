@@ -1,4 +1,4 @@
-import { Body, ConflictException, Controller, Delete, Get, Param, Patch, Post, ServiceUnavailableException, UseGuards } from '@nestjs/common';
+import { Body, ConflictException, Controller, Delete, Get, NotFoundException, Param, Patch, Post, ServiceUnavailableException, UseGuards } from '@nestjs/common';
 import { IsString, IsUrl, MinLength } from 'class-validator';
 import type { AuthScope } from '@eveops/contracts';
 import { presentNotification } from '@eveops/operations';
@@ -22,14 +22,47 @@ export class NotificationController {
       where: { recipientId: scope.userId, eventId: { in: scope.eventIds } },
       orderBy: { sentAt: 'desc' },
       take: 100,
+      include: {
+        ticket: {
+          select: {
+            status: true,
+            assignments: { where: { status: { in: ['ACTIVE', 'ACCEPTED'] } }, select: { staffId: true } },
+          },
+        },
+      },
     });
-    return rows.map((row) => presentNotification(row, scope.role));
+    return rows.map((row) => presentNotification(row, scope.role, {
+      status: row.ticket?.status ?? null,
+      assigneeIds: row.ticket?.assignments.map((assignment) => assignment.staffId) ?? [],
+      viewerId: scope.userId,
+    }));
   }
 
   @Get('push-config')
   pushConfig() {
     const publicKey = process.env.VAPID_PUBLIC_KEY ?? null;
     return { configured: Boolean(publicKey && process.env.VAPID_PRIVATE_KEY), publicKey };
+  }
+
+  @Get(':id')
+  async one(@Param('id') id: string, @CurrentScope() scope: AuthScope) {
+    const row = await this.prisma.notification.findFirst({
+      where: { id, recipientId: scope.userId, eventId: { in: scope.eventIds } },
+      include: {
+        ticket: {
+          select: {
+            status: true,
+            assignments: { where: { status: { in: ['ACTIVE', 'ACCEPTED'] } }, select: { staffId: true } },
+          },
+        },
+      },
+    });
+    if (!row) throw new NotFoundException('Alert is unavailable');
+    return presentNotification(row, scope.role, {
+      status: row.ticket?.status,
+      assigneeIds: row.ticket?.assignments.map((assignment) => assignment.staffId),
+      viewerId: scope.userId,
+    });
   }
 
   @Post('push-subscription')

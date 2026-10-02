@@ -1,6 +1,7 @@
 import type { Prisma, PrismaClient } from '@prisma/client';
 import { lookup } from 'node:dns/promises';
 import { BlockList, isIP } from 'node:net';
+import { alertHref, decideAlertDelivery } from './alert-audience';
 
 const ATTEMPT_LIMIT = 5;
 const DELIVERY_WINDOW_MS = 60 * 60 * 1000;
@@ -17,8 +18,6 @@ export type PushSubscriptionTarget = {
 
 export type PushSend = (subscription: PushSubscriptionTarget, body: string) => Promise<void>;
 
-type ScopeRow = { eventId: string; hallId: string | null; stallId: string | null; serviceType: string | null };
-
 type LoadedNotification = Prisma.NotificationGetPayload<{
   include: {
     recipient: {
@@ -28,6 +27,7 @@ type LoadedNotification = Prisma.NotificationGetPayload<{
         status: true;
         approvalStatus: true;
         scopes: { select: { eventId: true; hallId: true; stallId: true; serviceType: true } };
+        workforceMemberships: { select: { availability: true; eventId: true; pool: { select: { hallId: true; category: true; active: true } } } };
         pushSubscriptions: { select: { id: true; userId: true; endpoint: true; p256dh: true; auth: true } };
       };
     };
@@ -38,6 +38,7 @@ type LoadedNotification = Prisma.NotificationGetPayload<{
         hallId: true;
         stallId: true;
         category: true;
+        status: true;
         stall: { select: { active: true; archivedAt: true } };
         assignments: { select: { staffId: true } };
       };
@@ -63,6 +64,7 @@ const notificationInclude = {
       status: true,
       approvalStatus: true,
       scopes: { select: { eventId: true, hallId: true, stallId: true, serviceType: true } },
+      workforceMemberships: { select: { availability: true, eventId: true, pool: { select: { hallId: true, category: true, active: true } } } },
       pushSubscriptions: { select: { id: true, userId: true, endpoint: true, p256dh: true, auth: true } },
     },
   },
@@ -73,6 +75,7 @@ const notificationInclude = {
       hallId: true,
       stallId: true,
       category: true,
+      status: true,
       stall: { select: { active: true, archivedAt: true } },
       assignments: {
         where: { status: { in: ['ACTIVE', 'ACCEPTED'] as const } },
@@ -89,67 +92,58 @@ export async function loadPushDecision(db: PushDb, notificationId: string): Prom
   }) as LoadedNotification | null;
   if (!notification || notification.pushedAt) return null;
   const recipient = notification.recipient;
-  const accountRevoked = recipient.status !== 'ACTIVE' || recipient.approvalStatus !== 'APPROVED';
-  const authorized = !accountRevoked && recipientStillAuthorized(notification, recipient.scopes);
   const payload = notification.payload && typeof notification.payload === 'object' && !Array.isArray(notification.payload)
     ? notification.payload as Record<string, unknown>
     : {};
+  const audience = typeof payload.audience === 'string' ? payload.audience : null;
+  const ticket = notification.ticket;
+  const delivery = decideAlertDelivery({
+    type: notification.type,
+    audience,
+    eventId: notification.eventId,
+    subject: {
+      recipientId: recipient.id,
+      role: recipient.role,
+      status: recipient.status,
+      approvalStatus: recipient.approvalStatus,
+      scopes: recipient.scopes,
+      memberships: recipient.workforceMemberships.map((membership) => ({
+        availability: membership.availability,
+        eventId: membership.eventId,
+        hallId: membership.pool.hallId,
+        category: membership.pool.category,
+        active: membership.pool.active,
+      })),
+    },
+    ticket: ticket ? {
+      eventId: ticket.eventId,
+      hallId: ticket.hallId,
+      stallId: ticket.stallId,
+      category: ticket.category,
+      status: ticket.status,
+      stallActive: ticket.stall.active,
+      stallArchived: Boolean(ticket.stall.archivedAt),
+      assigneeIds: ticket.assignments.map((assignment) => assignment.staffId),
+    } : null,
+  });
   const summary = typeof payload.summary === 'string' && payload.summary.trim()
     ? payload.summary.trim().slice(0, 180)
     : 'You have an update';
+  const hrefAudience = delivery.lane === 'own-assignment' ? 'assignment' : (audience ?? '');
   return {
     notificationId: notification.id,
     recipientId: recipient.id,
-    authorized,
-    revokeSubscriptions: accountRevoked,
+    authorized: delivery.authorized,
+    revokeSubscriptions: delivery.revokeSubscriptions,
     subscriptions: recipient.pushSubscriptions,
     body: JSON.stringify({
       title: 'EveOps',
       body: summary,
-      url: notificationUrl(recipient.role, notification.ticketId),
+      url: alertHref(recipient.role, hrefAudience, notification.id, notification.ticketId),
       tag: notification.id,
+      actionable: delivery.actionable,
     }),
   };
-}
-
-function recipientStillAuthorized(notification: LoadedNotification, scopes: ScopeRow[]): boolean {
-  if (!notification.ticket) {
-    return scopes.some((scope) => scope.eventId === notification.eventId);
-  }
-  const ticket = notification.ticket;
-  if (ticket.eventId !== notification.eventId) return false;
-  const role = notification.recipient.role;
-  if (role === 'STALL') {
-    return ticket.stall.active
-      && !ticket.stall.archivedAt
-      && scopes.some((scope) => scope.eventId === ticket.eventId && scope.stallId === ticket.stallId);
-  }
-  if (role === 'HALL_MANAGER') {
-    return scopes.some((scope) => scope.eventId === ticket.eventId && scope.hallId === ticket.hallId);
-  }
-  if (role === 'STAFF') {
-    const assigned = ticket.assignments.some((assignment) => assignment.staffId === notification.recipient.id);
-    return assigned && scopes.some((scope) =>
-      scope.eventId === ticket.eventId
-      && scope.hallId === ticket.hallId
-      && scope.serviceType === ticket.category);
-  }
-  if (role === 'ADMIN' || role === 'SUPER_ADMIN') {
-    return scopes.some((scope) => scope.eventId === ticket.eventId);
-  }
-  return false;
-}
-
-function notificationUrl(role: string, ticketId: string | null) {
-  const ticketPath = ticketId && /^[A-Za-z0-9_-]{1,80}$/.test(ticketId) ? ticketId : null;
-  const target = role === 'STAFF' && ticketPath
-    ? `/staff/task/${ticketPath}`
-    : role === 'STALL' && ticketPath
-      ? `/stall/ticket/${ticketPath}`
-      : role === 'HALL_MANAGER'
-        ? '/hall-manager'
-        : '/';
-  return target.startsWith('/') && !target.startsWith('//') ? target : '/';
 }
 
 const blockedAddresses = new BlockList();
