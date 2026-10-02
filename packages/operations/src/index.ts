@@ -4,6 +4,26 @@ import { randomUUID } from 'node:crypto';
 export { assertEffectiveDatabase, effectiveDatabaseName, publishedDatabaseName } from './database-guard';
 export { classifyPushEndpoint, deliverNotificationPush, deliverPendingPushes, loadPushDecision, pushEndpointShapeAllowed } from './push-delivery';
 export type { PushDecision, PushSend, PushSubscriptionTarget } from './push-delivery';
+export {
+  boundedElapsedSeconds,
+  closedResolutionSeconds,
+  describeTicketTiming,
+  displayLiveAgeSeconds,
+  lifecycleTiming,
+  operationalNow,
+  serverClockOffset,
+  shouldRefreshForTicketEvent,
+  ticketListOrder,
+} from './ticket-timing';
+export type { TicketTimingDisplay, TicketTimingInput, TimingFact } from './ticket-timing';
+export {
+  isOperationalRole,
+  presentActivity,
+  presentNotification,
+  projectTicketForRole,
+  publicProgressLabel,
+  staffTaskLabel,
+} from './ticket-audience';
 
 type DatabaseClient = Pick<PrismaClient, '$transaction'>;
 

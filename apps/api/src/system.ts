@@ -1,5 +1,6 @@
 import { Controller, Get, ServiceUnavailableException } from '@nestjs/common';
 import { SkipThrottle } from '@nestjs/throttler';
+import { publishedBuildIdentity } from '@eveops/contracts';
 import { publishedDatabaseName } from '@eveops/operations';
 import { PrismaService } from './prisma.service';
 
@@ -14,7 +15,7 @@ export class SystemController {
     return {
       status: 'ok',
       service: 'eveops-api',
-      build: process.env.BUILD_SHA ?? 'development',
+      build: publishedBuildIdentity(),
       processId: process.pid,
       time: new Date().toISOString(),
       ...(databaseName ? { databaseName } : {}),
@@ -40,7 +41,7 @@ export class SystemController {
         && failedExports === 0;
       const body = {
         status: ready ? 'ready' : 'degraded',
-        build: process.env.BUILD_SHA ?? 'development',
+        build: publishedBuildIdentity(),
         processId: process.pid,
         database: 'connected',
         worker: workerAgeSeconds == null ? 'missing' : workerAgeSeconds <= 30 ? 'healthy' : 'stale',

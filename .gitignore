@@ -1,5 +1,6 @@
 node_modules
 .next
+.next-regression
 dist
 coverage
 .env

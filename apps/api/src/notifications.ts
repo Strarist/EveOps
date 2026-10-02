@@ -1,6 +1,7 @@
 import { Body, ConflictException, Controller, Delete, Get, Param, Patch, Post, ServiceUnavailableException, UseGuards } from '@nestjs/common';
 import { IsString, IsUrl, MinLength } from 'class-validator';
 import type { AuthScope } from '@eveops/contracts';
+import { presentNotification } from '@eveops/operations';
 import { CurrentScope, SessionGuard } from './auth';
 import { PrismaService } from './prisma.service';
 
@@ -16,12 +17,13 @@ export class NotificationController {
   constructor(private readonly prisma: PrismaService) {}
 
   @Get()
-  list(@CurrentScope() scope: AuthScope) {
-    return this.prisma.notification.findMany({
+  async list(@CurrentScope() scope: AuthScope) {
+    const rows = await this.prisma.notification.findMany({
       where: { recipientId: scope.userId, eventId: { in: scope.eventIds } },
       orderBy: { sentAt: 'desc' },
       take: 100,
     });
+    return rows.map((row) => presentNotification(row, scope.role));
   }
 
   @Get('push-config')

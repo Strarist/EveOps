@@ -42,9 +42,14 @@ export WEB_ORIGIN="http://localhost:${web_port}"
 export E2E_BASE_URL="$WEB_ORIGIN"
 export COOKIE_SECURE=false
 export NODE_ENV=development
+export NEXT_DIST_DIR=".next-regression"
 
-if command -v lsof >/dev/null && lsof -nP -iTCP:3000 -sTCP:LISTEN >/dev/null 2>&1; then
-  echo "A Next dev server is already listening on port 3000. This Next version allows one dev server per application, so the regression web server cannot start until that process stops." >&2
+if command -v lsof >/dev/null && lsof -nP -iTCP:"${web_port}" -sTCP:LISTEN >/dev/null 2>&1; then
+  echo "Port ${web_port} is already in use. Stop that regression web server or set REGRESSION_WEB_PORT. Unrelated services were left running." >&2
+  exit 1
+fi
+if command -v lsof >/dev/null && lsof -nP -iTCP:"${api_port}" -sTCP:LISTEN >/dev/null 2>&1; then
+  echo "Port ${api_port} is already in use. Stop that regression API or set REGRESSION_API_PORT. Unrelated services were left running." >&2
   exit 1
 fi
 node scripts/assert-regression-database.mjs

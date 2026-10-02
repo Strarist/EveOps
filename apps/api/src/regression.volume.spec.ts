@@ -3,7 +3,7 @@ import { INestApplication, ValidationPipe } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
 import cookieParser from 'cookie-parser';
 import type { Response } from 'express';
-import { deliverNotificationPush, deliverPendingPushes, serviceQueueOrderBy, type PushSend } from '@eveops/operations';
+import { deliverNotificationPush, deliverPendingPushes, describeTicketTiming, serviceQueueOrderBy, type PushSend } from '@eveops/operations';
 import { AppModule } from './app.module';
 import { AuthController } from './auth';
 import { SanitizedExceptionFilter } from './http-exception.filter';
@@ -17,7 +17,7 @@ import {
   type RegressionStall,
   type RegressionStaff,
 } from './regression-fixture';
-import { TicketService } from './tickets';
+import { ListTicketsDto, TicketService } from './tickets';
 import { WorkforceService } from './workforce';
 
 jest.setTimeout(120000);
@@ -285,14 +285,16 @@ const isolated = (() => {
     await workforce.availability(staffScope(worker), 'OFF_DUTY');
     const before = await prisma.stall.findUniqueOrThrow({ where: { id: stall.id } });
     const created = await createCase(tickets, stall, 'HOUSE_HELP', 'General', 'Snapshot priority before a stall edit', 'NORMAL', 'case-snapshot');
-    expect(created.servicePriority).toBe(before.servicePriority);
+    const stored = await prisma.ticket.findUniqueOrThrow({ where: { id: created.id } });
+    expect(stored.servicePriority).toBe(before.servicePriority);
     await management.updateRegistration(lab.admin.scope, stall.id, { servicePriority: before.servicePriority === 'LOW' ? 'HIGH' : 'LOW' });
     const historical = await prisma.ticket.findUniqueOrThrow({ where: { id: created.id } });
     expect(historical.servicePriority).toBe(before.servicePriority);
     const next = await createCase(tickets, stall, 'HOUSE_HELP', 'General', 'Ticket created after the stall edit', 'URGENT', 'case-snapshot-next');
-    expect(next.servicePriority).not.toBe(before.servicePriority);
+    const nextRow = await prisma.ticket.findUniqueOrThrow({ where: { id: next.id } });
+    expect(nextRow.servicePriority).not.toBe(before.servicePriority);
     expect(next.priority).toBe('URGENT');
-    await tickets.changePendingServicePriority(created.id, manager.scope, created.servicePriority === 'HIGH' ? 'MEDIUM' : 'HIGH', 'Live demonstration');
+    await tickets.changePendingServicePriority(created.id, manager.scope, stored.servicePriority === 'HIGH' ? 'MEDIUM' : 'HIGH', 'Live demonstration');
     await expect(tickets.changePendingServicePriority(created.id, staffScope(worker), 'HIGH', 'Staff cannot reorder')).rejects.toThrow(/authority/i);
     await expect(tickets.changePendingServicePriority(created.id, stallScope(stall), 'HIGH', 'Exhibitor cannot reorder')).rejects.toThrow(/authority/i);
     await workforce.availability(staffScope(worker), 'ON_DUTY');
@@ -338,8 +340,10 @@ const isolated = (() => {
     expect(alerts.some((alert) => alert.recipientId === stall.userId)).toBe(true);
     expect(alerts.some((alert) => alert.recipientId === manager.id)).toBe(false);
     expect(alerts.some((alert) => alert.recipientId === otherHallManager.id)).toBe(false);
-    const activity = await tickets.activity(created.id, stallScope(stall));
+    const activity = await tickets.activity(created.id, manager.scope);
     expect(activity.items.map((item) => item.eventType)).toEqual(expect.arrayContaining(['TICKET_CREATED', 'OTP_VERIFIED', 'STATUS_REOPENED']));
+    const stallActivity = await tickets.activity(created.id, stallScope(stall));
+    expect(stallActivity.items.every((item) => !('eventType' in item) && typeof item.summary === 'string')).toBe(true);
   });
 
   it('records a stall complaint without closing the ticket', async () => {
@@ -359,6 +363,66 @@ const isolated = (() => {
     const alerts = await prisma.notification.findMany({ where: { ticketId: created.id, type: 'COMPLAINT_RAISED' } });
     expect(alerts.some((alert) => alert.recipientId === manager.id)).toBe(true);
     await expect(workforce.reassign(created.id, worker.id, 'Complaint is not an assignment state', manager.scope)).rejects.toThrow(/cannot be reassigned/);
+  });
+
+  it('keeps creation time through retry and closure, and does not call a complaint resolved', async () => {
+    const stall = stallsIn(lab, 'H4')[1];
+    const manager = lab.managers.find((person) => person.hallId === stall.hallId)!;
+    const worker = staffBy(lab, 'H4', 'HOUSE_HELP', 2);
+    const started = Date.now();
+    const created = await createCase(tickets, stall, 'HOUSE_HELP', 'General', 'Fresh request for timing', 'NORMAL', 'case-age');
+    const retried = await createCase(tickets, stall, 'HOUSE_HELP', 'General', 'Fresh request for timing', 'NORMAL', 'case-age');
+    expect(retried.id).toBe(created.id);
+    expect(retried.createdAt.toISOString()).toBe(created.createdAt.toISOString());
+    expect(created.createdAt.getTime()).toBeGreaterThanOrEqual(started - 5_000);
+    expect(created.createdAt.getTime()).toBeLessThanOrEqual(Date.now() + 5_000);
+    const newer = await createCase(tickets, stall, 'HOUSE_HELP', 'General', 'A later request', 'NORMAL', 'case-age-new');
+    expect(newer.id).not.toBe(created.id);
+    expect(newer.createdAt.getTime()).toBeGreaterThanOrEqual(created.createdAt.getTime());
+
+    const assignee = staffScope(worker);
+    await tickets.transition(created.id, 'ACCEPTED', assignee);
+    await tickets.transition(created.id, 'IN_PROGRESS', assignee);
+    await tickets.transition(created.id, 'AWAITING_OTP', assignee);
+    const waiting = await tickets.list(stallScope(stall), Object.assign(new ListTicketsDto(), { view: 'active', limit: 20 }));
+    const awaiting = waiting.items.find((item) => item.id === created.id);
+    expect(awaiting?.status).toBe('AWAITING_OTP');
+    expect(describeTicketTiming(awaiting!, Date.parse(waiting.serverTime)).facts.some((fact) => fact.label === 'Resolved in')).toBe(false);
+
+    const presented = await tickets.presentOtp(created.id, stallScope(stall));
+    const closed = await tickets.verifyOtp(created.id, presented.otp!, manager.scope);
+    expect(closed.status).toBe('CLOSED');
+    const closedList = await tickets.list(stallScope(stall), Object.assign(new ListTicketsDto(), { view: 'closed', limit: 5 }));
+    expect(Number.isFinite(Date.parse(closedList.serverTime))).toBe(true);
+    const closedRow = closedList.items.find((item) => item.id === created.id);
+    expect(closedRow?.status).toBe('CLOSED');
+    const resolvedNow = describeTicketTiming(closedRow!, Date.parse(closedList.serverTime));
+    const resolvedLater = describeTicketTiming(closedRow!, Date.parse(closedList.serverTime) + 10 * 86_400_000);
+    expect(resolvedNow.facts[0]?.label).toBe('Resolved in');
+    expect(resolvedLater).toEqual(resolvedNow);
+    expect(Math.floor((closed.closedAt!.getTime() - created.createdAt.getTime()) / 1000)).toBeLessThan(600);
+    const activeAfterClose = await tickets.list(stallScope(stall), Object.assign(new ListTicketsDto(), { view: 'active', limit: 20 }));
+    expect(activeAfterClose.items.some((item) => item.id === created.id)).toBe(false);
+
+    await tickets.complaint(created.id, stallScope(stall), 'WORK_QUALITY', 'The work did not hold', 'case-age-complaint');
+    const complainedList = await tickets.list(stallScope(stall), Object.assign(new ListTicketsDto(), { view: 'active', limit: 20 }));
+    const complained = complainedList.items.find((item) => item.id === created.id);
+    expect(complained?.status).toBe('COMPLAINT_RAISED');
+    expect(complained?.complaintRaisedAt).toBeTruthy();
+    const hiddenFromResolved = await tickets.list(stallScope(stall), Object.assign(new ListTicketsDto(), { view: 'closed', limit: 20 }));
+    expect(hiddenFromResolved.items.some((item) => item.id === created.id)).toBe(false);
+    const complaintTiming = describeTicketTiming(complained!, Date.parse(complainedList.serverTime));
+    expect(complaintTiming.facts.map((fact) => fact.label)).toEqual(['Opened', 'Issue reported']);
+
+    const createdAt = complained!.createdAt;
+    await tickets.transition(created.id, 'REOPENED', manager.scope, 'Open the request again');
+    const persisted = await prisma.ticket.findUniqueOrThrow({ where: { id: created.id } });
+    expect(persisted.createdAt.toISOString()).toBe(new Date(createdAt).toISOString());
+    const ordered = await tickets.list(stallScope(stall), Object.assign(new ListTicketsDto(), { view: 'all', limit: 20 }));
+    const olderIndex = ordered.items.findIndex((item) => item.id === created.id);
+    const newerIndex = ordered.items.findIndex((item) => item.id === newer.id);
+    expect(olderIndex).toBeGreaterThanOrEqual(0);
+    expect(newerIndex).toBeGreaterThan(olderIndex);
   });
 
   it('notifies the scoped manager on create and the assignee on assignment', async () => {
@@ -813,6 +877,69 @@ const isolated = (() => {
     const alerts = await prisma.notification.findMany({ where: { ticketId: created.id, type: 'TICKET_REOPENED' } });
     expect(alerts.some((alert) => alert.recipientId === stall.userId)).toBe(true);
     expect(alerts.some((alert) => alert.recipientId === manager.id)).toBe(false);
+  });
+
+  it('hides operational fields from stall and staff, and issues one retry-safe exhibitor login', async () => {
+    const stall = stallsIn(lab, 'H1')[0];
+    const created = await createCase(tickets, stall, 'ELECTRICAL', 'NCP', 'Audience check', 'NORMAL', 'case-audience');
+    const assignment = await prisma.assignment.findFirst({ where: { ticketId: created.id, status: { in: ['ACTIVE', 'ACCEPTED'] } } });
+    const worker = lab.staff.find((person) => person.id === assignment?.staffId);
+    if (worker) {
+      const staffDetail = await tickets.detail(created.id, staffScope(worker));
+      expect(staffDetail).not.toHaveProperty('slaState');
+      expect(staffDetail).not.toHaveProperty('pool');
+      expect(staffDetail).not.toHaveProperty('servicePriority');
+      expect(staffDetail).not.toHaveProperty('assignments');
+      expect(staffDetail).toHaveProperty('taskLabel');
+    }
+    const stallDetail = await tickets.detail(created.id, stallScope(stall));
+    expect(stallDetail).not.toHaveProperty('slaState');
+    expect(stallDetail).not.toHaveProperty('events');
+    expect(stallDetail).not.toHaveProperty('otpChallenges');
+    expect(stallDetail).not.toHaveProperty('servicePriority');
+    expect((stallDetail as { progressLabel?: string }).progressLabel).toBe('Staff assigned');
+    const activity = await tickets.activity(created.id, stallScope(stall));
+    expect(activity.items.every((item) => !('eventType' in item) && 'summary' in item)).toBe(true);
+    const managerDetail = await tickets.detail(created.id, lab.managers.find((person) => person.hallId === stall.hallId)!.scope);
+    expect(managerDetail).toHaveProperty('slaState');
+    expect(managerDetail).toHaveProperty('servicePriority');
+
+    const email = `regression.case.login.${Date.now()}@volume.lab`;
+    const key = `case-login-${Date.now()}`;
+    const body = {
+      eventId: lab.eventId,
+      zoneId: stall.zoneId,
+      stallCode: 'CASE-LOGIN',
+      exhibitorName: 'Case login',
+      servicePriority: 'HIGH' as const,
+      loginName: 'Case login',
+      loginEmail: email,
+      idempotencyKey: key,
+    };
+    const first = await management.createRegistrationWithLogin(lab.admin.scope, body);
+    const retry = await management.createRegistrationWithLogin(lab.admin.scope, body);
+    expect(first.credentialIssued).toBe(true);
+    expect(first.handoff.initialCredential).toEqual(expect.any(String));
+    expect(retry.credentialIssued).toBe(false);
+    expect(retry.handoff.initialCredential).toBeNull();
+    expect(await prisma.stall.count({ where: { stallCode: 'CASE-LOGIN', zoneId: stall.zoneId } })).toBe(1);
+    expect(await prisma.user.count({ where: { email } })).toBe(1);
+    const audits = await prisma.managementAudit.findMany({ where: { targetUserId: first.account.id } });
+    expect(JSON.stringify(audits)).not.toContain(first.handoff.initialCredential);
+    const auth = new AuthController(prisma);
+    const response = { cookie() { return undefined; } } as unknown as Response;
+    const signedIn = await auth.login({
+      email,
+      password: first.handoff.initialCredential!,
+      portal: 'OPERATIONS',
+    }, response);
+    expect(signedIn.mustChangePassword).toBe(true);
+    const changed = await auth.changePassword(
+      { userId: first.account.id, role: 'STALL', eventIds: [lab.eventId], hallIds: [stall.hallId], stallId: first.registration?.id, serviceTypes: [] },
+      { currentPassword: first.handoff.initialCredential!, newPassword: 'Replacement!2026' },
+      { sessionId: undefined } as never,
+    );
+    expect(changed.mustChangePassword).toBe(false);
   });
 });
 

@@ -4,7 +4,7 @@ import { Transform, Type } from 'class-transformer';
 import { createCipheriv, createDecipheriv, createHash, randomBytes, randomInt } from 'node:crypto';
 import { ACTIVE_TICKET_STATUSES, TERMINAL_TICKET_STATUSES } from '@eveops/contracts';
 import type { AuthScope, TicketStatus } from '@eveops/contracts';
-import { routeTicket, serviceQueueOrderBy } from '@eveops/operations';
+import { lifecycleTiming, presentActivity, projectTicketForRole, routeTicket, serviceQueueOrderBy, ticketListOrder } from '@eveops/operations';
 import { Prisma, ServicePriority, TicketPriority } from '@prisma/client';
 import { Throttle } from '@nestjs/throttler';
 import { CurrentScope, SessionGuard } from './auth';
@@ -224,8 +224,14 @@ export class TicketService {
           hall: true,
           zone: true,
           assignments: { orderBy: { assignedAt: 'desc' }, take: 1, include: { staff: { select: { id: true, name: true } } } },
+          events: {
+            where: { eventType: { in: ['COMPLAINT_RAISED', 'STATUS_REOPENED', 'STATUS_CANCELLED'] } },
+            orderBy: { createdAt: 'desc' },
+            take: 12,
+            select: { eventType: true, createdAt: true },
+          },
         },
-        orderBy: [{ priority: 'desc' }, { createdAt: 'asc' }, { id: 'asc' }],
+        orderBy: ticketListOrder(query.view),
         take: query.limit + 1,
         ...(query.cursor ? { cursor: { id: query.cursor }, skip: 1 } : {}),
       }),
@@ -233,10 +239,15 @@ export class TicketService {
     const hasMore = rows.length > query.limit;
     const items = hasMore ? rows.slice(0, query.limit) : rows;
     return {
-      items: items.map((ticket) => ({
-        ...ticket,
-        ...projectTicketView(ticket, scope),
-      })),
+      serverTime: new Date().toISOString(),
+      items: items.map((ticket) => {
+        const { events, ...record } = ticket;
+        return projectTicketForRole({
+          ...record,
+          ...projectTicketView(ticket, scope),
+          ...lifecycleTiming(events),
+        }, scope.role);
+      }),
       total,
       nextCursor: hasMore ? items.at(-1)?.id : null,
     };
@@ -277,12 +288,12 @@ export class TicketService {
       throw new BadRequestException('Ticket is not assigned to this staff account');
     }
     const assignmentHistory = [...ticket.assignments].reverse();
-    return {
+    return projectTicketForRole({
       ...ticket,
       ...projectTicketView(ticket, scope),
       assignmentHistory,
       otpChallenges: ticket.otpChallenges,
-    };
+    }, scope.role);
   }
 
   async activity(id: string, scope: AuthScope, cursor?: string) {
@@ -303,13 +314,17 @@ export class TicketService {
       select: { id: true, eventType: true, createdAt: true, actor: { select: { name: true } } },
     });
     const hasMore = rows.length > 20;
-    const items = (hasMore ? rows.slice(0, 20) : rows).map((event) => ({
-      id: event.id,
-      eventType: event.eventType,
-      createdAt: event.createdAt,
-      actorName: event.actor?.name ?? 'System',
-    }));
-    return { items, nextCursor: hasMore ? items.at(-1)?.id ?? null : null };
+    const page = hasMore ? rows.slice(0, 20) : rows;
+    const items = page.flatMap((event) => {
+      const presented = presentActivity({
+        id: event.id,
+        eventType: event.eventType,
+        createdAt: event.createdAt,
+        actorName: event.actor?.name ?? 'System',
+      }, scope.role);
+      return presented ? [presented] : [];
+    });
+    return { items, nextCursor: hasMore ? page.at(-1)?.id ?? null : null };
   }
 
   async create(dto: CreateTicketDto, scope: AuthScope) {
