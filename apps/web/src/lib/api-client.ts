@@ -66,25 +66,48 @@ export async function apiErrorMessage(response: Response, fallback: string) {
   return raw;
 }
 
+function publishConnection(state: 'live' | 'reconnecting') {
+  realtimeSubscribers.forEach((item) => item.onConnection(state));
+}
+
+function openEventSource() {
+  if (eventSource || authLost || !realtimeSubscribers.size) return;
+  eventSource = new EventSource('/api/tickets/stream/live', { withCredentials: true });
+  eventSource.onopen = () => publishConnection('live');
+  eventSource.onerror = () => {
+    publishConnection('reconnecting');
+    if (typeof navigator !== 'undefined' && navigator.onLine === false) return;
+    if (Date.now() - lastAuthProbeAt > 30000) {
+      lastAuthProbeAt = Date.now();
+      void apiFetch('/api/auth/me', { cache: 'no-store' });
+    }
+  };
+  eventSource.addEventListener('ticket.updated', (event) => {
+    notifyRealtimeSubscribers(event as MessageEvent<string>);
+  });
+  eventSource.addEventListener('workforce.updated', (event) => {
+    notifyRealtimeSubscribers(event as MessageEvent<string>);
+  });
+}
+
+let networkBound = false;
+function bindNetworkState() {
+  if (networkBound || typeof window === 'undefined') return;
+  networkBound = true;
+  window.addEventListener('offline', () => publishConnection('reconnecting'));
+  window.addEventListener('online', () => {
+    if (!realtimeSubscribers.size || authLost) return;
+    eventSource?.close();
+    eventSource = null;
+    publishConnection('reconnecting');
+    openEventSource();
+  });
+}
+
 export function subscribeRealtime(subscriber: RealtimeSubscriber) {
   realtimeSubscribers.add(subscriber);
-  if (!eventSource && !authLost) {
-    eventSource = new EventSource('/api/tickets/stream/live', { withCredentials: true });
-    eventSource.onopen = () => realtimeSubscribers.forEach((item) => item.onConnection('live'));
-    eventSource.onerror = () => {
-      realtimeSubscribers.forEach((item) => item.onConnection('reconnecting'));
-      if (Date.now() - lastAuthProbeAt > 30000) {
-        lastAuthProbeAt = Date.now();
-        void apiFetch('/api/auth/me', { cache: 'no-store' });
-      }
-    };
-    eventSource.addEventListener('ticket.updated', (event) => {
-      notifyRealtimeSubscribers(event as MessageEvent<string>);
-    });
-    eventSource.addEventListener('workforce.updated', (event) => {
-      notifyRealtimeSubscribers(event as MessageEvent<string>);
-    });
-  }
+  bindNetworkState();
+  openEventSource();
   const closeOnAuthLoss = () => {
     eventSource?.close();
     eventSource = null;

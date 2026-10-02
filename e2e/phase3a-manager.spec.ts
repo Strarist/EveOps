@@ -98,7 +98,8 @@ test('hall manager attention, queue, detail, and staff journeys stay in scope', 
   await nav.getByRole('button', { name: 'Tickets' }).click();
   await manager.getByLabel('Search tickets').fill(foreign.publicNo);
   await expect(manager.getByText('No tickets match these filters.')).toBeVisible();
-  await manager.getByRole('button', { name: 'Clear filters' }).first().click();
+  await expect(manager.getByRole('button', { name: 'Clear filters' })).toHaveCount(1);
+  await manager.getByRole('button', { name: 'Clear filters' }).click();
 
   await nav.getByRole('button', { name: 'Staff' }).click();
   await expect(manager.getByText('Stall registration and exhibitor logins stay with Admin.')).toBeVisible();

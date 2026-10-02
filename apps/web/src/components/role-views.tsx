@@ -4,7 +4,7 @@ import type { Role, TicketStatus } from '@eveops/contracts';
 import { FormEvent, KeyboardEvent, ClipboardEvent, createContext, useCallback, useContext, useEffect, useRef, useState, type ReactNode } from 'react';
 import Link from 'next/link';
 import { useRouter, useSearchParams } from 'next/navigation';
-import { describeTicketTiming, shouldRefreshForTicketEvent } from '@eveops/ticket-timing';
+import { describeTicketTiming, managerAttentionLabel, shouldRefreshForTicketEvent } from '@eveops/ticket-timing';
 import { apiFetch, apiErrorMessage, AUTH_LOST_EVENT, subscribeRealtime } from '../lib/api-client';
 import { activitySentence, serviceLabel } from '../lib/activity-copy';
 import { noteServerTime, ServerClockProvider, useOperationalNow } from '../lib/server-clock';
@@ -161,6 +161,12 @@ function useApiTickets(query = '') {
   const requestSequence = useRef(0);
   const requestController = useRef<AbortController | null>(null);
   const loadedQuery = useRef('');
+  const depthRef = useRef(1);
+  const queryRef = useRef(query);
+  if (queryRef.current !== query) {
+    queryRef.current = query;
+    depthRef.current = 1;
+  }
   const refresh = useCallback(async (cursor?: string, append = false) => {
     const sequence = ++requestSequence.current;
     requestController.current?.abort();
@@ -168,18 +174,33 @@ function useApiTickets(query = '') {
     requestController.current = controller;
     if (!append && loadedQuery.current !== query) setLoading(true);
     try {
-      const parameters = new URLSearchParams(query);
-      if (cursor) parameters.set('cursor', cursor);
-      const response = await apiFetch('/api/tickets?' + parameters.toString(), { credentials: 'include', cache: 'no-store', signal: controller.signal });
-      if (!response.ok) throw new Error('Live tickets could not be loaded');
-      const receivedAt = Date.now();
-      const result = await response.json() as { items: ApiTicket[]; total: number; nextCursor: string | null; serverTime?: string };
+      const collected: Ticket[] = [];
+      let pageCursor = append ? cursor : undefined;
+      let total = 0;
+      let next: string | null = null;
+      const pages = append ? 1 : Math.max(1, depthRef.current);
+      let fetchedPages = 0;
+      for (let page = 0; page < pages; page += 1) {
+        const parameters = new URLSearchParams(query);
+        if (pageCursor) parameters.set('cursor', pageCursor);
+        const response = await apiFetch('/api/tickets?' + parameters.toString(), { credentials: 'include', cache: 'no-store', signal: controller.signal });
+        if (!response.ok) throw new Error('Live tickets could not be loaded');
+        const receivedAt = Date.now();
+        const result = await response.json() as { items: ApiTicket[]; total: number; nextCursor: string | null; serverTime?: string };
+        if (sequence !== requestSequence.current) return;
+        if (result.serverTime) noteServerTime(result.serverTime, receivedAt);
+        collected.push(...result.items.map(mapTicket));
+        total = result.total;
+        next = result.nextCursor;
+        fetchedPages += 1;
+        if (!next) break;
+        pageCursor = next;
+      }
       if (sequence !== requestSequence.current) return;
-      if (result.serverTime) noteServerTime(result.serverTime, receivedAt);
-      const mapped = result.items.map(mapTicket);
-      setItems((current) => append ? [...current, ...mapped] : mapped);
-      setTotal(result.total);
-      setNextCursor(result.nextCursor);
+      setItems((current) => append ? [...current, ...collected] : collected);
+      setTotal(total);
+      setNextCursor(next);
+      depthRef.current = append ? depthRef.current + 1 : fetchedPages;
       setLastUpdatedAt(Date.now());
       setError('');
       loadedQuery.current = query;
@@ -332,30 +353,6 @@ function LogoutButton() {
   return <button className="logout" onClick={logout}>Sign out</button>;
 }
 
-function shortTime(value: string | null | undefined, timezone = 'UTC') {
-  if (!value) return null;
-  return new Intl.DateTimeFormat('en-IN', { timeZone: timezone, timeStyle: 'short' }).format(new Date(value));
-}
-
-function countdownLabel(expiresAt: string | undefined, nowMs: number) {
-  if (!expiresAt) return '';
-  const remaining = Math.max(0, Math.floor((new Date(expiresAt).getTime() - nowMs) / 1000));
-  const minutes = Math.floor(remaining / 60);
-  const seconds = remaining % 60;
-  return `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
-}
-
-function OtpDigits({ value, empty = false }: { value?: string; empty?: boolean }) {
-  const digits = (value ?? '').padEnd(6, ' ').slice(0, 6).split('');
-  return (
-    <div className="otp-digits" aria-hidden={empty || !value}>
-      {digits.map((digit, index) => (
-        <span key={index} className={digit.trim() ? 'otp-digit' : 'otp-digit otp-digit-empty'}>{digit.trim() || '·'}</span>
-      ))}
-    </div>
-  );
-}
-
 function StaffOtpEntry({ disabled, value, onChange, onSubmit, submitting, error, success }: {
   disabled?: boolean;
   value: string;
@@ -456,7 +453,7 @@ function TicketCard({ ticket, actions = false, actionLabel = 'Accept assignment'
       {audience === 'stall' && showMilestones && (
         <div className="ticket-meta">
           <span>Raised <strong>{eventTime(ticket.createdAt)}</strong></span>
-          {ticket.closedAt ? <span>Completed <strong>{eventTime(ticket.closedAt)}</strong></span> : null}
+          {ticket.status === 'CLOSED' && ticket.closedAt ? <span>Completed <strong>{eventTime(ticket.closedAt)}</strong></span> : null}
           {ticket.cancelledAt ? <span>Cancelled <strong>{eventTime(ticket.cancelledAt)}</strong></span> : null}
           {ticket.complaintRaisedAt ? <span>Problem reported <strong>{eventTime(ticket.complaintRaisedAt)}</strong></span> : null}
           {ticket.reopenCount > 0 ? <span>Reopened <strong>{ticket.reopenCount === 1 ? 'Once' : `${ticket.reopenCount} times`}</strong></span> : null}
@@ -470,380 +467,6 @@ function TicketCard({ ticket, actions = false, actionLabel = 'Accept assignment'
         </div>
       )}
     </article>
-  );
-}
-
-function ComplaintDisclosure({ ticketId, summary, onSuccess }: { ticketId: string; summary: string; onSuccess: () => Promise<unknown> }) {
-  const [submitting, setSubmitting] = useState(false);
-  const [error, setError] = useState('');
-  const [success, setSuccess] = useState('');
-  const idempotencyKey = useRef(crypto.randomUUID());
-
-  async function submitComplaint(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    if (submitting) return;
-    setSubmitting(true);
-    setError('');
-    setSuccess('');
-    const form = event.currentTarget;
-    const values = new FormData(form);
-    try {
-      const response = await apiFetch('/api/tickets/' + ticketId + '/complaints', {
-        method: 'POST',
-        credentials: 'include',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({
-          reasonCode: values.get('reasonCode'),
-          comment: values.get('comment'),
-          idempotencyKey: idempotencyKey.current,
-        }),
-      });
-      if (!response.ok) throw new Error(await apiErrorMessage(response, 'Complaint could not be raised'));
-      idempotencyKey.current = crypto.randomUUID();
-      form.reset();
-      setSuccess('Complaint recorded. Hall Manager has been notified.');
-      await onSuccess();
-    } catch (cause) {
-      setError(cause instanceof Error ? cause.message : 'Complaint could not be raised');
-    } finally {
-      setSubmitting(false);
-    }
-  }
-
-  return (
-    <details className="complaint-disclosure">
-      <summary>{summary}</summary>
-      <form onSubmit={(event) => void submitComplaint(event)}>
-        <label>What is still wrong?<select name="reasonCode" required disabled={submitting}><option value="">Choose reason</option><option value="WORK_INCOMPLETE">Work incomplete</option><option value="WORK_QUALITY">Issue returned</option><option value="WRONG_SERVICE">Wrong repair</option></select></label>
-        <label>Additional details<textarea name="comment" maxLength={500} disabled={submitting} placeholder="Optional note" /></label>
-        {error && <p className="form-error" role="alert">{error}</p>}
-        {success && <p className="form-success" role="status">{success}</p>}
-        <button type="submit" disabled={submitting}>{submitting ? 'Submitting complaint…' : 'Submit complaint'}</button>
-      </form>
-    </details>
-  );
-}
-
-export function StallWorkspace({ focusId }: { focusId?: string } = {}) {
-  const profile = useProfile();
-  const { items, total, loading, error: loadError, refresh, connection } = useApiTickets('view=active');
-  const { items: resolvedItems, loading: resolvedLoading, refresh: refreshResolved } = useApiTickets('view=closed&limit=5');
-  const { items: directoryItems, refresh: refreshDirectory } = useApiTickets('view=all&limit=50');
-  const [showForm, setShowForm] = useState(false);
-  const [showAll, setShowAll] = useState(false);
-  const [showHelp, setShowHelp] = useState(false);
-  const [showProfile, setShowProfile] = useState(false);
-  const [ticketSearch, setTicketSearch] = useState('');
-  const [submitted, setSubmitted] = useState('');
-  const [category, setCategory] = useState('');
-  const [submitError, setSubmitError] = useState('');
-  const [submitting, setSubmitting] = useState(false);
-  const [otpByTicket, setOtpByTicket] = useState<Record<string, string>>({});
-  const [otpExpiryByTicket, setOtpExpiryByTicket] = useState<Record<string, string>>({});
-  const [otpExpiredByTicket, setOtpExpiredByTicket] = useState<Record<string, boolean>>({});
-  const [otpPending, setOtpPending] = useState<Record<string, boolean>>({});
-  const [nowMs, setNowMs] = useState(() => Date.now());
-  const idempotencyKey = useRef('');
-  useAuthLoss(() => {
-    setOtpByTicket({});
-    setOtpExpiryByTicket({});
-    setOtpExpiredByTicket({});
-    setOtpPending({});
-    setSubmitted('');
-  });
-  useEffect(() => {
-    const timer = setInterval(() => setNowMs(Date.now()), 1000);
-    return () => clearInterval(timer);
-  }, []);
-  const stallScope = profile?.scopes.find((scope) => scope.stall);
-  const locationLabel = stallScope
-    ? [stallScope.hall?.name, 'Zone ' + stallScope.stall!.zone.code, 'Stall ' + stallScope.stall!.stallCode].filter(Boolean).join(' / ')
-    : 'Loading assigned location…';
-  const directory = showAll ? directoryItems : [];
-  async function refreshTickets() {
-    await Promise.all([refresh(), refreshResolved(), refreshDirectory()]);
-  }
-  const filteredDirectory = directory.filter((ticket) => {
-    const query = ticketSearch.trim().toLowerCase();
-    if (!query) return true;
-    return ticket.no.toLowerCase().includes(query) || ticket.service.toLowerCase().includes(query) || ticket.description.toLowerCase().includes(query);
-  });
-
-  async function loadOtp(ticketId: string) {
-    if (otpPending[ticketId]) return;
-    setOtpPending((current) => ({ ...current, [ticketId]: true }));
-    try {
-      const response = await apiFetch('/api/tickets/' + ticketId + '/otp', { credentials: 'include', cache: 'no-store' });
-      if (!response.ok) throw new Error(await apiErrorMessage(response, 'Completion code is unavailable'));
-      const result = await response.json() as { otp?: string | null; expiresAt?: string; expired?: boolean };
-      if (result.expired || !result.otp) {
-        setOtpByTicket((current) => {
-          const next = { ...current };
-          delete next[ticketId];
-          return next;
-        });
-        setOtpExpiredByTicket((current) => ({ ...current, [ticketId]: true }));
-        if (result.expiresAt) setOtpExpiryByTicket((current) => ({ ...current, [ticketId]: result.expiresAt! }));
-      } else {
-        setOtpByTicket((current) => ({ ...current, [ticketId]: result.otp! }));
-        setOtpExpiredByTicket((current) => ({ ...current, [ticketId]: false }));
-        if (result.expiresAt) setOtpExpiryByTicket((current) => ({ ...current, [ticketId]: result.expiresAt! }));
-      }
-      setSubmitError('');
-    } catch (cause) {
-      setSubmitError(cause instanceof Error ? cause.message : 'Completion code is unavailable');
-    } finally {
-      setOtpPending((current) => ({ ...current, [ticketId]: false }));
-    }
-  }
-
-  async function regenerateOtp(ticketId: string) {
-    if (otpPending[ticketId]) return;
-    setOtpPending((current) => ({ ...current, [ticketId]: true }));
-    try {
-      const response = await apiFetch('/api/tickets/' + ticketId + '/otp/regenerate', { method: 'POST', credentials: 'include' });
-      if (!response.ok) throw new Error(await apiErrorMessage(response, 'Could not generate a new code'));
-      setOtpPending((current) => ({ ...current, [ticketId]: false }));
-      await loadOtp(ticketId);
-    } catch (cause) {
-      setSubmitError(cause instanceof Error ? cause.message : 'Could not generate a new code');
-      setOtpPending((current) => ({ ...current, [ticketId]: false }));
-    }
-  }
-
-  useEffect(() => {
-    for (const ticket of items) {
-      if (ticket.status === 'AWAITING_OTP' && !otpByTicket[ticket.id] && !otpExpiredByTicket[ticket.id] && !otpPending[ticket.id]) {
-        void loadOtp(ticket.id);
-      }
-      if (ticket.status !== 'AWAITING_OTP' && otpByTicket[ticket.id]) {
-        setOtpByTicket((current) => {
-          const next = { ...current };
-          delete next[ticket.id];
-          return next;
-        });
-      }
-    }
-    // Auto-fetch once per awaiting ticket; pending/otp maps intentionally omitted to avoid loops.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [items]);
-
-  async function submit(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    setSubmitting(true);
-    setSubmitError('');
-    const form = new FormData(event.currentTarget);
-    try {
-      const response = await apiFetch('/api/tickets', {
-        method: 'POST',
-        credentials: 'include',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({
-          category,
-          subtype: category === 'ELECTRICAL' ? String(form.get('subtype') ?? '') : 'General',
-          description: String(form.get('description') ?? ''),
-          priority: form.get('urgent') ? 'URGENT' : 'NORMAL',
-          idempotencyKey: idempotencyKey.current || (idempotencyKey.current = crypto.randomUUID()),
-        }),
-      });
-      if (!response.ok) throw new Error(await apiErrorMessage(response, 'Ticket could not be created'));
-      const result = await response.json() as { publicNo?: string };
-      if (!result.publicNo) throw new Error('Ticket could not be created');
-      setSubmitted(result.publicNo);
-      idempotencyKey.current = '';
-      await refreshTickets();
-    } catch (cause) {
-      setSubmitError(cause instanceof Error ? cause.message : 'Ticket could not be created');
-    } finally {
-      setSubmitting(false);
-    }
-  }
-
-  if (focusId) {
-    const ticket = [...items, ...resolvedItems, ...directoryItems].find((item) => item.id === focusId);
-    return (
-      <OperationalClock timeZone={stallScope?.event.timezone}>
-      <div className="mobile-page">
-        <main className="mobile-shell">
-          <a className="back" href="/stall">← Back</a>
-          {ticket ? <TicketCard ticket={ticket} audience="stall" showMilestones /> : <p className="empty-state">This request is not in your stall list.</p>}
-          <TicketActivity ticketId={focusId} />
-        </main>
-      </div>
-      </OperationalClock>
-    );
-  }
-
-  return (
-    <OperationalClock timeZone={stallScope?.event.timezone}>
-    <div className="mobile-page">
-      <main className="mobile-shell">
-        <header className="mobile-header">
-          <div><span className="eyebrow">{stallScope?.event.name ?? 'EveOps event'}</span><h1>{stallScope?.stall ? 'Stall ' + stallScope.stall.stallCode : 'Your stall'}</h1></div>
-          <span className="online">{connection === 'live' ? 'Live' : connection === 'reconnecting' ? 'Reconnecting…' : 'Connecting…'}</span>
-        </header>
-        {submitted ? (
-          <section className="success-panel">
-            <span className="success-mark" aria-hidden="true">✓</span>
-            <h2>Ticket {submitted} confirmed</h2>
-            <p>The server confirmed your ticket. Hall Manager notified; waiting for assignment.</p>
-            <button onClick={() => { setSubmitted(''); setShowForm(false); }}>View ticket</button>
-          </section>
-        ) : showForm ? (
-          <form className="raise-form" onSubmit={submit}>
-            <button type="button" className="back" onClick={() => setShowForm(false)}>← Back</button>
-            <span className="eyebrow">Locked location · {locationLabel}</span>
-            <h2>What do you need?</h2>
-            <fieldset className="service-grid">
-              <legend>Service category</legend>
-              <label><input type="radio" name="service" required value="ELECTRICAL" onChange={() => setCategory('ELECTRICAL')} />Electrical</label>
-              <label><input type="radio" name="service" value="HOUSE_HELP" onChange={() => setCategory('HOUSE_HELP')} />House Help</label>
-              <label><input type="radio" name="service" value="HALL_MANAGER" onChange={() => setCategory('HALL_MANAGER')} />Hall Manager</label>
-            </fieldset>
-            {category === 'ELECTRICAL' && <label className="field">Electrical subtype<select name="subtype" required><option value="">Choose subtype</option><option value="NCP">NCP</option><option value="Lighting">Lighting</option></select></label>}
-            <label className="field">Brief description<textarea name="description" required minLength={3} maxLength={500} placeholder="Tell us what needs attention" /></label>
-            <label className="urgent"><input type="checkbox" name="urgent" /> Mark as urgent</label>
-            {submitError && <div className="form-error" role="alert">{submitError}</div>}
-            <button className="primary full-width" type="submit" disabled={submitting || !category}>{submitting ? 'Confirming…' : 'Raise ticket'}</button>
-          </form>
-        ) : showProfile ? (
-          <section className="success-panel">
-            <h2>Your stall</h2>
-            <p>{profile?.name}</p>
-            <p>{profile?.email}</p>
-            {profile?.phone && <p>{profile.phone}</p>}
-            <p>{locationLabel}</p>
-            <PushOptIn />
-            <button type="button" onClick={() => setShowProfile(false)}>Back to requests</button>
-          </section>
-        ) : showAll ? (
-          <section>
-            <button type="button" className="back" onClick={() => setShowAll(false)}>← Back</button>
-            <h2>My tickets</h2>
-            <label className="field">Search<input value={ticketSearch} onChange={(event) => setTicketSearch(event.target.value)} placeholder="Ticket number or issue" /></label>
-            {filteredDirectory.length ? filteredDirectory.map((ticket) => <a className="ticket-link" key={ticket.id} href={'/stall/ticket/' + ticket.id}><TicketCard ticket={ticket} audience="stall" /></a>) : <p className="empty-state">No tickets match this search.</p>}
-          </section>
-        ) : showHelp ? (
-          <section className="success-panel">
-            <h2>Need operational help?</h2>
-            <p>Raise a Hall Manager ticket for event assistance. For an existing request, include the ticket number when speaking with your Hall Manager.</p>
-            <button className="primary" onClick={() => { idempotencyKey.current = crypto.randomUUID(); setShowHelp(false); setShowForm(true); }}>Raise a help ticket</button>
-            <button onClick={() => setShowHelp(false)}>Back to tickets</button>
-          </section>
-        ) : (
-          <>
-            <button className="raise" onClick={() => { idempotencyKey.current = crypto.randomUUID(); setShowForm(true); }}><span aria-hidden="true">＋</span> Raise a ticket</button>
-            <section>
-              <div className="section-title"><h2>Active requests</h2><span>{total} open</span></div>
-              {submitError && <div className="form-error" role="alert">{submitError}</div>}
-              {loading ? <p className="empty-state">Loading your requests…</p> : loadError ? <p className="form-error">{loadError}</p> : items.length ? (showAll ? items : items.slice(0, 3)).map((ticket) => (
-                <div key={ticket.id}>
-                  <a className="ticket-link" href={'/stall/ticket/' + ticket.id}><TicketCard ticket={ticket} audience="stall" /></a>
-                  {ticket.status === 'AWAITING_OTP' && (
-                    <div className="otp-panel otp-display-panel">
-                      <p className="otp-kicker">Staff has requested completion</p>
-                      <p>Check the work before sharing this code.</p>
-                      {(ticket.firstStartedAt || ticket.completionRequestedAt) && (
-                        <div className="otp-milestones">
-                          {ticket.firstStartedAt && <span>Work started · {shortTime(ticket.firstStartedAt) ?? '—'}</span>}
-                          {ticket.completionRequestedAt && <span>Completion requested · {shortTime(ticket.completionRequestedAt) ?? '—'}</span>}
-                        </div>
-                      )}
-                      {otpByTicket[ticket.id] && countdownLabel(otpExpiryByTicket[ticket.id], nowMs) !== '00:00' ? (
-                        <>
-                          <p className="otp-code-label">Completion code</p>
-                          <div aria-label={`Completion code ${otpByTicket[ticket.id].split('').join(' ')}`}>
-                            <OtpDigits value={otpByTicket[ticket.id]} />
-                          </div>
-                          <p className="otp-expiry">Expires in {countdownLabel(otpExpiryByTicket[ticket.id], nowMs)}</p>
-                          <p className="otp-hint">Tell this code to the assigned worker or hall manager only if the work is complete.</p>
-                          <button type="button" className="secondary-action" disabled={otpPending[ticket.id]} onClick={() => void regenerateOtp(ticket.id)}>
-                            Request new completion code
-                          </button>
-                        </>
-                      ) : otpExpiredByTicket[ticket.id] || (otpByTicket[ticket.id] && countdownLabel(otpExpiryByTicket[ticket.id], nowMs) === '00:00') ? (
-                        <>
-                          <p className="form-error" role="alert">Verification code expired</p>
-                          <button type="button" className="primary" disabled={otpPending[ticket.id]} onClick={() => void regenerateOtp(ticket.id)}>
-                            {otpPending[ticket.id] ? 'Generating…' : 'Generate new code'}
-                          </button>
-                        </>
-                      ) : (
-                        <button type="button" className="primary" disabled={otpPending[ticket.id]} onClick={() => void loadOtp(ticket.id)}>
-                          {otpPending[ticket.id] ? 'Loading code…' : 'Show completion code'}
-                        </button>
-                      )}
-                      <ComplaintDisclosure ticketId={ticket.id} summary="Work is not satisfactory" onSuccess={async () => { setOtpByTicket((current) => { const next = { ...current }; delete next[ticket.id]; return next; }); await refreshTickets(); }} />
-                    </div>
-                  )}
-                </div>
-              )) : <p className="empty-state">No active requests for this stall.</p>}
-            </section>
-            <section>
-              <div className="section-title"><h2>Recently resolved</h2><button className="link" onClick={() => setShowAll(true)}>View all</button></div>
-              {resolvedLoading ? <p className="empty-state">Loading resolved requests…</p> : resolvedItems.length ? resolvedItems.map((ticket) => (
-                <div key={ticket.id}>
-                  <a className="ticket-link" href={'/stall/ticket/' + ticket.id}><div className="recent"><Status value="CLOSED" audience="stall" /><strong>{ticket.no} · {ticket.service}</strong><span>{ticket.closedAt ? `Completed ${eventTime(ticket.closedAt)}` : 'Completed'}</span></div></a>
-                  <ComplaintDisclosure ticketId={ticket.id} summary="Report a problem" onSuccess={refreshTickets} />
-                </div>
-              )) : <p className="empty-state">No resolved requests yet.</p>}
-            </section>
-          </>
-        )}
-        <nav className="bottom-nav" aria-label="Stall navigation"><button onClick={() => { setShowHelp(false); setShowAll(false); setShowProfile(false); }}>Home</button><button onClick={() => { setShowHelp(false); setShowProfile(false); setShowAll(true); }}>My tickets</button><button onClick={() => { setShowHelp(false); setShowAll(false); setShowProfile(true); }}>Profile</button><LogoutButton /></nav>
-      </main>
-    </div>
-    </OperationalClock>
-  );
-}
-
-function urlBase64ToBytes(value: string) {
-  const padding = '='.repeat((4 - (value.length % 4)) % 4);
-  const base64 = (value + padding).replace(/-/g, '+').replace(/_/g, '/');
-  const raw = window.atob(base64);
-  const output = new Uint8Array(raw.length);
-  for (let index = 0; index < raw.length; index += 1) output[index] = raw.charCodeAt(index);
-  return output;
-}
-
-function PushOptIn() {
-  const [message, setMessage] = useState('Background alerts use the browser’s notification permission.');
-  async function enable() {
-    if (!('serviceWorker' in navigator) || !('PushManager' in window)) {
-      setMessage('This browser does not support background notifications.');
-      return;
-    }
-    const permission = await Notification.requestPermission();
-    if (permission !== 'granted') {
-      setMessage(permission === 'denied' ? 'Notifications are blocked in the browser settings.' : 'Notification permission was not granted.');
-      return;
-    }
-    const config = await apiFetch('/api/notifications/push-config', { credentials: 'include', cache: 'no-store' });
-    const body = await config.json() as { configured: boolean; publicKey: string | null };
-    if (!config.ok || !body.configured || !body.publicKey) {
-      setMessage('Background alerts are not configured on this server yet. On-screen alerts still work.');
-      return;
-    }
-    const registration = await navigator.serviceWorker.register('/sw.js');
-    const subscription = await registration.pushManager.subscribe({
-      userVisibleOnly: true,
-      applicationServerKey: urlBase64ToBytes(body.publicKey),
-    });
-    const json = subscription.toJSON();
-    const saved = await apiFetch('/api/notifications/push-subscription', {
-      method: 'POST',
-      credentials: 'include',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ endpoint: json.endpoint, p256dh: json.keys?.p256dh, auth: json.keys?.auth }),
-    });
-    setMessage(saved.ok ? 'Background alerts are on for this browser.' : 'The subscription could not be saved.');
-    if (json.endpoint) window.localStorage.setItem('eveops-push-endpoint', json.endpoint);
-  }
-  return (
-    <div>
-      <button type="button" onClick={() => void enable()}>Allow background alerts</button>
-      <p className="otp-hint">{message}</p>
-    </div>
   );
 }
 
@@ -1195,16 +818,12 @@ const navByRole: Record<'HALL_MANAGER' | 'ADMIN', string[]> = {
 };
 
 function attentionReason(ticket: Ticket): string | null {
-  if (ticket.status === 'COMPLAINT_RAISED') return 'The stall reported a problem';
-  if (ticket.status === 'ESCALATED') return 'Escalated and waiting for a decision';
-  if (ticket.slaState === 'SLA breached') return 'Past the resolution target';
-  if (ticket.slaState === 'Response overdue') return 'Waiting too long for a response';
-  if (ticket.priority) return 'Marked urgent';
-  if (ticket.status === 'REOPENED' || (ticket.reopenCount > 0 && ['NEW', 'QUEUED', 'ASSIGNED', 'SNOOZED'].includes(ticket.status))) return 'Opened again';
-  if (ticket.status === 'NEW') return 'Just raised';
-  if (ticket.status === 'AWAITING_OTP') return 'Waiting for the stall to confirm completion';
-  if (ticket.status === 'ASSIGNED' || ticket.status === 'SNOOZED') return 'Assigned and not yet started';
-  return null;
+  return managerAttentionLabel({
+    status: ticket.status,
+    slaState: ticket.slaState,
+    priority: ticket.priority,
+    reopenCount: ticket.reopenCount,
+  });
 }
 
 function managementStatusIsSuccess(message: string) {
@@ -1523,9 +1142,9 @@ export function ManagementWorkspace({ role }: { role: 'HALL_MANAGER' | 'ADMIN' }
     ...(role === 'HALL_MANAGER' && hallFilter ? { hallId: hallFilter } : {}),
     ...(role === 'HALL_MANAGER' && debouncedSearch ? { search: debouncedSearch } : {}),
   }).toString();
-  const attentionQuery = role === 'HALL_MANAGER' ? 'view=active&limit=100' : 'view=active&limit=1';
+  const attentionQuery = role === 'HALL_MANAGER' ? 'view=attention&limit=50' : 'view=active&limit=1';
   const { items: queuedItems, total: queueTotal, nextCursor: queueCursor, loading: queueLoading, error: queueError, refresh: refreshQueue, loadMore: loadMoreQueue } = useApiTickets(queueQuery);
-  const { items: attentionSource, nextCursor: attentionCursor, loading: attentionLoading, error: attentionError, refresh: refreshAttention, loadMore: loadMoreAttention } = useApiTickets(attentionQuery);
+  const { items: attentionSource, total: attentionTotal, nextCursor: attentionCursor, loading: attentionLoading, error: attentionError, refresh: refreshAttention, loadMore: loadMoreAttention } = useApiTickets(attentionQuery);
   const [timings, setTimings] = useState<Record<string, TimingRecord>>({});
   const [liveMetrics, setLiveMetrics] = useState<OperationalMetrics>({});
   const [detail, setDetail] = useState<TicketDetail>();
@@ -1624,7 +1243,7 @@ export function ManagementWorkspace({ role }: { role: 'HALL_MANAGER' | 'ADMIN' }
     { label: 'Avg. response', value: duration(liveMetrics.avgResponseSeconds) },
   ];
 
-  const attentionItems = role === 'HALL_MANAGER' ? attentionSource.filter((ticket) => attentionReason(ticket)) : [];
+  const attentionItems = role === 'HALL_MANAGER' ? attentionSource : [];
 
   useEffect(() => {
     if (role === 'HALL_MANAGER') {
@@ -2071,7 +1690,7 @@ export function ManagementWorkspace({ role }: { role: 'HALL_MANAGER' | 'ADMIN' }
       <aside className={role === 'HALL_MANAGER' ? 'sidebar hall-manager' : 'sidebar'}>
         <div className="brand"><span>E</span>EveOps</div>
         <nav aria-label={role === 'ADMIN' ? 'Admin navigation' : 'Hall Manager navigation'}>
-          {navByRole[role].map((item) => <button className={activeSection === item ? 'active' : ''} aria-current={activeSection === item ? 'page' : undefined} onClick={() => { setActiveSection(item); if (role === 'HALL_MANAGER') { setSelected(null); window.scrollTo({ top: 0 }); } }} key={item}>{item}{item === 'Attention' && attentionItems.length > 0 ? <i>{attentionItems.length}</i> : null}{item === 'Workforce' && role === 'ADMIN' && pendingApprovals.length > 0 && <i>{pendingApprovals.length}</i>}</button>)}
+          {navByRole[role].map((item) => <button className={activeSection === item ? 'active' : ''} aria-current={activeSection === item ? 'page' : undefined} onClick={() => { setActiveSection(item); if (role === 'HALL_MANAGER') { setSelected(null); window.scrollTo({ top: 0 }); } }} key={item}>{item}{item === 'Attention' && attentionTotal > 0 ? <i>{attentionTotal}</i> : null}{item === 'Workforce' && role === 'ADMIN' && pendingApprovals.length > 0 && <i>{pendingApprovals.length}</i>}</button>)}
           {role === 'ADMIN' && <Link href="/admin/registrations">Registrations</Link>}
         </nav>
         <div className="user"><span>{role === 'ADMIN' ? 'AD' : 'HM'}</span><div><strong>{profile?.name ?? (role === 'ADMIN' ? 'Event Admin' : 'Hall Manager')}</strong><small>{role.replace('_', ' ')}</small></div></div>
@@ -2166,16 +1785,16 @@ export function ManagementWorkspace({ role }: { role: 'HALL_MANAGER' | 'ADMIN' }
         {(activeSection === 'Reports') && <section className="portfolio-list"><div className="section-title"><div><h2>Reports</h2><p>Scoped metrics for the selected creation range, plus authorized CSV export jobs</p></div><div className="drawer-actions"><label className="sr-only" htmlFor="report-range">Report range</label><select id="report-range" aria-label="Report range" value={reportRange} onChange={(event) => setReportRange(event.target.value as 'live' | 'today' | 'custom')}><option value="live">All tickets in scope</option><option value="today">Created today</option><option value="custom">Custom range</option></select>{reportRange === 'custom' && <><label className="sr-only" htmlFor="report-from">From</label><input id="report-from" aria-label="Report from" type="datetime-local" value={reportFrom} onChange={(event) => setReportFrom(event.target.value)} /><label className="sr-only" htmlFor="report-to">To</label><input id="report-to" aria-label="Report to" type="datetime-local" value={reportTo} onChange={(event) => setReportTo(event.target.value)} /></>}<button type="button" onClick={() => void exportView()}>Queue CSV export</button></div></div><CommandInsights metrics={liveMetrics} />{exports.length ? exports.map((job) => <article key={job.id}><div><strong>{job.format}</strong><span>{eventTime(job.createdAt)}</span></div><div><span>Status</span><strong>{job.status}</strong></div><div><span>Rows</span><strong>{job.rowCount ?? 'Pending'}</strong></div>{job.status === 'READY' && <a href={'/api/management/exports/' + job.id + '/download'}>Download</a>}</article>) : <p className="empty-state">No export jobs yet. Queue an export from Live operations or Reports.</p>}</section>}
         {role === 'HALL_MANAGER' && activeSection === 'Attention' && <section className={selected ? 'workspace manager-focus' : 'workspace'} aria-label="Needs attention">
           <div className="operations">
-            <div className="section-title"><div><h2>Needs attention</h2><p>Newly raised, reopened, complained, escalated, urgent, and overdue work. Waiting tickets stay in Queue.</p></div></div>
-            {attentionLoading ? <p className="empty-state">Loading work that needs attention…</p> : attentionError ? <p className="form-error" role="alert">{attentionError}</p> : !attentionItems.length ? <p className="empty-state">Nothing needs attention right now.</p> : <div className="manager-list">{attentionItems.map((ticket) => <button type="button" key={ticket.id} className={selected?.id === ticket.id ? 'manager-card selected' : 'manager-card'} onClick={() => setSelected(ticket)}><strong>{attentionReason(ticket)}</strong><span>{ticket.location}</span><span>{ticket.service}</span><span>{ticket.no} · {statusLabels[ticket.status]}</span><span>Next: {managerNextStep(ticket)}</span></button>)}</div>}{attentionCursor && <button type="button" onClick={() => void loadMoreAttention()}>Load more</button>}
+            <div className="section-title"><div><h2>Needs attention</h2><p>{attentionTotal} in this hall. Newly raised, reopened, complained, escalated, urgent, overdue, waiting for a completion code, or assigned and not yet started. Ordinary waiting tickets stay in Queue. Showing {attentionItems.length}.</p></div></div>
+            {attentionLoading && !attentionItems.length ? <p className="empty-state">Loading work that needs attention…</p> : attentionError ? <p className="form-error" role="alert">{attentionError}</p> : attentionTotal === 0 ? <p className="empty-state">Nothing needs attention right now.</p> : <div className="manager-list">{attentionItems.map((ticket) => <button type="button" key={ticket.id} className={selected?.id === ticket.id ? 'manager-card selected' : 'manager-card'} onClick={() => setSelected(ticket)}><strong>{attentionReason(ticket) ?? 'Needs attention'}</strong><span>{ticket.location}</span><span>{ticket.service}</span><span>{ticket.no} · {statusLabels[ticket.status]}</span><span>Next: {managerNextStep(ticket)}</span></button>)}</div>}{attentionCursor && <button type="button" onClick={() => void loadMoreAttention()}>Load more</button>}
           </div>
           {ticketPanel}
         </section>}
         {role === 'HALL_MANAGER' && activeSection === 'Queue' && <section className={selected ? 'workspace manager-focus' : 'workspace'} aria-label="Waiting queue">
           <div className="operations">
-            <div className="section-title"><div><h2>Waiting queue</h2><p>{queueTotal} waiting · moved-ahead tickets, then high, medium, and low stall priority, then oldest. Urgency does not change this order. Assigned work stays with the worker.</p></div></div>
+            <div className="section-title"><div><h2>Waiting queue</h2><p>{queueTotal} waiting · moved-ahead tickets, then high, medium, and low stall priority, then oldest. Urgency does not change this order. Assigned work stays with the worker. Showing {queuedItems.length}. A scheduling position appears only when one service is selected and the search is empty. With more than one service, this is the shared waiting order, not one dispatch line.</p></div></div>
             <div className="filters"><select aria-label="Queue service" value={categoryFilter} onChange={(event) => setCategoryFilter(event.target.value)}><option value="">All services</option><option value="ELECTRICAL">Electrical</option><option value="HOUSE_HELP">House Help</option><option value="HALL_MANAGER">Hall Manager</option></select>{hallOptions.length > 1 && <select aria-label="Queue hall" value={hallFilter} onChange={(event) => setHallFilter(event.target.value)}><option value="">All halls</option>{hallOptions.map((hall) => <option key={hall.id} value={hall.id}>{hall.code} · {hall.name}</option>)}</select>}<label className="sr-only" htmlFor="queue-search">Find a waiting ticket</label><input id="queue-search" value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Ticket number or stall" />{(categoryFilter || hallFilter || search) && <button type="button" onClick={() => { setCategoryFilter(''); setHallFilter(''); setSearch(''); }}>Clear filters</button>}</div>
-            {queueLoading ? <p className="empty-state">Loading the waiting queue…</p> : queueError ? <p className="form-error" role="alert">{queueError}</p> : !queuedItems.length ? <p className="empty-state">{categoryFilter || hallFilter || search ? 'No waiting tickets match this search.' : 'No tickets are waiting in the queue.'}</p> : <><div className="manager-list">{queuedItems.map((ticket, index) => <button type="button" key={ticket.id} className={selected?.id === ticket.id ? 'manager-card selected' : 'manager-card'} onClick={() => setSelected(ticket)}><span className="eyebrow">Queue {index + 1}</span><strong>{ticket.no} · Stall {ticket.locationParts.stall}</strong><span>{ticket.location}</span><span>{ticket.service} · {statusLabels[ticket.status]}</span><span>{ticket.queuePriorityOverrideAt ? 'Moved ahead' : `${ticket.servicePriority ?? 'MEDIUM'} stall priority`}{ticket.priority ? ' · Urgent' : ''}</span></button>)}</div>{queueCursor && <button type="button" onClick={() => void loadMoreQueue()}>Load more</button>}</>}
+            {queueLoading ? <p className="empty-state">Loading the waiting queue…</p> : queueError ? <p className="form-error" role="alert">{queueError}</p> : !queuedItems.length ? <p className="empty-state">{categoryFilter || hallFilter || search ? 'No waiting tickets match this search.' : 'No tickets are waiting in the queue.'}</p> : <><div className="manager-list">{queuedItems.map((ticket, index) => <button type="button" key={ticket.id} className={selected?.id === ticket.id ? 'manager-card selected' : 'manager-card'} onClick={() => setSelected(ticket)}><span className="eyebrow">{categoryFilter && !search.trim() ? `Scheduling position ${index + 1}` : 'Waiting'}</span><strong>{ticket.no} · Stall {ticket.locationParts.stall}</strong><span>{ticket.location}</span><span>{ticket.service} · {statusLabels[ticket.status]}</span><span>{ticket.queuePriorityOverrideAt ? 'Moved ahead' : `${ticket.servicePriority ?? 'MEDIUM'} stall priority`}{ticket.priority ? ' · Urgent' : ''}</span></button>)}</div>{queueCursor && <button type="button" onClick={() => void loadMoreQueue()}>Load more</button>}</>}
           </div>
           {ticketPanel}
         </section>}
@@ -2183,7 +1802,7 @@ export function ManagementWorkspace({ role }: { role: 'HALL_MANAGER' | 'ADMIN' }
           <div className="operations">
             <div className="section-title"><div><h2>{role === 'HALL_MANAGER' ? 'Tickets' : 'Live operations'}</h2><p>{role === 'HALL_MANAGER' ? `${total} tickets in this hall. Open one for the full activity log.` : `${total} scoped tickets · server-authoritative status`}</p></div>{role === 'ADMIN' && <button onClick={() => void exportView()}>Export view</button>}</div>
             <div className="filters"><select aria-label="Status filter" value={statusFilter} onChange={(event) => setStatusFilter(event.target.value)}><option value="">All statuses</option>{Object.keys(statusLabels).map((status) => <option key={status} value={status}>{statusLabels[status as TicketStatus]}</option>)}</select><select aria-label="Service filter" value={categoryFilter} onChange={(event) => setCategoryFilter(event.target.value)}><option value="">All services</option><option value="ELECTRICAL">Electrical</option><option value="HOUSE_HELP">House Help</option><option value="HALL_MANAGER">Hall Manager</option></select>{hallOptions.length > 1 && <select aria-label="Hall filter" value={hallFilter} onChange={(event) => setHallFilter(event.target.value)}><option value="">All halls</option>{hallOptions.map((hall) => <option key={hall.id} value={hall.id}>{hall.code} · {hall.name}</option>)}</select>}<label className="sr-only" htmlFor="created-from">Created from</label><input id="created-from" aria-label="Created from" type="datetime-local" value={createdFrom} onChange={(event) => setCreatedFrom(event.target.value)} /><label className="sr-only" htmlFor="created-to">Created to</label><input id="created-to" aria-label="Created to" type="datetime-local" value={createdTo} onChange={(event) => setCreatedTo(event.target.value)} /><label className="sr-only" htmlFor="ticket-search">Search tickets</label><input id="ticket-search" value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search ticket or stall" autoFocus={activeSection === 'Search'} />{filtersActive && <button type="button" onClick={() => { setStatusFilter(''); setCategoryFilter(''); setHallFilter(''); setCreatedFrom(''); setCreatedTo(''); setSearch(''); }}>Clear filters</button>}</div>
-            {loading ? <p className="empty-state">Loading live operations…</p> : loadError ? <p className="form-error">{loadError}</p> : !items.length ? <p className="empty-state">{filtersActive ? 'No tickets match these filters.' : 'No tickets match the current scope.'}{filtersActive && <> <button type="button" onClick={() => { setStatusFilter(''); setCategoryFilter(''); setHallFilter(''); setCreatedFrom(''); setCreatedTo(''); setSearch(''); }}>Clear filters</button></>}</p> : role === 'HALL_MANAGER' ? <><div className="manager-list">{items.map((ticket) => <button type="button" key={ticket.id} className={selected?.id === ticket.id ? 'manager-card selected' : 'manager-card'} onClick={() => setSelected(ticket)}><strong>{ticket.no} · Stall {ticket.locationParts.stall}</strong><span>{ticket.location}</span><span>{ticket.service}</span><span>{statusLabels[ticket.status]} · {ticket.assignee}</span><TimingFacts ticket={ticket} /></button>)}</div>{nextCursor && <button type="button" onClick={() => void loadMore()}>Load more</button>}</> : <><div className="table-wrap"><table><thead><tr><th>Ticket</th><th>Location / issue</th><th>Status</th><th>Timing</th><th>Response</th><th>Total</th><th>Assignee</th><th>SLA</th></tr></thead><tbody>{items.map((ticket) => <tr key={ticket.no} tabIndex={0} className={selected?.no === ticket.no ? 'selected' : ''} onClick={() => setSelected(ticket)} onKeyDown={(event) => { if (event.key === 'Enter') setSelected(ticket); }}><td><strong>{ticket.no}</strong><small>{ticket.service}</small></td><td><strong>{ticket.location}</strong><small>{ticket.description}</small></td><td><Status value={ticket.status} /></td><td className={ticket.priority ? 'red' : ''}><TimingFacts ticket={ticket} /></td><td>{duration(timings[ticket.id]?.assignToAcceptSeconds)}</td><td>{duration(timings[ticket.id]?.totalResolutionSeconds)}</td><td>{ticket.assignee}</td><td><span className={ticket.slaState === 'On track' ? 'sla' : 'sla breach'}>{ticket.slaState}</span></td></tr>)}</tbody></table></div>{nextCursor && <button type="button" onClick={() => void loadMore()}>Load more</button>}</>}
+            {loading ? <p className="empty-state">Loading live operations…</p> : loadError ? <p className="form-error">{loadError}</p> : !items.length ? <p className="empty-state">{filtersActive ? 'No tickets match these filters.' : 'No tickets match the current scope.'}</p> : role === 'HALL_MANAGER' ? <><div className="manager-list">{items.map((ticket) => <button type="button" key={ticket.id} className={selected?.id === ticket.id ? 'manager-card selected' : 'manager-card'} onClick={() => setSelected(ticket)}><strong>{ticket.no} · Stall {ticket.locationParts.stall}</strong><span>{ticket.location}</span><span>{ticket.service}</span><span>{statusLabels[ticket.status]} · {ticket.assignee}</span><TimingFacts ticket={ticket} /></button>)}</div>{nextCursor && <button type="button" onClick={() => void loadMore()}>Load more</button>}</> : <><div className="table-wrap"><table><thead><tr><th>Ticket</th><th>Location / issue</th><th>Status</th><th>Timing</th><th>Response</th><th>Total</th><th>Assignee</th><th>SLA</th></tr></thead><tbody>{items.map((ticket) => <tr key={ticket.no} tabIndex={0} className={selected?.no === ticket.no ? 'selected' : ''} onClick={() => setSelected(ticket)} onKeyDown={(event) => { if (event.key === 'Enter') setSelected(ticket); }}><td><strong>{ticket.no}</strong><small>{ticket.service}</small></td><td><strong>{ticket.location}</strong><small>{ticket.description}</small></td><td><Status value={ticket.status} /></td><td className={ticket.priority ? 'red' : ''}><TimingFacts ticket={ticket} /></td><td>{duration(timings[ticket.id]?.assignToAcceptSeconds)}</td><td>{duration(timings[ticket.id]?.totalResolutionSeconds)}</td><td>{ticket.assignee}</td><td><span className={ticket.slaState === 'On track' ? 'sla' : 'sla breach'}>{ticket.slaState}</span></td></tr>)}</tbody></table></div>{nextCursor && <button type="button" onClick={() => void loadMore()}>Load more</button>}</>}
           </div>
           {ticketPanel}
         </section>}

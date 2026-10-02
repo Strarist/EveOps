@@ -1,5 +1,5 @@
-import { StallWorkspace } from '@/components/role-views';
+import { ExhibitorHome } from '@/components/exhibitor/home';
 
 export default function StallPage() {
-  return <StallWorkspace />;
+  return <ExhibitorHome />;
 }

@@ -343,3 +343,45 @@ a.ticket-link .ticket-card, a.ticket-link .recent { margin-bottom: 0; }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation-duration: .01ms !important; transition-duration: .01ms !important; scroll-behavior: auto !important; }
 }
+
+.mobile-shell.exhibitor { width: min(100%, 40rem); max-width: none; }
+.exhibitor-page .bottom-nav { width: min(100%, 40rem); }
+.exhibitor-header { display: flex; justify-content: space-between; gap: 1rem; align-items: flex-start; margin-bottom: 1.25rem; }
+.exhibitor-header h1 { margin: .15rem 0; font-size: clamp(1.7rem, 4vw, 2.4rem); letter-spacing: -.03em; }
+.exhibitor-place, .exhibitor-note { margin: .2rem 0 .8rem; color: var(--muted); line-height: 1.45; }
+.exhibitor-connection { margin: 0; min-height: 32px; display: inline-flex; align-items: center; padding: .2rem .55rem; border-radius: 999px; background: var(--white); border: 1px solid var(--line); font-size: .75rem; font-weight: 700; }
+.connection-reconnecting { border-color: #e2b15a; }
+.exhibitor-home, .exhibitor-requests, .exhibitor-form, .exhibitor-detail, .exhibitor-profile, .exhibitor-success { display: grid; gap: 1rem; }
+.request-help, .exhibitor-success .primary, .exhibitor-submit { min-height: 56px; display: flex; align-items: center; justify-content: center; border-radius: 12px; background: var(--teal); color: var(--white); text-decoration: none; font-size: 1.15rem; font-weight: 800; }
+.exhibitor-list { display: grid; gap: .75rem; }
+.exhibitor-card { display: grid; gap: .25rem; padding: 1rem; border: 1px solid var(--line); border-radius: 12px; background: var(--white); color: inherit; text-decoration: none; }
+.exhibitor-card strong { font-size: 1.05rem; }
+.exhibitor-card .status { justify-self: start; }
+.exhibitor-filters { display: flex; gap: .5rem; flex-wrap: wrap; }
+.exhibitor-filters button { min-height: 44px; min-width: 44px; padding: .5rem .9rem; border: 1px solid var(--line); border-radius: 999px; background: var(--white); }
+.exhibitor-filters button.is-selected { border-color: var(--teal); background: var(--teal-soft); color: var(--navy); font-weight: 800; }
+.exhibitor-form textarea, .exhibitor-form select, .exhibitor-profile button, .complaint-disclosure button, .complaint-disclosure select, .complaint-disclosure textarea { width: 100%; }
+.exhibitor-submit { scroll-margin-bottom: 7rem; }
+.exhibitor-success { padding: 1.5rem 1rem 2rem; border: 1px solid var(--line); border-radius: 12px; background: var(--white); }
+.exhibitor-number { margin: 0; font-size: 1.8rem; font-weight: 800; letter-spacing: -.03em; }
+.exhibitor-dates { margin: 0; padding: 0; list-style: none; display: grid; gap: .35rem; }
+.exhibitor-account { display: grid; gap: .75rem; margin: 0; }
+.exhibitor-account div { display: grid; gap: .15rem; }
+.exhibitor-account dt { color: var(--muted); font-size: .75rem; font-weight: 700; }
+.exhibitor-account dd { margin: 0; }
+.exhibitor-help, .exhibitor-alerts { display: grid; gap: .6rem; padding: 1rem; border-radius: 12px; background: var(--white); border: 1px solid var(--line); }
+.exhibitor-help p, .exhibitor-alerts p { margin: 0; line-height: 1.5; }
+.completion-code { margin: 0; font-size: clamp(1.8rem, 6vw, 2.4rem); letter-spacing: .28em; font-weight: 800; text-align: center; }
+.exhibitor a:focus-visible, .exhibitor button:focus-visible, .exhibitor input:focus-visible, .exhibitor textarea:focus-visible, .exhibitor select:focus-visible, .exhibitor-nav a:focus-visible { outline: 3px solid var(--navy); outline-offset: 3px; }
+.text-link { color: var(--teal); font-weight: 700; }
+@media (min-width: 768px) {
+  .mobile-shell.exhibitor, .exhibitor-page .bottom-nav { width: min(100% - 2rem, 52rem); }
+}
+@media (min-width: 1024px) {
+  .mobile-shell.exhibitor, .exhibitor-page .bottom-nav { width: min(100% - 3rem, 64rem); }
+  .exhibitor-home { grid-template-columns: 1fr 1fr; align-items: start; }
+  .exhibitor-home .request-help { grid-column: 1 / -1; }
+}
+@media (min-width: 1440px) {
+  .mobile-shell.exhibitor, .exhibitor-page .bottom-nav { width: min(100% - 4rem, 72rem); }
+}
