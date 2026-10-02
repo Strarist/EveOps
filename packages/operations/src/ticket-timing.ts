@@ -99,7 +99,11 @@ export function describeTicketTiming(input: TicketTimingInput, serverNowMs: numb
 
 /** Newest-first lifecycle events from the ticket timeline. */
 export function lifecycleTiming(events: Array<{ eventType: string; createdAt: Date }>) {
-  const latest = (eventType: string) => events.find((event) => event.eventType === eventType)?.createdAt ?? null;
+  const latest = (eventType: string) => events.reduce<Date | null>((found, event) => {
+    if (event.eventType !== eventType) return found;
+    const at = new Date(event.createdAt);
+    return !found || at.getTime() > found.getTime() ? at : found;
+  }, null);
   return {
     complaintRaisedAt: latest('COMPLAINT_RAISED'),
     currentCycleStartedAt: latest('STATUS_REOPENED'),
@@ -115,19 +119,63 @@ export const serviceQueueOrderBy = [
   { id: 'asc' as const },
 ];
 
-export function ticketListOrder(view?: string) {
+const activeListOrder = [
+  { priority: 'desc' as const },
+  { createdAt: 'asc' as const },
+  { id: 'asc' as const },
+];
+
+/**
+ * Queued view follows service-queue precedence.
+ * Attention uses the same order as the active list: urgent, then oldest, then id.
+ * `recent` is newest created first and is not a scheduling rank.
+ */
+export function ticketListOrder(view?: string, sort?: string) {
   if (view === 'queued') return serviceQueueOrderBy;
+  if (sort === 'recent') {
+    return [
+      { createdAt: 'desc' as const },
+      { id: 'desc' as const },
+    ];
+  }
   if (view === 'closed') {
     return [
       { closedAt: { sort: 'desc' as const, nulls: 'last' as const } },
       { id: 'desc' as const },
     ];
   }
-  return [
-    { priority: 'desc' as const },
-    { createdAt: 'asc' as const },
-    { id: 'asc' as const },
-  ];
+  return activeListOrder;
+}
+
+export type ManagerAttentionInput = {
+  status: string;
+  slaState?: string | null;
+  priority?: boolean | string | null;
+  reopenCount?: number | null;
+};
+
+/**
+ * Hall Manager attention, matching the operational list:
+ * complained, escalated, past the resolution target, response overdue,
+ * urgent, opened again, newly raised, waiting for a completion code,
+ * or assigned and not yet started.
+ * Ordinary queued, accepted, and in-progress work is not included.
+ * Closed and cancelled work is not included.
+ */
+export function managerAttentionLabel(ticket: ManagerAttentionInput): string | null {
+  if (ticket.status === 'CLOSED' || ticket.status === 'CANCELLED') return null;
+  if (ticket.status === 'COMPLAINT_RAISED') return 'The stall reported a problem';
+  if (ticket.status === 'ESCALATED') return 'Escalated and waiting for a decision';
+  if (ticket.slaState === 'SLA breached' || ticket.slaState === 'SLA_BREACHED') return 'Past the resolution target';
+  if (ticket.slaState === 'Response overdue' || ticket.slaState === 'RESPONSE_OVERDUE') return 'Waiting too long for a response';
+  if (ticket.priority === true || ticket.priority === 'URGENT') return 'Marked urgent';
+  if (ticket.status === 'REOPENED' || ((ticket.reopenCount ?? 0) > 0 && ['NEW', 'QUEUED', 'ASSIGNED', 'SNOOZED'].includes(ticket.status))) {
+    return 'Opened again';
+  }
+  if (ticket.status === 'NEW') return 'Just raised';
+  if (ticket.status === 'AWAITING_OTP') return 'Waiting for the stall to confirm completion';
+  if (ticket.status === 'ASSIGNED' || ticket.status === 'SNOOZED') return 'Assigned and not yet started';
+  return null;
 }
 
 export function displayLiveAgeSeconds(status: string, createdAt: Date, nowMs: number): number | null {

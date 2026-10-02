@@ -15,9 +15,11 @@ export {
   operationalNow,
   serverClockOffset,
   shouldRefreshForTicketEvent,
+  managerAttentionLabel,
   serviceQueueOrderBy,
   ticketListOrder,
 } from './ticket-timing';
+export type { ManagerAttentionInput } from './ticket-timing';
 export type { TicketTimingDisplay, TicketTimingInput, TimingFact } from './ticket-timing';
 export {
   isOperationalRole,

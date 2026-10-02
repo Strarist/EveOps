@@ -7,6 +7,7 @@ import {
   serverClockOffset,
   serviceQueueOrderBy,
   shouldRefreshForTicketEvent,
+  managerAttentionLabel,
   ticketListOrder,
 } from '@eveops/operations';
 
@@ -96,6 +97,19 @@ describe('ticket timing display', () => {
     expect(ticketListOrder('active').some((rule) => 'priority' in rule)).toBe(true);
     expect(ticketListOrder('active').some((rule) => 'servicePriority' in rule)).toBe(false);
     expect(ticketListOrder('closed')[0]).toEqual({ closedAt: { sort: 'desc', nulls: 'last' } });
+    expect(ticketListOrder('attention')).toEqual(ticketListOrder('active'));
+    expect(ticketListOrder('all', 'recent')[0]).toEqual({ createdAt: 'desc' });
+    expect(ticketListOrder('queued', 'recent')).toEqual(serviceQueueOrderBy);
+    expect(managerAttentionLabel({ status: 'COMPLAINT_RAISED' })).toBe('The stall reported a problem');
+    expect(managerAttentionLabel({ status: 'QUEUED', priority: 'NORMAL', reopenCount: 0, slaState: 'ON_TRACK' })).toBeNull();
+    expect(managerAttentionLabel({ status: 'IN_PROGRESS', priority: 'URGENT' })).toBe('Marked urgent');
+    expect(managerAttentionLabel({ status: 'QUEUED', reopenCount: 1, slaState: 'ON_TRACK' })).toBe('Opened again');
+    expect(managerAttentionLabel({ status: 'ACCEPTED', slaState: 'RESPONSE_OVERDUE' })).toBe('Waiting too long for a response');
+    expect(managerAttentionLabel({ status: 'IN_PROGRESS', slaState: 'SLA_BREACHED' })).toBe('Past the resolution target');
+    expect(managerAttentionLabel({ status: 'ASSIGNED' })).toBe('Assigned and not yet started');
+    expect(managerAttentionLabel({ status: 'AWAITING_OTP' })).toBe('Waiting for the stall to confirm completion');
+    expect(managerAttentionLabel({ status: 'CLOSED', priority: 'URGENT' })).toBeNull();
+    expect(managerAttentionLabel({ status: 'SNOOZED' })).toBe('Assigned and not yet started');
   });
 
   it('does not treat work awaiting a code as resolved', () => {

@@ -38,7 +38,8 @@ export class ListTicketsDto {
   @IsOptional() @IsDateString() createdTo?: string;
   @IsOptional() @IsString() search?: string;
   @IsOptional() @IsString() cursor?: string;
-  @IsOptional() @IsIn(['active', 'closed', 'all', 'queued']) view: 'active' | 'closed' | 'all' | 'queued' = 'all';
+  @IsOptional() @IsIn(['active', 'closed', 'all', 'queued', 'attention']) view: 'active' | 'closed' | 'all' | 'queued' | 'attention' = 'all';
+  @IsOptional() @IsIn(['recent']) sort?: 'recent';
   @IsOptional() @Type(() => Number) @IsInt() @Min(1) @Max(100) limit = 50;
 }
 
@@ -166,7 +167,10 @@ export class TicketService {
     }
     if (scope.role === 'HALL_MANAGER') where.hallId = { in: scope.hallIds };
     if (query.view === 'queued') where.status = 'QUEUED';
-    else if (query.status) where.status = query.status;
+    else if (query.view === 'attention') {
+      const attention = await this.attentionEligibility(new Date(), scope.eventIds);
+      where.AND = [...(Array.isArray(where.AND) ? where.AND : where.AND ? [where.AND] : []), attention];
+    } else if (query.status) where.status = query.status;
     else if (query.view === 'active') where.status = { in: [...ACTIVE_TICKET_STATUSES] };
     else if (query.view === 'closed') where.status = 'CLOSED';
     if (query.category) where.category = query.category;
@@ -217,7 +221,7 @@ export class TicketService {
             select: { eventType: true, createdAt: true },
           },
         },
-        orderBy: ticketListOrder(query.view), // queued view uses service-queue precedence
+        orderBy: ticketListOrder(query.view, query.sort),
         take: query.limit + 1,
         ...(query.cursor ? { cursor: { id: query.cursor }, skip: 1 } : {}),
       }),
@@ -274,9 +278,11 @@ export class TicketService {
       throw new BadRequestException('Ticket is not assigned to this staff account');
     }
     const assignmentHistory = [...ticket.assignments].reverse();
+    // Detail dates come from the ticket timeline, independent of list order.
     return projectTicketForRole({
       ...ticket,
       ...projectTicketView(ticket, scope),
+      ...lifecycleTiming(ticket.events),
       assignmentHistory,
       otpChallenges: ticket.otpChallenges,
     }, scope.role);
@@ -704,7 +710,7 @@ export class TicketService {
   async complaint(id: string, scope: AuthScope, reasonCode: string, comment: string | undefined, idempotencyKey: string) {
     if (scope.role === 'STAFF') throw new BadRequestException('Staff cannot raise complaints');
     if (!['WORK_INCOMPLETE', 'WORK_QUALITY', 'WRONG_SERVICE'].includes(reasonCode)) throw new BadRequestException('A valid complaint reason is required');
-    return this.prisma.$transaction(async (tx) => {
+    const updated = await this.prisma.$transaction(async (tx) => {
       await tx.$executeRaw(Prisma.sql`SELECT pg_advisory_xact_lock(hashtextextended(${`${scope.userId}:${idempotencyKey}`}, 2))`);
       const existing = await tx.complaint.findUnique({
         where: { createdBy_idempotencyKey: { createdBy: scope.userId, idempotencyKey } },
@@ -737,6 +743,7 @@ export class TicketService {
       await createLifecycleNotifications(tx, updated, 'COMPLAINT_RAISED', scope.userId);
       return updated;
     });
+    return scope.role === 'STALL' ? this.detail(updated.id, scope) : updated;
   }
 
   async overrideClose(id: string, scope: AuthScope, reason: string) {
@@ -950,6 +957,36 @@ export class TicketService {
     for (const poolId of [...new Set(memberships.map((membership) => membership.poolId))]) {
       await this.assignNextWaiting(poolId);
     }
+  }
+
+  /**
+   * Attention is decided before pagination.
+   * Statuses that always qualify stay in the query. Resolution breach uses each pool's target.
+   * Response overdue matches an open assignment the worker has already marked overdue.
+   */
+  private async attentionEligibility(now: Date, eventIds: string[]): Promise<Prisma.TicketWhereInput> {
+    const pools = await this.prisma.servicePool.findMany({
+      where: { eventId: { in: eventIds } },
+      select: { id: true, resolutionTargetSeconds: true },
+    });
+    const resolutionBreach: Prisma.TicketWhereInput[] = pools.map((pool) => ({
+      poolId: pool.id,
+      createdAt: { lt: new Date(now.getTime() - pool.resolutionTargetSeconds * 1000) },
+    }));
+    resolutionBreach.push({
+      poolId: null,
+      createdAt: { lt: new Date(now.getTime() - 3600 * 1000) },
+    });
+    return {
+      status: { in: [...ACTIVE_TICKET_STATUSES] },
+      OR: [
+        { status: { in: ['COMPLAINT_RAISED', 'ESCALATED', 'REOPENED', 'NEW', 'AWAITING_OTP', 'ASSIGNED', 'SNOOZED'] } },
+        { priority: 'URGENT' },
+        { reopenCount: { gt: 0 }, status: { in: ['NEW', 'QUEUED', 'ASSIGNED', 'SNOOZED'] } },
+        { assignments: { some: { responseOverdueAt: { not: null }, status: { in: ['ACTIVE', 'ACCEPTED'] } } } },
+        ...resolutionBreach,
+      ],
+    };
   }
 
   private otpKey() {

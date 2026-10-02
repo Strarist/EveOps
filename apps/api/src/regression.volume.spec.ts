@@ -3,7 +3,7 @@ import { INestApplication, ValidationPipe } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
 import cookieParser from 'cookie-parser';
 import type { Response } from 'express';
-import { deliverNotificationPush, deliverPendingPushes, describeTicketTiming, serviceQueueOrderBy, type PushSend } from '@eveops/operations';
+import { deliverNotificationPush, deliverPendingPushes, describeTicketTiming, managerAttentionLabel, serviceQueueOrderBy, type PushSend } from '@eveops/operations';
 import { AppModule } from './app.module';
 import { AuthController } from './auth';
 import { SanitizedExceptionFilter } from './http-exception.filter';
@@ -1020,6 +1020,171 @@ const isolated = (() => {
       { sessionId: undefined } as never,
     );
     expect(changed.mustChangePassword).toBe(false);
+  });
+
+  it('pages attention ahead of ordinary work and keeps exhibitor history and codes in scope', async () => {
+    const stall = stallsIn(lab, 'H1')[0];
+    const other = stallsIn(lab, 'H1')[1];
+    const manager = lab.managers.find((person) => person.hallId === stall.hallId)!;
+    const worker = staffBy(lab, 'H1', 'HOUSE_HELP', 1);
+    const created = await createCase(tickets, stall, 'HOUSE_HELP', 'General', 'Code stays with this stall', 'NORMAL', 'case-exhibitor-code');
+    await closeThroughOtp(tickets, created.id, worker, stall, manager.scope);
+    const reopenedOwner = await tickets.detail(created.id, stallScope(stall));
+    expect(reopenedOwner.status).toBe('CLOSED');
+    await expect(tickets.detail(created.id, stallScope(other))).rejects.toThrow(/scope/i);
+    await expect(tickets.activity(created.id, stallScope(other))).rejects.toThrow(/scope/i);
+    await expect(tickets.presentOtp(created.id, stallScope(other))).rejects.toThrow(/scope|stall|OTP|awaiting/i);
+
+    const fresh = await createCase(tickets, stall, 'HOUSE_HELP', 'General', 'Completion code for the owner', 'NORMAL', 'case-exhibitor-open');
+    await tickets.transition(fresh.id, 'ACCEPTED', staffScope(worker));
+    await tickets.transition(fresh.id, 'IN_PROGRESS', staffScope(worker));
+    await tickets.transition(fresh.id, 'AWAITING_OTP', staffScope(worker));
+    const presented = await tickets.presentOtp(fresh.id, stallScope(stall));
+    expect(presented.expired).toBe(false);
+    expect(presented.otp).toMatch(/^\d{6}$/);
+    await expect(tickets.presentOtp(fresh.id, stallScope(other))).rejects.toThrow(/scope/i);
+    const ownerActivity = await tickets.activity(fresh.id, stallScope(stall));
+    expect(ownerActivity.items.length).toBeGreaterThan(0);
+    expect(ownerActivity.items.every((item) => !('eventType' in item) && typeof item.summary === 'string')).toBe(true);
+    expect(JSON.stringify(ownerActivity)).not.toMatch(/servicePriority|slaState|ASSIGNMENT_SNOOZED|queuePriorityOverrideAt/);
+
+    const hallStaff = lab.staff.filter((person) => person.hallCode === 'H1');
+    await prisma.workforceMembership.updateMany({
+      where: { userId: { in: hallStaff.map((person) => person.id) } },
+      data: { availability: 'OFF_DUTY' },
+    });
+    try {
+      const electricalPool = await prisma.servicePool.findFirstOrThrow({
+        where: { hallId: stall.hallId, category: 'ELECTRICAL', subtype: 'Lighting', active: true },
+      });
+      const helpPool = await prisma.servicePool.findFirstOrThrow({
+        where: { hallId: stall.hallId, category: 'HOUSE_HELP', subtype: 'General', active: true },
+      });
+      const now = Date.now();
+      const ordinary = Array.from({ length: 105 }, (_, index) => ({
+        publicNo: `CASE-H-${String(index).padStart(4, '0')}`,
+        eventId: lab.eventId,
+        hallId: stall.hallId,
+        zoneId: stall.zoneId,
+        stallId: stall.id,
+        poolId: helpPool.id,
+        category: 'HOUSE_HELP',
+        subtype: 'General',
+        description: 'Ordinary in-progress work',
+        priority: 'NORMAL' as const,
+        servicePriority: 'MEDIUM' as const,
+        status: 'IN_PROGRESS' as const,
+        createdById: stall.userId,
+        idempotencyKey: `case-page-${String(index).padStart(4, '0')}`,
+        createdAt: new Date(now - (120 - index) * 1000),
+      }));
+      const queued = Array.from({ length: 55 }, (_, index) => ({
+        publicNo: `CASE-Q-${String(index).padStart(4, '0')}`,
+        eventId: lab.eventId,
+        hallId: stall.hallId,
+        zoneId: stall.zoneId,
+        stallId: stall.id,
+        poolId: electricalPool.id,
+        category: 'ELECTRICAL',
+        subtype: 'Lighting',
+        description: 'Queued electrical work',
+        priority: 'NORMAL' as const,
+        servicePriority: (['HIGH', 'MEDIUM', 'LOW'] as const)[index % 3],
+        status: 'QUEUED' as const,
+        createdById: stall.userId,
+        idempotencyKey: `case-queue-${String(index).padStart(4, '0')}`,
+        createdAt: new Date(now - (80 - index) * 1000),
+      }));
+      const house = Array.from({ length: 5 }, (_, index) => ({
+        publicNo: `CASE-W-${String(index).padStart(4, '0')}`,
+        eventId: lab.eventId,
+        hallId: stall.hallId,
+        zoneId: stall.zoneId,
+        stallId: stall.id,
+        poolId: helpPool.id,
+        category: 'HOUSE_HELP',
+        subtype: 'General',
+        description: 'Queued house help',
+        priority: 'NORMAL' as const,
+        servicePriority: 'LOW' as const,
+        status: 'QUEUED' as const,
+        createdById: stall.userId,
+        idempotencyKey: `case-wait-${String(index).padStart(4, '0')}`,
+        createdAt: new Date(now - 30_000 - index * 1000),
+      }));
+      await prisma.ticket.createMany({ data: [...ordinary, ...queued, ...house] });
+      const marker = await prisma.ticket.create({
+        data: {
+          publicNo: 'CASE-MARK',
+          eventId: lab.eventId,
+          hallId: stall.hallId,
+          zoneId: stall.zoneId,
+          stallId: stall.id,
+          poolId: helpPool.id,
+          category: 'HOUSE_HELP',
+          subtype: 'General',
+          description: 'Needs attention beyond the first active page',
+          priority: 'NORMAL',
+          servicePriority: 'MEDIUM',
+          status: 'COMPLAINT_RAISED',
+          createdById: stall.userId,
+          idempotencyKey: 'case-mark',
+          createdAt: new Date(now),
+        },
+      });
+      const activePage = await tickets.list(manager.scope, Object.assign(new ListTicketsDto(), { view: 'active', limit: 50 }));
+      expect(activePage.total).toBeGreaterThan(100);
+      expect(activePage.items.some((item) => item.id === marker.id)).toBe(false);
+
+      const attentionItems = [];
+      let attentionTotal = 0;
+      let cursor: string | undefined;
+      for (let page = 0; page < 20; page += 1) {
+        const listed = await tickets.list(manager.scope, Object.assign(new ListTicketsDto(), { view: 'attention', limit: 50, cursor }));
+        attentionTotal = listed.total;
+        expect(listed.items.every((item) => managerAttentionLabel({
+          status: item.status,
+          slaState: item.slaState,
+          priority: item.priority,
+          reopenCount: item.reopenCount,
+        }))).toBe(true);
+        attentionItems.push(...listed.items);
+        if (!listed.nextCursor) break;
+        cursor = listed.nextCursor;
+      }
+      expect(attentionItems.some((item) => item.id === marker.id)).toBe(true);
+      expect(attentionTotal).toBe(attentionItems.length);
+      expect(attentionItems.map((item) => item.publicNo)).not.toContain('CASE-H-0000');
+
+      const queueFirst = await tickets.list(manager.scope, Object.assign(new ListTicketsDto(), { view: 'queued', category: 'ELECTRICAL', limit: 20 }));
+      const queueSecond = await tickets.list(manager.scope, Object.assign(new ListTicketsDto(), { view: 'queued', category: 'ELECTRICAL', limit: 20, cursor: queueFirst.nextCursor! }));
+      const queueCombined = [...queueFirst.items, ...queueSecond.items];
+      const queueWide = await tickets.list(manager.scope, Object.assign(new ListTicketsDto(), { view: 'queued', category: 'ELECTRICAL', limit: 40 }));
+      expect(queueCombined.map((item) => item.id)).toEqual(queueWide.items.map((item) => item.id));
+      expect(new Set(queueCombined.map((item) => item.id)).size).toBe(queueCombined.length);
+      expect(queueCombined.map((item) => item.publicNo)).not.toContain('CASE-W-0000');
+      expect(JSON.stringify(queueCombined[0])).not.toMatch(/"queueRank"|"queuePosition"/);
+
+      const history = await tickets.list(stallScope(stall), Object.assign(new ListTicketsDto(), { view: 'all', sort: 'recent', limit: 20 }));
+      expect(history.total).toBeGreaterThan(50);
+      expect(history.items.some((item) => item.publicNo === 'CASE-H-0000')).toBe(false);
+      const searched = await tickets.list(stallScope(stall), Object.assign(new ListTicketsDto(), { view: 'all', sort: 'recent', limit: 20, search: 'CASE-H-0000' }));
+      expect(searched.items.map((item) => item.publicNo)).toEqual(['CASE-H-0000']);
+      const oldest = searched.items[0];
+      const direct = await tickets.detail(oldest.id, stallScope(stall));
+      expect(direct.id).toBe(oldest.id);
+      expect(direct.publicNo).toBe('CASE-H-0000');
+      const hidden = JSON.stringify({ list: history.items[0], detail: direct });
+      expect(hidden).not.toMatch(/"servicePriority"|"slaState"|"queuePriorityOverrideAt"|"snoozedUntil"|"escalationLevel"|"assignments"/);
+      await expect(tickets.detail(oldest.id, stallScope(other))).rejects.toThrow(/scope/i);
+    } finally {
+      for (const person of hallStaff) {
+        await prisma.workforceMembership.updateMany({
+          where: { userId: person.id },
+          data: { availability: person.availability, capacity: 1 },
+        });
+      }
+    }
   });
 });
 
