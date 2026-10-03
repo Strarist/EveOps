@@ -19,8 +19,8 @@ export function ExhibitorRequests() {
   const view = requested === 'completed' || requested === 'all' ? requested : 'active';
   const q = searchParams.get('q') ?? '';
   const [draft, setDraft] = useState(q);
-  const { connection, pulse } = useConnection();
-  const { profile } = useStallProfile(connection + pulse);
+  const { pulse } = useConnection();
+  const { profile } = useStallProfile();
   const timeZone = profile?.scopes.find((scope) => scope.event.timezone)?.event.timezone ?? 'UTC';
   const apiView = view === 'completed' ? 'closed' : view;
   const query = `view=${apiView}&limit=20${view === 'completed' ? '' : '&sort=recent'}${q.trim() ? '&search=' + encodeURIComponent(q.trim()) : ''}`;

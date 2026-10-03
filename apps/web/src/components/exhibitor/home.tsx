@@ -5,8 +5,8 @@ import { useConnection, useStallProfile, useStallTickets } from './data';
 import { eventTime, progressText, serviceText } from './format';
 
 export function ExhibitorHome() {
-  const { connection, pulse } = useConnection();
-  const { profile } = useStallProfile(connection + pulse);
+  const { pulse } = useConnection();
+  const { profile } = useStallProfile();
   const timeZone = profile?.scopes.find((scope) => scope.event.timezone)?.event.timezone ?? 'UTC';
   const active = useStallTickets('view=active&limit=3&sort=recent', pulse);
   const recent = useStallTickets('view=closed&limit=3', pulse);

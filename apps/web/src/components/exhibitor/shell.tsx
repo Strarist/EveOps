@@ -9,8 +9,8 @@ import { useConnection, useStallProfile } from './data';
 export function ExhibitorShell({ children }: { children: ReactNode }) {
   const pathname = usePathname();
   const router = useRouter();
-  const { connection, pulse } = useConnection();
-  const { profile, error: profileError, reload } = useStallProfile(connection + pulse);
+  const { connection } = useConnection();
+  const { profile, error: profileError, stale: profileStale, reload } = useStallProfile();
   const scope = profile?.scopes.find((item) => item.stall);
   const stallCode = scope?.stall?.stallCode;
   const place = scope?.stall
@@ -39,6 +39,7 @@ export function ExhibitorShell({ children }: { children: ReactNode }) {
             <p className={'exhibitor-connection connection-' + connection} role="status">{connectionLabel}</p>
           </header>
           {profileError && !profile ? <p className="form-error" role="alert">{profileError} <button type="button" onClick={() => void reload()}>Try again</button></p> : null}
+          {profile && profileStale ? <p className="alert-line" role="status">Account details could not be refreshed. Showing the last loaded account.</p> : null}
           {children}
           <nav className="bottom-nav exhibitor-nav" aria-label="Stall navigation">
             <a href="/stall" aria-current={pathname === '/stall' ? 'page' : undefined}>Home</a>

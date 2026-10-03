@@ -15,7 +15,10 @@ export {
   operationalNow,
   serverClockOffset,
   shouldRefreshForTicketEvent,
+  jitteredRetryMs,
   managerAttentionLabel,
+  retryAfterMs,
+  schedulingQueueLabel,
   serviceQueueOrderBy,
   ticketListOrder,
 } from './ticket-timing';

@@ -1,9 +1,10 @@
 'use client';
 
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { AUTH_LOST_EVENT, apiFetch, subscribeRealtime } from '@/lib/api-client';
+import { apiFetch, subscribeRealtime } from '@/lib/api-client';
 import { noteServerTime } from '@/lib/server-clock';
-import { shouldRefreshForTicketEvent } from '@eveops/ticket-timing';
+import { loadSessionProfile, profileSnapshot, subscribeProfile } from '@/lib/session-profile';
+import { jitteredRetryMs, retryAfterMs, shouldRefreshForTicketEvent } from '@eveops/ticket-timing';
 import type { StallTicket } from './format';
 
 export type StallProfile = {
@@ -20,30 +21,19 @@ export type StallProfile = {
 
 type ListResponse = { items: StallTicket[]; total: number; nextCursor: string | null; serverTime?: string };
 
-export function useStallProfile(refreshKey: number | string = 0) {
-  const [profile, setProfile] = useState<StallProfile | null>(null);
-  const [error, setError] = useState('');
-  const load = useCallback(async () => {
-    try {
-      const response = await apiFetch('/api/auth/profile', { credentials: 'include', cache: 'no-store' });
-      if (response.status === 429) throw new Error('Account details are busy right now. Try again.');
-      if (!response.ok) throw new Error('Account details could not be loaded');
-      setProfile(await response.json() as StallProfile);
-      setError('');
-    } catch (cause) {
-      setError(cause instanceof Error ? cause.message : 'Account details could not be loaded');
-    }
-  }, []);
+export function useStallProfile() {
+  const [snapshot, setSnapshot] = useState(profileSnapshot);
   useEffect(() => {
-    if (profile) return;
-    void load();
-  }, [load, refreshKey, profile]);
-  useEffect(() => {
-    const clear = () => setProfile(null);
-    window.addEventListener(AUTH_LOST_EVENT, clear);
-    return () => window.removeEventListener(AUTH_LOST_EVENT, clear);
+    void loadSessionProfile();
+    return subscribeProfile(() => setSnapshot({ ...profileSnapshot() }));
   }, []);
-  return { profile, error, reload: load };
+  return {
+    profile: snapshot.profile as StallProfile | null,
+    error: snapshot.error,
+    stale: snapshot.stale,
+    denied: snapshot.denied,
+    reload: () => loadSessionProfile(true),
+  };
 }
 
 export function useConnection() {
@@ -73,6 +63,9 @@ export function useStallTickets(query: string, pulse: number) {
   const [nextCursor, setNextCursor] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
+  const [stale, setStale] = useState(false);
+  const cooldownUntil = useRef(0);
+  const retryTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const depthRef = useRef(1);
   const queryRef = useRef(query);
   const seenQuery = useRef('');
@@ -84,6 +77,7 @@ export function useStallTickets(query: string, pulse: number) {
   }
 
   const refresh = useCallback(async (cursor?: string, append = false) => {
+    if (Date.now() < cooldownUntil.current) return;
     const request = ++sequence.current;
     controller.current?.abort();
     const abort = new AbortController();
@@ -100,6 +94,30 @@ export function useStallTickets(query: string, pulse: number) {
         const parameters = new URLSearchParams(query);
         if (pageCursor) parameters.set('cursor', pageCursor);
         const response = await apiFetch('/api/tickets?' + parameters.toString(), { credentials: 'include', cache: 'no-store', signal: abort.signal });
+        if (response.status === 429) {
+          const wait = jitteredRetryMs(retryAfterMs(response.headers.get('retry-after')), Math.random());
+          cooldownUntil.current = Date.now() + wait;
+          if (request !== sequence.current) return;
+          setStale(true);
+          setError('Requests are busy right now. Showing the last loaded list.');
+          if (retryTimer.current) clearTimeout(retryTimer.current);
+          retryTimer.current = setTimeout(() => {
+            retryTimer.current = null;
+            cooldownUntil.current = 0;
+            void refresh();
+          }, wait);
+          return;
+        }
+        if (response.status === 401) {
+          setError('Session expired');
+          setStale(false);
+          return;
+        }
+        if (response.status === 403) {
+          setError('You no longer have access to these requests.');
+          setStale(false);
+          return;
+        }
         if (!response.ok) throw new Error('Requests could not be loaded');
         const receivedAt = Date.now();
         const result = await response.json() as ListResponse;
@@ -118,6 +136,7 @@ export function useStallTickets(query: string, pulse: number) {
       setNextCursor(next);
       depthRef.current = append ? depthRef.current + 1 : fetched;
       setError('');
+      setStale(false);
       seenQuery.current = query;
     } catch (cause) {
       if (abort.signal.aborted) return;
@@ -127,8 +146,16 @@ export function useStallTickets(query: string, pulse: number) {
     }
   }, [query]);
 
-  useEffect(() => { void refresh(); }, [refresh, pulse]);
-  useEffect(() => () => controller.current?.abort(), []);
+  useEffect(() => {
+    if (Date.now() < cooldownUntil.current) return;
+    const wait = pulse === 0 ? 0 : jitteredRetryMs(400, Math.random());
+    const timer = window.setTimeout(() => { void refresh(); }, wait);
+    return () => window.clearTimeout(timer);
+  }, [refresh, pulse]);
+  useEffect(() => () => {
+    controller.current?.abort();
+    if (retryTimer.current) clearTimeout(retryTimer.current);
+  }, []);
 
   return {
     items,
@@ -136,6 +163,7 @@ export function useStallTickets(query: string, pulse: number) {
     nextCursor,
     loading,
     error,
+    stale,
     refresh,
     loadMore: () => nextCursor ? refresh(nextCursor, true) : Promise.resolve(),
   };
@@ -148,8 +176,10 @@ export function useStallTicket(id: string, pulse: number) {
   const [state, setState] = useState<TicketLoadState>('loading');
   const [error, setError] = useState('');
   const sequence = useRef(0);
+  const cooldownUntil = useRef(0);
 
   const load = useCallback(async () => {
+    if (Date.now() < cooldownUntil.current) return;
     const request = ++sequence.current;
     setError('');
     try {
@@ -178,6 +208,22 @@ export function useStallTicket(id: string, pulse: number) {
         setError(message || 'This request could not be loaded');
         return;
       }
+      if (response.status === 429) {
+        const wait = jitteredRetryMs(retryAfterMs(response.headers.get('retry-after')), Math.random());
+        cooldownUntil.current = Date.now() + wait;
+        setError('This request is busy right now. Showing the last loaded details.');
+        setState((current) => current === 'ready' ? current : 'error');
+        window.setTimeout(() => {
+          cooldownUntil.current = 0;
+          void load();
+        }, wait);
+        return;
+      }
+      if (response.status === 401) {
+        setError('Session expired');
+        setState('error');
+        return;
+      }
       if (!response.ok) throw new Error('This request could not be loaded');
       const receivedAt = Date.now();
       const body = await response.json() as StallTicket & { serverTime?: string };
@@ -196,7 +242,12 @@ export function useStallTicket(id: string, pulse: number) {
     setTicket(null);
     setState('loading');
   }, [id]);
-  useEffect(() => { void load(); }, [load, pulse]);
+  useEffect(() => {
+    if (Date.now() < cooldownUntil.current) return;
+    const wait = pulse === 0 ? 0 : jitteredRetryMs(400, Math.random());
+    const timer = window.setTimeout(() => { void load(); }, wait);
+    return () => window.clearTimeout(timer);
+  }, [load, pulse]);
 
   return { ticket, state, error, reload: load };
 }

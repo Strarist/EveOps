@@ -1,6 +1,7 @@
 'use client';
 
 import { useCallback, useEffect, useState } from 'react';
+import { jitteredRetryMs } from '@eveops/ticket-timing';
 import { AUTH_LOST_EVENT, apiFetch, subscribeRealtime } from '../lib/api-client';
 import {
   acknowledgeAlert,
@@ -61,13 +62,24 @@ export function WorkAlertHost({ userId }: { userId: string }) {
     };
     document.addEventListener('visibilitychange', onResume);
     window.addEventListener(AUTH_LOST_EVENT, releaseWorkAlerts);
-    const unsubscribe = subscribeRealtime({ onTicket: () => { void refresh(); }, onConnection: () => undefined });
+    let alertTimer: ReturnType<typeof setTimeout> | null = null;
+    const unsubscribe = subscribeRealtime({
+      onTicket: () => {
+        if (alertTimer) return;
+        alertTimer = setTimeout(() => {
+          alertTimer = null;
+          void refresh();
+        }, jitteredRetryMs(800, Math.random()));
+      },
+      onConnection: () => undefined,
+    });
     void refresh();
     const timer = window.setInterval(() => { void refresh(); }, 15000);
     return () => {
       stop();
       document.removeEventListener('visibilitychange', onResume);
       window.removeEventListener(AUTH_LOST_EVENT, releaseWorkAlerts);
+      if (alertTimer) clearTimeout(alertTimer);
       unsubscribe();
       window.clearInterval(timer);
       releaseWorkAlerts();

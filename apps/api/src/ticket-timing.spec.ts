@@ -7,7 +7,10 @@ import {
   serverClockOffset,
   serviceQueueOrderBy,
   shouldRefreshForTicketEvent,
+  jitteredRetryMs,
   managerAttentionLabel,
+  retryAfterMs,
+  schedulingQueueLabel,
   ticketListOrder,
 } from '@eveops/operations';
 
@@ -110,6 +113,17 @@ describe('ticket timing display', () => {
     expect(managerAttentionLabel({ status: 'AWAITING_OTP' })).toBe('Waiting for the stall to confirm completion');
     expect(managerAttentionLabel({ status: 'CLOSED', priority: 'URGENT' })).toBeNull();
     expect(managerAttentionLabel({ status: 'SNOOZED' })).toBe('Assigned and not yet started');
+    expect(schedulingQueueLabel({ index: 0, category: 'ELECTRICAL', subtype: 'Lighting', scopedHallCount: 1 })).toBe('Scheduling position 1');
+    expect(schedulingQueueLabel({ index: 2, category: 'ELECTRICAL', subtype: 'Lighting', hallId: 'hall-1', scopedHallCount: 3 })).toBe('Scheduling position 3');
+    expect(schedulingQueueLabel({ index: 0, category: 'ELECTRICAL', scopedHallCount: 1 })).toBe('Waiting');
+    expect(schedulingQueueLabel({ index: 0, category: 'ELECTRICAL', subtype: 'Lighting', scopedHallCount: 2 })).toBe('Waiting');
+    expect(schedulingQueueLabel({ index: 0, category: 'ELECTRICAL', subtype: 'Lighting', hallId: 'hall-1', search: 'A12', scopedHallCount: 1 })).toBe('Waiting');
+    expect(retryAfterMs('30', 1_000)).toBe(30_000);
+    expect(retryAfterMs('60')).toBeLessThanOrEqual(120_000);
+    expect(retryAfterMs(new Date(5_000).toUTCString(), 1_000)).toBe(4_000);
+    expect(retryAfterMs(null)).toBe(5_000);
+    expect(jitteredRetryMs(4_000, 0)).toBe(4_000);
+    expect(jitteredRetryMs(4_000, 1)).toBeGreaterThan(4_000);
   });
 
   it('does not treat work awaiting a code as resolved', () => {

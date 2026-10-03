@@ -8,8 +8,8 @@ import { useConnection, useStallProfile, useStallTicket } from './data';
 import { complaintAllowed, countdownLabel, eventTime, progressText, serviceText, stallPlace, type StallTicket } from './format';
 
 export function ExhibitorDetail({ ticketId }: { ticketId: string }) {
-  const { connection, pulse } = useConnection();
-  const { profile } = useStallProfile(connection + pulse);
+  const { pulse } = useConnection();
+  const { profile } = useStallProfile();
   const { ticket, state, error, reload } = useStallTicket(ticketId, pulse);
   const timeZone = ticket?.event?.timezone || profile?.scopes[0]?.event.timezone || 'UTC';
   return (

@@ -31,6 +31,7 @@ export class ListTicketsDto {
   @IsOptional() @IsString() stallId?: string;
   @IsOptional() @IsString() assigneeId?: string;
   @IsOptional() @IsIn(['ELECTRICAL', 'HOUSE_HELP', 'HALL_MANAGER']) category?: string;
+  @IsOptional() @IsString() @Length(1, 80) subtype?: string;
   @IsOptional() @IsIn(['NORMAL', 'URGENT']) priority?: 'NORMAL' | 'URGENT';
   @IsOptional() @Transform(({ value }) => value === true || value === 'true') @IsBoolean() complaint?: boolean;
   @IsOptional() @Transform(({ value }) => value === true || value === 'true') @IsBoolean() reopened?: boolean;
@@ -174,6 +175,7 @@ export class TicketService {
     else if (query.view === 'active') where.status = { in: [...ACTIVE_TICKET_STATUSES] };
     else if (query.view === 'closed') where.status = 'CLOSED';
     if (query.category) where.category = query.category;
+    if (query.subtype) where.subtype = query.subtype;
     if (query.priority) where.priority = query.priority;
     if (query.zoneId) where.zoneId = query.zoneId;
     if (query.stallId) {

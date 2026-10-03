@@ -190,6 +190,9 @@ test('attention and queue pages stay truthful when the hall has more than one pa
   await expect(manager.locator('.drawer .eyebrow')).toHaveText(openTicket);
   await expect.poll(async () => Number((await showing.innerText()).match(/Showing (\d+)/)?.[1] ?? 0)).toBeGreaterThanOrEqual(loaded);
   await manager.getByLabel('Queue service').selectOption('ELECTRICAL');
+  await expect(manager.getByText(/^Scheduling position \d+/)).toHaveCount(0);
+  await expect(manager.getByText('Waiting', { exact: true }).first()).toBeVisible();
+  await manager.getByLabel('Queue subtype').selectOption('Lighting');
   await expect(manager.getByText('Scheduling position 1', { exact: true })).toBeVisible();
   await expect(manager.locator('.drawer .eyebrow')).toHaveText(openTicket);
   await manager.getByLabel('Queue service').selectOption('');

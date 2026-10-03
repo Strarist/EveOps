@@ -130,6 +130,41 @@ const activeListOrder = [
  * Attention uses the same order as the active list: urgent, then oldest, then id.
  * `recent` is newest created first and is not a scheduling rank.
  */
+/**
+ * A scheduling position is the rank inside one service pool:
+ * one hall, one service, and one subtype, with no search mixed in.
+ * Combined queues and search results are waiting tickets, not a dispatch line.
+ */
+export function schedulingQueueLabel(input: {
+  index: number;
+  search?: string | null;
+  category?: string | null;
+  subtype?: string | null;
+  hallId?: string | null;
+  scopedHallCount: number;
+}): string {
+  const oneHall = Boolean(input.hallId) || input.scopedHallCount === 1;
+  const onePool = oneHall && Boolean(input.category) && Boolean(input.subtype) && !input.search?.trim();
+  return onePool ? `Scheduling position ${input.index + 1}` : 'Waiting';
+}
+
+/** Retry-After is either delay-seconds or an HTTP date. Unknown values wait five seconds. */
+export function retryAfterMs(header: string | null | undefined, now = Date.now()): number {
+  if (!header) return 5_000;
+  const numeric = Number(header);
+  if (Number.isFinite(numeric)) return Math.min(120_000, Math.max(0, numeric * 1_000));
+  const parsed = Date.parse(header);
+  if (Number.isFinite(parsed)) return Math.min(120_000, Math.max(0, parsed - now));
+  return 5_000;
+}
+
+/** Add a short spread so screens that hit the same limit do not retry on the same tick. */
+export function jitteredRetryMs(baseMs: number, unitRandom: number): number {
+  const unit = Math.min(1, Math.max(0, unitRandom));
+  const spread = Math.min(1_500, Math.max(250, Math.round(baseMs * 0.25)));
+  return baseMs + Math.floor(unit * spread);
+}
+
 export function ticketListOrder(view?: string, sort?: string) {
   if (view === 'queued') return serviceQueueOrderBy;
   if (sort === 'recent') {
