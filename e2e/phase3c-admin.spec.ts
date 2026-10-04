@@ -172,6 +172,10 @@ test('admin sections, ticket scope, and pagination stay inside the event', async
     await page.setViewportSize({ width, height: 900 });
     for (const [path, name] of shots) {
       await page.goto(path);
+      if (await page.getByText('Your session is still valid.').count()) {
+        await page.waitForTimeout(65_000);
+        await page.goto(path);
+      }
       await expect(page.locator('h1').first()).toBeVisible();
       if (name === 'overview') await expect(page.locator('.metric strong').first()).not.toHaveText('—');
       if (name === 'tickets') await expect(page.locator('.operations .section-title p')).toContainText(/Showing [1-9]/);
@@ -327,24 +331,24 @@ test('registration, workforce approval, export, and session expiry stay in the a
     },
   });
   expect(staffResponse.ok()).toBeTruthy();
-  await admin.goto('/admin?section=Workforce');
+  await gotoReady(admin, '/admin?section=Workforce');
   const approval = admin.locator('article').filter({ hasText: 'Phase 3C staff' }).first();
   await expect(approval).toBeVisible();
   await approval.getByRole('button', { name: 'Approve' }).click();
   await expect(admin.getByText('Phase 3C staff').first()).toBeVisible();
 
-  await admin.goto('/admin?section=Reports');
+  await gotoReady(admin, '/admin?section=Reports');
   await admin.getByRole('button', { name: 'Queue CSV export' }).click();
   const download = admin.getByRole('link', { name: 'Download' }).first();
   await expect(download).toBeVisible({ timeout: 20_000 });
   const file = await admin.request.get(await download.getAttribute('href') ?? '');
   expect(file.ok()).toBeTruthy();
   expect(await file.text()).toContain('ticket_number');
-  await admin.goto('/admin?section=Tickets');
+  await gotoReady(admin, '/admin?section=Tickets');
   await admin.getByLabel('Search tickets').fill('P3C-NO-SUCH-TICKET');
   await expect(admin.getByText('No tickets match these filters.')).toBeVisible();
   await admin.getByRole('button', { name: 'Export this filter' }).click();
-  await admin.goto('/admin?section=Reports');
+  await gotoReady(admin, '/admin?section=Reports');
   await expect.poll(async () => {
     const jobs = await admin.request.get('/api/management/exports');
     const body = await jobs.json() as Array<{ rowCount: number | null; status: string }>;
@@ -357,7 +361,7 @@ test('registration, workforce approval, export, and session expiry stay in the a
   const cookie = (await expiry.context().cookies()).find((item) => item.name === 'eveops_session');
   if (!cookie) throw new Error('Admin session cookie missing');
   await prisma.session.deleteMany({ where: { tokenHash: createHash('sha256').update(cookie.value).digest('hex') } });
-  await expiry.goto('/admin');
+  await gotoReady(expiry, '/admin');
   await expect(expiry).toHaveURL(/\/login/);
 
   await exhibitor.close();
@@ -369,6 +373,14 @@ test('registration, workforce approval, export, and session expiry stay in the a
 async function showingCount(page: Page) {
   const text = await page.locator('.operations .section-title p').innerText();
   return Number(text.match(/Showing (\d+)/)?.[1] ?? 0);
+}
+
+async function gotoReady(page: Page, path: string) {
+  await page.goto(path);
+  if (await page.getByText('Your session is still valid.').count()) {
+    await page.waitForTimeout(65_000);
+    await page.goto(path);
+  }
 }
 
 async function openSession(browser: Browser, email: string, width: number) {

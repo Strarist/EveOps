@@ -26,6 +26,8 @@
     "db:deploy": "prisma migrate deploy",
     "db:seed": "tsx prisma/seed.ts",
     "db:fixture:regression": "npm run db:fixture:regression -w @eveops/api",
+    "db:history:regression": "tsx apps/api/src/regression-history.cli.ts",
+    "lab:regression": "bash scripts/prod-regression.sh",
     "test:regression": "npm run test:regression -w @eveops/api"
   },
   "devDependencies": {

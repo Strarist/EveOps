@@ -53,6 +53,15 @@ describe('authentication scope shape', () => {
     })).toThrow(UnauthorizedException);
   });
 
+  it('accepts an alphanumeric user ID and rejects a blank or spaced one', async () => {
+    const accepted = Object.assign(new LoginDto(), { userId: 'elec-h1-1', password: 'ab12' });
+    const spaced = Object.assign(new LoginDto(), { userId: 'bad id', password: 'ab12' });
+    const missing = Object.assign(new LoginDto(), { password: 'ab12' });
+    expect(await validate(accepted)).toHaveLength(0);
+    expect(await validate(spaced)).not.toHaveLength(0);
+    expect(await validate(missing)).not.toHaveLength(0);
+  });
+
   it('accepts a 4 character sign-in password and rejects one outside 4 to 72 bytes', async () => {
     const accepted = Object.assign(new LoginDto(), { email: 'stall@eveops.test', password: 'ab12' });
     const tooShort = Object.assign(new LoginDto(), { email: 'stall@eveops.test', password: 'ab1' });

@@ -70,6 +70,7 @@ export async function ensureDemoSeed(prisma: PrismaClient) {
         approvalStatus: 'APPROVED',
         passwordHash,
         employeeCode,
+        loginId: employeeCode.toLowerCase(),
         mustChangePassword: false,
       },
       create: {
@@ -79,6 +80,7 @@ export async function ensureDemoSeed(prisma: PrismaClient) {
         role,
         passwordHash,
         employeeCode,
+        loginId: employeeCode.toLowerCase(),
         approvalStatus: 'APPROVED',
         mustChangePassword: false,
       },

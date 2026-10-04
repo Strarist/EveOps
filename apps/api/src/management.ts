@@ -1,5 +1,5 @@
 import { BadRequestException, Body, ConflictException, Controller, ForbiddenException, Get, Injectable, NotFoundException, Param, Patch, Post, Query, Res, StreamableFile, UseGuards } from '@nestjs/common';
-import { ACTIVE_TICKET_STATUSES, type AuthScope, type ServicePriority } from '@eveops/contracts';
+import { ACTIVE_TICKET_STATUSES, LOGIN_IDENTIFIER_PATTERN, USER_ID_MESSAGE, type AuthScope, type ServicePriority } from '@eveops/contracts';
 import type { Response } from 'express';
 import { Prisma } from '@prisma/client';
 import { boundedElapsedSeconds, closedResolutionSeconds, displayLiveAgeSeconds } from '@eveops/operations';
@@ -9,12 +9,13 @@ import {
   IsArray,
   IsBoolean,
   IsDateString,
-  IsEmail,
   IsIn,
   IsInt,
   IsObject,
   IsOptional,
   IsString,
+  Matches,
+  Max,
   MaxLength,
   Min,
   MinLength,
@@ -28,6 +29,7 @@ import { CurrentScope, SessionGuard } from './auth';
 import { IsNewPassword } from './password-policy';
 import { requireAuthority } from './domain';
 import { PrismaService } from './prisma.service';
+import { AUDIT_PAGE_DEFAULT, auditOlderThan, decodeAuditCursor, encodeAuditCursor, mergeAuditPage } from './audit-page';
 import { stallCodeConflictMessage } from './stall-conflict';
 
 export class MetricsQueryDto {
@@ -81,19 +83,19 @@ export class CreateRegistrationLoginDto {
   @IsOptional() @IsString() @MaxLength(80) contact?: string;
   @IsOptional() @IsIn(['HIGH', 'MEDIUM', 'LOW']) servicePriority?: ServicePriority;
   @IsString() @MinLength(2) @MaxLength(120) loginName!: string;
-  @IsEmail() loginEmail!: string;
+  @IsString() @Matches(LOGIN_IDENTIFIER_PATTERN, { message: USER_ID_MESSAGE }) loginEmail!: string;
   @IsString() @MinLength(8) @MaxLength(80) idempotencyKey!: string;
 }
 
 export class CreateExhibitorLoginDto {
   @IsString() @MinLength(2) @MaxLength(120) loginName!: string;
-  @IsEmail() loginEmail!: string;
+  @IsString() @Matches(LOGIN_IDENTIFIER_PATTERN, { message: USER_ID_MESSAGE }) loginEmail!: string;
   @IsString() @MinLength(8) @MaxLength(80) idempotencyKey!: string;
 }
 
 export class CreateAdminDto {
   @IsString() @MinLength(2) name!: string;
-  @IsEmail() email!: string;
+  @IsString() @Matches(LOGIN_IDENTIFIER_PATTERN, { message: USER_ID_MESSAGE }) email!: string;
   @IsString() @IsNewPassword() password!: string;
   @IsArray() @ArrayMinSize(1) @IsString({ each: true }) eventIds!: string[];
 }
@@ -105,8 +107,10 @@ export class CreateExportDto {
 }
 
 export class AuditQueryDto {
-  @IsOptional() @IsString() action?: string;
-  @IsOptional() @IsString() ticket?: string;
+  @IsOptional() @IsString() @MaxLength(80) action?: string;
+  @IsOptional() @IsString() @MaxLength(80) ticket?: string;
+  @IsOptional() @IsString() @MaxLength(240) cursor?: string;
+  @IsOptional() @Type(() => Number) @IsInt() @Min(1) @Max(100) limit?: number;
 }
 
 @Injectable()
@@ -487,39 +491,57 @@ export class ManagementService {
     });
   }
 
-  async audit(scope: AuthScope, query: { action?: string; ticket?: string }) {
+  async audit(scope: AuthScope, query: { action?: string; ticket?: string; cursor?: string; limit?: number }) {
     requireAuthority(scope.role, 'HALL_MANAGER');
+    const limit = query.limit ?? AUDIT_PAGE_DEFAULT;
+    if (!Number.isInteger(limit) || limit < 1 || limit > 100) throw new BadRequestException('Audit page size must be from 1 to 100');
+    const cursor = decodeAuditCursor(query.cursor);
+    if (query.cursor && !cursor) throw new BadRequestException('Audit cursor is invalid');
+    const older = auditOlderThan(cursor);
     const ticketEvents = await this.prisma.ticketEvent.findMany({
       where: {
         eventId: { in: scope.eventIds },
         AND: [
           ...(scope.role === 'HALL_MANAGER' ? [{ ticket: { hallId: { in: scope.hallIds } } }] : []),
           ...(query.ticket ? [{ ticket: { publicNo: { contains: query.ticket, mode: 'insensitive' as const } } }] : []),
+          ...(query.action ? [{ eventType: { contains: query.action, mode: 'insensitive' as const } }] : []),
+          ...(cursor ? [older] : []),
         ],
-        ...(query.action ? { eventType: { contains: query.action, mode: 'insensitive' as const } } : {}),
       },
       include: { actor: { select: { name: true, role: true } }, ticket: { select: { publicNo: true, hallId: true } } },
-      orderBy: { createdAt: 'desc' },
-      take: 200,
+      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+      take: limit + 1,
     });
-    if (!['ADMIN', 'SUPER_ADMIN'].includes(scope.role)) return ticketEvents;
-    const managementAudits = await this.prisma.managementAudit.findMany({
-      where: {
-        OR: [
-          { eventId: { in: scope.eventIds } },
-          { eventId: null, organizationId: (await this.prisma.user.findUniqueOrThrow({ where: { id: scope.userId }, select: { organizationId: true } })).organizationId },
-        ],
-        ...(query.action ? { action: { contains: query.action, mode: 'insensitive' as const } } : {}),
-      },
-      include: {
-        actor: { select: { name: true, role: true } },
-        targetUser: { select: { name: true, employeeCode: true, role: true } },
-      },
-      orderBy: { createdAt: 'desc' },
-      take: 100,
-    });
-    return [
-      ...ticketEvents.map((event) => ({
+    const managementAudits = ['ADMIN', 'SUPER_ADMIN'].includes(scope.role)
+      ? await this.prisma.managementAudit.findMany({
+        where: {
+          AND: [
+            {
+              OR: [
+                { eventId: { in: scope.eventIds } },
+                { eventId: null, organizationId: (await this.prisma.user.findUniqueOrThrow({ where: { id: scope.userId }, select: { organizationId: true } })).organizationId },
+              ],
+            },
+            ...(query.action ? [{ action: { contains: query.action, mode: 'insensitive' as const } }] : []),
+            ...(query.ticket ? [{
+              OR: [
+                { targetUser: { is: { name: { contains: query.ticket, mode: 'insensitive' as const } } } },
+                { targetUser: { is: { employeeCode: { contains: query.ticket, mode: 'insensitive' as const } } } },
+              ],
+            }] : []),
+            ...(cursor ? [older] : []),
+          ],
+        },
+        include: {
+          actor: { select: { name: true, role: true } },
+          targetUser: { select: { name: true, employeeCode: true, role: true } },
+        },
+        orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+        take: limit + 1,
+      })
+      : [];
+    const merged = mergeAuditPage(
+      ticketEvents.map((event) => ({
         id: event.id,
         kind: 'ticket' as const,
         eventType: event.eventType,
@@ -528,7 +550,7 @@ export class ManagementService {
         ticket: event.ticket,
         target: null as null,
       })),
-      ...managementAudits.map((event) => ({
+      managementAudits.map((event) => ({
         id: event.id,
         kind: 'workforce' as const,
         eventType: event.action,
@@ -537,7 +559,13 @@ export class ManagementService {
         ticket: { publicNo: event.targetUser?.role === 'STALL' ? 'Stall account' : (event.targetUser?.employeeCode ?? event.targetUser?.name ?? 'Account') },
         target: event.targetUser,
       })),
-    ].sort((left, right) => right.createdAt.getTime() - left.createdAt.getTime()).slice(0, 200);
+      limit,
+    );
+    const last = merged.items.at(-1);
+    return {
+      items: merged.items,
+      nextCursor: merged.hasMore && last ? encodeAuditCursor({ createdAt: last.createdAt, id: last.id }) : null,
+    };
   }
 
   async masters(scope: AuthScope) {
@@ -1117,6 +1145,7 @@ export class ManagementService {
         organizationId: actor.organizationId,
         name: input.loginName,
         email: input.loginEmail,
+        loginId: input.loginEmail,
         passwordHash: await hash(initialCredential, 12),
         mustChangePassword: true,
         role: 'STALL',
@@ -1169,6 +1198,7 @@ export class ManagementService {
           organizationId: actor.organizationId,
           name: body.name.trim(),
           email: body.email.trim().toLowerCase(),
+          loginId: body.email.trim().toLowerCase(),
           passwordHash: await hash(body.password, 12),
           mustChangePassword: true,
           role: 'ADMIN',

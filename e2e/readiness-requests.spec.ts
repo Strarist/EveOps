@@ -52,6 +52,45 @@ test('a rate-limited refresh keeps the visible list and does not burst retries',
   await page.context().close();
 });
 
+test('a throttled search keeps the typed query and waits out Retry-After', async ({ browser }) => {
+  const page = await openSession(browser, 'regression.stall.h1-01@volume.lab');
+  await page.goto('/stall/requests');
+  await expect(page.getByRole('heading', { name: 'My requests' })).toBeVisible();
+  let ticketReads = 0;
+  await page.route('**/api/tickets?**', async (route) => {
+    ticketReads += 1;
+    await route.fulfill({
+      status: 429,
+      headers: { 'retry-after': '30', 'content-type': 'application/json' },
+      body: JSON.stringify({ message: 'ThrottlerException: Too Many Requests' }),
+    });
+  });
+  await page.getByLabel('Search requests').fill('booth light 42');
+  await expect(page.getByText('Requests are busy right now. Showing the last loaded list.')).toBeVisible();
+  await page.waitForTimeout(800);
+  expect(ticketReads).toBe(1);
+  await expect(page.getByLabel('Search requests')).toHaveValue('booth light 42');
+  await expect(page.getByText('Session expired')).toHaveCount(0);
+  await page.context().close();
+});
+
+test('an expired session is not presented as temporary throttling', async ({ browser }) => {
+  const page = await openSession(browser, 'regression.stall.h1-01@volume.lab');
+  await page.goto('/stall/requests');
+  await expect(page.getByRole('heading', { name: 'My requests' })).toBeVisible();
+  await page.route('**/api/tickets?**', async (route) => {
+    await route.fulfill({
+      status: 401,
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ message: 'Unauthorized' }),
+    });
+  });
+  await page.getByRole('button', { name: 'All' }).click();
+  await expect(page.getByText('Requests are busy right now. Showing the last loaded list.')).toHaveCount(0);
+  await expect(page).toHaveURL(/\/login/);
+  await page.context().close();
+});
+
 async function openSession(browser: Browser, email: string) {
   const context = await browser.newContext({ viewport: { width: 390, height: 844 } });
   const page = await context.newPage();

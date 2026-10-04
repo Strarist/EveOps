@@ -20,7 +20,7 @@ export default function GovernanceAccessPage() {
         credentials: 'include',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({
-          email: String(form.get('email') ?? ''),
+          userId: String(form.get('userId') ?? ''),
           password: String(form.get('password') ?? ''),
           portal: 'GOVERNANCE',
         }),
@@ -57,7 +57,7 @@ export default function GovernanceAccessPage() {
           <form onSubmit={login}>
             <label>
               SuperAdmin ID
-              <input name="email" type="email" autoComplete="username" required />
+              <input name="userId" type="text" autoComplete="username" required minLength={2} maxLength={254} spellCheck={false} />
             </label>
             <label>
               Password

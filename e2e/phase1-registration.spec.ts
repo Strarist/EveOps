@@ -3,7 +3,7 @@ import { expect, test, type Page } from '@playwright/test';
 const password = process.env.REGRESSION_FIXTURE_PASSWORD ?? '';
 
 test.beforeAll(() => {
-  if (password.length < 12) throw new Error('Set REGRESSION_FIXTURE_PASSWORD before browser regression. Do not commit it.');
+  if (!/^[0-9]{4,7}$/.test(password)) throw new Error('Set REGRESSION_FIXTURE_PASSWORD to 4–7 digits before browser regression. Do not commit it.');
 });
 
 test.use({ screenshot: 'off', trace: 'off', video: 'off' });
@@ -75,7 +75,7 @@ test('exhibitor visibility and admin registration journeys', async ({ browser })
   await create.locator('input[name="loginName"]').fill('Phase 1 duplicate');
   await create.locator('input[name="loginEmail"]').fill(`other.${suffix}@volume.lab`);
   await create.getByRole('button', { name: 'Create stall and exhibitor login' }).click();
-  await expect(adminPage.locator('.form-error')).toContainText(`Stall code ${stallCode} is already used in this zone`);
+  await expect(adminPage.locator('p.form-error[role="alert"]')).toContainText(`Stall code ${stallCode} is already used in this zone`);
 
   await adminPage.reload();
   const row = adminPage.locator('article').filter({ hasText: stallCode }).first();
@@ -96,14 +96,13 @@ test('exhibitor visibility and admin registration journeys', async ({ browser })
   await stallPage.waitForURL(/\/stall/);
   await expect(stallPage.getByRole('heading', { name: `Stall ${stallCode}` })).toBeVisible();
   await expect(stallPage.getByText(/snooze|queue priority|SLA/i)).toHaveCount(0);
-  await stallPage.getByRole('button', { name: 'Raise a ticket' }).click();
+  await stallPage.getByRole('link', { name: 'Request help' }).click();
   await stallPage.getByLabel('House Help').check();
-  await stallPage.locator('textarea[name="description"]').fill('Need a chair moved for the booth');
-  await stallPage.getByRole('button', { name: 'Raise ticket' }).click();
-  await expect(stallPage.getByRole('heading', { name: /confirmed/i })).toBeVisible();
-  await stallPage.getByRole('button', { name: 'View ticket' }).click();
+  await stallPage.getByLabel('What needs attention?').fill('Need a chair moved for the booth');
+  await stallPage.getByRole('button', { name: 'Request help' }).click();
+  await expect(stallPage.getByRole('heading', { name: 'Request received.' })).toBeVisible();
+  await stallPage.getByRole('link', { name: 'View request' }).click();
   await expect(stallPage.getByText(/Waiting for assistance|Staff assigned|Request received/)).toBeVisible();
-  await stallPage.locator('a.ticket-link').first().click();
   await expect(stallPage.getByRole('heading', { name: 'Activity' })).toBeVisible();
   await expect(stallPage.getByText('Your request was received.')).toBeVisible();
   await expect(stallPage.getByText(/ASSIGNMENT_SNOOZED|SERVICE_PRIORITY|SLA_BREACHED|queue priority/i)).toHaveCount(0);
@@ -133,7 +132,7 @@ test('exhibitor visibility and admin registration journeys', async ({ browser })
 
 async function signIn(page: Page, email: string, secret: string, url: RegExp) {
   await page.goto('/login');
-  await page.locator('input[name="email"]').fill(email);
+  await page.locator('input[name="userId"]').fill(email);
   await page.locator('input[name="password"]').fill(secret);
   await page.getByRole('button', { name: 'Sign in' }).click();
   await page.waitForURL(url, { timeout: 20_000 });

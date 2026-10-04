@@ -718,6 +718,7 @@ const isolated = (() => {
         organizationId: adminUser.organizationId,
         name: 'Shared exhibitor',
         email: `regression.case.shared.${suffix}@volume.lab`,
+        loginId: `regression.case.shared.${suffix}@volume.lab`,
         passwordHash: 'not-used',
         role: 'STALL',
         status: 'ACTIVE',

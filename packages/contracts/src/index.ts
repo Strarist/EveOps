@@ -8,6 +8,12 @@ export const PASSWORD_MAX_BYTES = 72;
 export const NEW_PASSWORD_PATTERN = /^(?=.*[A-Za-z])(?=.*\d).+$/;
 export const NEW_PASSWORD_MESSAGE = 'Password must include at least one letter and one number';
 
+/** Sign-in user ID: letters, digits, and hyphens, 2–32 characters. Stored lowercase. */
+export const USER_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9-]{1,31}$/;
+export const USER_ID_MESSAGE = 'User ID must be 2–32 letters, digits, or hyphens';
+/** User ID, or an existing email-shaped identifier still accepted at sign-in. */
+export const LOGIN_IDENTIFIER_PATTERN = /^(?:[A-Za-z0-9][A-Za-z0-9-]{1,31}|[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})$/;
+
 export const ROLES = ['STALL', 'STAFF', 'HALL_MANAGER', 'ADMIN', 'SUPER_ADMIN'] as const;
 export type Role = (typeof ROLES)[number];
 

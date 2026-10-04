@@ -1,4 +1,4 @@
-import { assertEffectiveDatabase, classifyPushEndpoint, publishedDatabaseName, pushEndpointShapeAllowed } from '@eveops/operations';
+import { assertEffectiveDatabase, classifyPushEndpoint, publishedDatabaseName, pushEndpointShapeAllowed, resolvePushTransport } from '@eveops/operations';
 
 const probe = {
   $queryRaw: async () => [{ name: 'eveops_regression' }],
@@ -28,6 +28,15 @@ describe('database name publication', () => {
     process.env.EVEOPS_REQUIRE_DATABASE = 'eveops';
     await expect(assertEffectiveDatabase(probe as never)).rejects.toThrow(/eveops_regression/);
     expect(publishedDatabaseName()).toBeUndefined();
+  });
+});
+
+describe('push transport selection', () => {
+  it('keeps external web push as the default and names the lab capture mode', () => {
+    expect(resolvePushTransport({})).toBe('web-push');
+    expect(resolvePushTransport({ EVEOPS_PUSH_TRANSPORT: 'capture' })).toBe('capture');
+    expect(resolvePushTransport({ EVEOPS_PUSH_TRANSPORT: 'disabled' })).toBe('disabled');
+    expect(() => resolvePushTransport({ EVEOPS_PUSH_TRANSPORT: 'off' })).toThrow(/web-push, capture, or disabled/);
   });
 });
 

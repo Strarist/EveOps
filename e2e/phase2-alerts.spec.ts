@@ -11,7 +11,7 @@ test.use({ screenshot: 'off', trace: 'off', video: 'off' });
 test.describe.configure({ mode: 'serial' });
 
 test.beforeAll(() => {
-  if (password.length < 12) throw new Error('Set REGRESSION_FIXTURE_PASSWORD before browser regression. Do not commit it.');
+  if (!/^[0-9]{4,7}$/.test(password)) throw new Error('Set REGRESSION_FIXTURE_PASSWORD to 4–7 digits before browser regression. Do not commit it.');
 });
 
 test.afterAll(async () => {

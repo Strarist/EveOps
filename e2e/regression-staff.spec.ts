@@ -4,7 +4,7 @@ const password = process.env.REGRESSION_FIXTURE_PASSWORD ?? '';
 const widths = [360, 390, 768, 1024, 1440];
 
 test.beforeAll(() => {
-  if (password.length < 12) throw new Error('Set REGRESSION_FIXTURE_PASSWORD before browser regression. Do not commit it.');
+  if (!/^[0-9]{4,7}$/.test(password)) throw new Error('Set REGRESSION_FIXTURE_PASSWORD to 4–7 digits before browser regression. Do not commit it.');
 });
 
 test('electrician and house help task lists stay usable', async ({ browser }) => {
@@ -50,7 +50,7 @@ test('electrician and house help task lists stay usable', async ({ browser }) =>
 
 async function signIn(page: Page, email: string) {
   await page.goto('/login');
-  await page.locator('input[name="email"]').fill(email);
+  await page.locator('input[name="userId"]').fill(email);
   await page.locator('input[name="password"]').fill(password);
   for (let attempt = 0; attempt < 3; attempt += 1) {
     await page.getByRole('button', { name: 'Sign in' }).click();

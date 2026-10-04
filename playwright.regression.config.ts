@@ -1,33 +1,39 @@
 import { defineConfig, devices } from '@playwright/test';
 
-const baseURL = process.env.E2E_BASE_URL ?? 'http://localhost:3100';
+const baseURL = process.env.E2E_BASE_URL ?? 'http://127.0.0.1:3100';
 
 export default defineConfig({
   testDir: './e2e',
-  testMatch: /regression-(smoke|staff)\.spec\.ts/,
+  testMatch: [
+    'regression-smoke.spec.ts',
+    'regression-staff.spec.ts',
+    'phase1-registration.spec.ts',
+    'phase2-alerts.spec.ts',
+    'phase3a-manager.spec.ts',
+    'phase3a-pagination.spec.ts',
+    'phase3b-stall.spec.ts',
+    'phase3c-admin.spec.ts',
+    'phase3d-super.spec.ts',
+    'phase4-vacant-stall.spec.ts',
+    'readiness-requests.spec.ts',
+  ],
   fullyParallel: false,
   workers: 1,
-  timeout: 180_000,
+  timeout: 300_000,
   expect: { timeout: 15_000 },
   reporter: 'list',
+  outputDir: 'test-results/e2e',
   use: {
     baseURL,
     trace: 'retain-on-failure',
     screenshot: 'only-on-failure',
+    video: 'off',
   },
   projects: [{ name: 'chromium', use: { ...devices['Desktop Chrome'] } }],
   webServer: {
-    command: 'bash scripts/dev-regression.sh',
-    url: 'http://localhost:4100/api/system/health',
+    command: 'bash scripts/prod-regression.sh',
+    url: `${process.env.API_URL ?? 'http://127.0.0.1:4100/api'}/system/health`,
     reuseExistingServer: true,
-    timeout: 180_000,
-    env: {
-      ...process.env,
-      DATABASE_URL: 'postgresql://eveops:eveops@localhost:55432/eveops_regression?schema=public',
-      ALLOW_DEMO_SEED: 'false',
-      EVEOPS_REQUIRE_DATABASE: 'eveops_regression',
-      REGRESSION_WEB_PORT: '3100',
-      REGRESSION_API_PORT: '4100',
-    },
+    timeout: 600_000,
   },
 });

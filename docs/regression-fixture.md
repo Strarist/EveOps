@@ -23,7 +23,7 @@ DATABASE_URL="postgresql://eveops:eveops@localhost:55432/eveops_regression?schem
 
 The command runs through the API test runner so Nest decorators load. `ALLOW_DEMO_SEED=false` keeps the documented pilot accounts out of this database. Running it again updates the same rows.
 
-The shared password is `REGRESSION_FIXTURE_PASSWORD`, supplied in the environment. The fixture refuses to run when it is missing, updates the synthetic account hashes to that value, and does not print it. Do not commit the password, and do not put it in tracked source, screenshots, or reports. Emails use `@volume.lab`.
+The shared password is `REGRESSION_FIXTURE_PASSWORD`: 4 to 7 digits, supplied in the environment. The fixture refuses to run when it is missing or not in that form, updates the synthetic account hashes to that value, and does not print it. Do not commit the password, and do not put it in tracked source, screenshots, or reports. Emails use `@volume.lab`.
 
 ## Isolated browser stack
 
@@ -40,7 +40,7 @@ Start the regression stack only through `scripts/dev-regression.sh`. That script
 - Runs migrations and the fixture seed against `eveops_regression` only.
 
 ```bash
-export REGRESSION_FIXTURE_PASSWORD='your-local-password'
+export REGRESSION_FIXTURE_PASSWORD='1234567'
 bash scripts/dev-regression.sh
 ```
 
@@ -52,18 +52,35 @@ curl -s http://localhost:4100/api/system/health
 
 The JSON `databaseName` must be `eveops_regression`.
 
-Playwright for this stack is `npx playwright test -c playwright.regression.config.ts`. It does not start `npm run dev`. Start the regression script first, or let that config start it. The browser base URL is `E2E_BASE_URL`.
+Playwright for this stack is `npx playwright test -c playwright.regression.config.ts`. It does not start `npm run dev`. For a production-mode run, start `bash scripts/prod-regression.sh` first. That config reuses the lab when it is already healthy and otherwise starts it. The browser base URL is `E2E_BASE_URL`.
+
+## Production-mode lab
+
+`bash scripts/prod-regression.sh` builds the API, worker, and web, then runs them with `NODE_ENV=production` against `eveops_regression` only. It sets `BUILD_SHA` from the current commit and `EVEOPS_PUSH_TRANSPORT=capture`, so push delivery is simulated and written to `test-results/phase4/push-capture.jsonl`. VAPID keys are not loaded. Liveness is `GET /api/system/health`. Readiness is `GET /api/system/ready`.
+
+If `REGRESSION_FIXTURE_PASSWORD` is unset, the script generates a 7-digit password into gitignored `.local/regression-fixture-password` and does not print it. Sign-in still requires at least 4 characters, so the lab password stays in that 4-to-7 digit range.
+
+Historical volume, after the 40-account fixture exists:
+
+```bash
+npm run db:history:regression -- 2000
+npm run db:history:regression -- 10000
+```
+
+Those commands insert tagged `HIST-` rows directly. They do not emit outbox work, so the worker does not route the historical backlog into the live queue. The command prints status counts and an audit-page walk.
 
 ## Tests
 
-| Role | Count | Email pattern |
+Sign in with the user ID. It is letters, digits, and hyphens.
+
+| Role | Count | User ID |
 | --- | ---: | --- |
-| Admin | 1 | `regression.admin@volume.lab` |
-| Super Admin | 1 | `regression.super@volume.lab` |
-| Hall managers | 4 | `regression.manager.h1@volume.lab` through `h4` |
-| Stall exhibitors | 18 | `regression.stall.h1-01@volume.lab` and so on |
-| Electricians | 8 | `regression.elec.h1.1@volume.lab` and `hN.2` |
-| House help | 8 | `regression.help.h1.1@volume.lab` and `hN.2` |
+| Admin | 1 | `admin` |
+| Super Admin | 1 | `super` |
+| Hall managers | 4 | `manager-h1` through `manager-h4` |
+| Stall exhibitors | 18 | `stall-h1-01` and so on |
+| Electricians | 8 | `elec-h1-1` and `elec-hN-2` |
+| House help | 8 | `help-h1-1` and `help-hN-2` |
 
 Layout:
 

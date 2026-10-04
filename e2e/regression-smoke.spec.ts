@@ -7,7 +7,7 @@ const apiOrigin = process.env.API_URL?.replace(/\/api$/, '') ?? 'http://localhos
 const prisma = new PrismaClient();
 
 test.beforeAll(() => {
-  if (password.length < 12) throw new Error('Set REGRESSION_FIXTURE_PASSWORD before browser regression. Do not commit it.');
+  if (!/^[0-9]{4,7}$/.test(password)) throw new Error('Set REGRESSION_FIXTURE_PASSWORD to 4–7 digits before browser regression. Do not commit it.');
 });
 
 test.afterAll(async () => {
@@ -92,7 +92,7 @@ test('admin sees a stall-code conflict and archive removes exhibitor push access
   await createdArticle.getByRole('button', { name: 'Archive' }).click();
   await createdArticle.getByLabel('Reason').fill('Browser archive check');
   await createdArticle.getByRole('button', { name: 'Archive registration' }).click();
-  await expect(page.getByRole('status')).toBeVisible();
+  await expect(page.getByRole('status').filter({ hasText: 'Registration updated' })).toBeVisible();
   await expect.poll(async () => prisma.pushSubscription.count({ where: { userId: account.id } })).toBe(0);
   const disabled = await prisma.user.findUniqueOrThrow({ where: { id: account.id } });
   expect(disabled.status).toBe('DISABLED');
@@ -151,7 +151,7 @@ test('live reopen response matches the stored ticket', async () => {
 
 async function signIn(page: Page, path: string, email: string, button: string, url: RegExp) {
   await page.goto(path);
-  await page.locator('input[name="email"]').fill(email);
+  await page.locator('input[name="userId"]').fill(email);
   await page.locator('input[name="password"]').fill(password);
   for (let attempt = 0; attempt < 3; attempt += 1) {
     await page.getByRole('button', { name: button }).click();

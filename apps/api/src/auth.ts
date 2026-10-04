@@ -4,8 +4,8 @@ import { createHash, randomBytes } from 'node:crypto';
 import { hash } from 'bcryptjs';
 import { Throttle } from '@nestjs/throttler';
 import { Transform } from 'class-transformer';
-import { IsEmail, IsIn, IsOptional, IsString } from 'class-validator';
-import type { AuthScope } from '@eveops/contracts';
+import { IsEmail, IsIn, IsOptional, IsString, Matches, MaxLength, ValidateIf } from 'class-validator';
+import { LOGIN_IDENTIFIER_PATTERN, USER_ID_MESSAGE, type AuthScope } from '@eveops/contracts';
 import { PrismaService } from './prisma.service';
 import { assertPortalRole } from './domain';
 import { IsAcceptedPassword, IsNewPassword, passwordMatches } from './password-policy';
@@ -13,9 +13,17 @@ import { IsAcceptedPassword, IsNewPassword, passwordMatches } from './password-p
 export const CurrentScope = createParamDecorator((_data: unknown, context: ExecutionContext) => context.switchToHttp().getRequest().scope);
 
 export class LoginDto {
+  @Transform(({ value }) => typeof value === 'string' ? value.trim() : value)
+  @ValidateIf((dto: LoginDto) => dto.userId !== undefined && dto.userId !== '')
+  @IsString()
+  @MaxLength(254)
+  @Matches(LOGIN_IDENTIFIER_PATTERN, { message: USER_ID_MESSAGE })
+  userId?: string;
+
   @Transform(({ value }) => typeof value === 'string' ? value.trim().toLowerCase() : value)
+  @ValidateIf((dto: LoginDto) => !dto.userId)
   @IsEmail()
-  email!: string;
+  email?: string;
 
   @IsString()
   @IsAcceptedPassword()
@@ -130,7 +138,11 @@ export class AuthController {
     @Body() body: LoginDto,
     @Res({ passthrough: true }) response: Response,
   ) {
-    const user = await this.prisma.user.findUnique({ where: { email: body.email } });
+    const presented = (body.userId ?? body.email ?? '').trim().toLowerCase();
+    if (!presented) throw new UnauthorizedException('Invalid credentials');
+    const user = await this.prisma.user.findFirst({
+      where: { OR: [{ loginId: presented }, { email: presented }] },
+    });
     const matches = await passwordMatches(body.password, user?.passwordHash);
     if (!user || !matches) throw new UnauthorizedException('Invalid credentials');
     if (user.approvalStatus === 'PENDING_APPROVAL') {

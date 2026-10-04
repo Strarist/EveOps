@@ -235,7 +235,7 @@ export function RegistrationsView() {
               </select>
             </label>
             <label>Login name<span aria-hidden="true"> *</span><input name="loginName" required minLength={2} /></label>
-            <label>Login email<span aria-hidden="true"> *</span><input name="loginEmail" type="email" required autoComplete="off" /></label>
+            <label>User ID<span aria-hidden="true"> *</span><input name="loginEmail" type="text" required autoComplete="off" minLength={2} maxLength={254} spellCheck={false} /></label>
             <button className="primary" type="submit" disabled={busy || !zones.length}>{busy ? 'Creating…' : 'Create stall and exhibitor login'}</button>
           </form>
         </section>
@@ -286,7 +286,7 @@ export function RegistrationsView() {
               {loginStallId === row.id && !row.exhibitors.length && (
                 <form className="authority-action" onSubmit={(event) => void submitLogin(event, '/api/management/registrations/' + row.id + '/exhibitor-login')}>
                   <label>Login name<span aria-hidden="true"> *</span><input name="loginName" required minLength={2} defaultValue={row.exhibitorName} /></label>
-                  <label>Login email<span aria-hidden="true"> *</span><input name="loginEmail" type="email" required autoComplete="off" /></label>
+                  <label>User ID<span aria-hidden="true"> *</span><input name="loginEmail" type="text" required autoComplete="off" minLength={2} maxLength={254} spellCheck={false} /></label>
                   <div className="drawer-actions">
                     <button type="button" onClick={() => setLoginStallId(null)}>Cancel</button>
                     <button className="primary" type="submit" disabled={busy}>{busy ? 'Creating…' : 'Create exhibitor login'}</button>

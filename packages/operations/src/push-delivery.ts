@@ -3,6 +3,12 @@ import { lookup } from 'node:dns/promises';
 import { BlockList, isIP } from 'node:net';
 import { alertHref, decideAlertDelivery } from './alert-audience';
 
+export function resolvePushTransport(env: { EVEOPS_PUSH_TRANSPORT?: string } = process.env): 'web-push' | 'capture' | 'disabled' {
+  const value = (env.EVEOPS_PUSH_TRANSPORT ?? 'web-push').trim();
+  if (value === 'web-push' || value === 'capture' || value === 'disabled') return value;
+  throw new Error('EVEOPS_PUSH_TRANSPORT must be web-push, capture, or disabled');
+}
+
 const ATTEMPT_LIMIT = 5;
 const DELIVERY_WINDOW_MS = 60 * 60 * 1000;
 

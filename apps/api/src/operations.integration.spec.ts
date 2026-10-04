@@ -58,12 +58,12 @@ describe('operational database invariants', () => {
     await prisma.stall.create({ data: { id: ids.otherStall, eventId: ids.event, zoneId: ids.zone, stallCode: 'S2', exhibitorName: 'Other stall' } });
     await prisma.user.createMany({
       data: [
-        { id: ids.stallUser, organizationId: ids.organization, name: 'Stall', email: `${key}-stall@example.test`, passwordHash: 'not-used', role: 'STALL' },
-        { id: ids.staffUser, organizationId: ids.organization, name: 'Staff', email: `${key}-staff@example.test`, passwordHash: 'not-used', role: 'STAFF' },
-        { id: ids.secondStaffUser, organizationId: ids.organization, name: 'Second Staff', email: `${key}-staff-2@example.test`, passwordHash: 'not-used', role: 'STAFF' },
-        { id: ids.managerUser, organizationId: ids.organization, name: 'Manager', email: `${key}-manager@example.test`, passwordHash: 'not-used', role: 'HALL_MANAGER' },
-        { id: ids.adminUser, organizationId: ids.organization, name: 'Admin', email: `${key}-admin@example.test`, passwordHash: 'not-used', role: 'ADMIN' },
-        { id: ids.superUser, organizationId: ids.organization, name: 'Super', email: `${key}-super@example.test`, passwordHash: 'not-used', role: 'SUPER_ADMIN' },
+        { id: ids.stallUser, organizationId: ids.organization, name: 'Stall', email: `${key}-stall@example.test`, loginId: `${key}-stall@example.test`, passwordHash: 'not-used', role: 'STALL' },
+        { id: ids.staffUser, organizationId: ids.organization, name: 'Staff', email: `${key}-staff@example.test`, loginId: `${key}-staff@example.test`, passwordHash: 'not-used', role: 'STAFF' },
+        { id: ids.secondStaffUser, organizationId: ids.organization, name: 'Second Staff', email: `${key}-staff-2@example.test`, loginId: `${key}-staff-2@example.test`, passwordHash: 'not-used', role: 'STAFF' },
+        { id: ids.managerUser, organizationId: ids.organization, name: 'Manager', email: `${key}-manager@example.test`, loginId: `${key}-manager@example.test`, passwordHash: 'not-used', role: 'HALL_MANAGER' },
+        { id: ids.adminUser, organizationId: ids.organization, name: 'Admin', email: `${key}-admin@example.test`, loginId: `${key}-admin@example.test`, passwordHash: 'not-used', role: 'ADMIN' },
+        { id: ids.superUser, organizationId: ids.organization, name: 'Super', email: `${key}-super@example.test`, loginId: `${key}-super@example.test`, passwordHash: 'not-used', role: 'SUPER_ADMIN' },
       ],
     });
     await prisma.userScope.createMany({
@@ -565,7 +565,7 @@ describe('operational database invariants', () => {
       data: { eventId: ids.event, zoneId: zone.id, stallCode: `${key}-source`, exhibitorName: 'Moving exhibitor', contact: '9990001111', servicePriority: 'MEDIUM' },
     });
     const exhibitor = await prisma.user.create({
-      data: { id: `${key}-moving-user`, organizationId: ids.organization, name: 'Moving exhibitor', email: `${key}-moving@example.test`, passwordHash: 'not-used', role: 'STALL' },
+      data: { id: `${key}-moving-user`, organizationId: ids.organization, name: 'Moving exhibitor', email: `${key}-moving@example.test`, loginId: `${key}-moving@example.test`, passwordHash: 'not-used', role: 'STALL' },
     });
     await prisma.userScope.create({ data: { userId: exhibitor.id, eventId: ids.event, hallId: ids.hall, stallId: sourceStall.id } });
     await prisma.session.create({

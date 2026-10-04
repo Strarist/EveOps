@@ -4,7 +4,7 @@ import { serviceQueueOrderBy } from './ticket-timing';
 import { randomUUID } from 'node:crypto';
 
 export { assertEffectiveDatabase, effectiveDatabaseName, publishedDatabaseName } from './database-guard';
-export { classifyPushEndpoint, deliverNotificationPush, deliverPendingPushes, loadPushDecision, pushEndpointShapeAllowed } from './push-delivery';
+export { classifyPushEndpoint, deliverNotificationPush, deliverPendingPushes, loadPushDecision, pushEndpointShapeAllowed, resolvePushTransport } from './push-delivery';
 export type { PushDecision, PushSend, PushSubscriptionTarget } from './push-delivery';
 export {
   boundedElapsedSeconds,

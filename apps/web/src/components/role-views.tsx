@@ -6,6 +6,7 @@ import Link from 'next/link';
 import { useRouter, useSearchParams } from 'next/navigation';
 import { describeTicketTiming, jitteredRetryMs, managerAttentionLabel, retryAfterMs, schedulingQueueLabel, shouldRefreshForTicketEvent } from '@eveops/ticket-timing';
 import { apiFetch, apiErrorMessage, AUTH_LOST_EVENT, subscribeRealtime } from '../lib/api-client';
+import { useAuditHistory } from '../lib/audit-history';
 import { loadSessionProfile, profileSnapshot, subscribeProfile, type SessionProfile } from '../lib/session-profile';
 import { activitySentence, serviceLabel } from '../lib/activity-copy';
 import { noteServerTime, ServerClockProvider, useOperationalNow } from '../lib/server-clock';
@@ -1281,10 +1282,9 @@ export function ManagementWorkspace({ role }: { role: 'HALL_MANAGER' | 'ADMIN' }
   const [capacityValue, setCapacityValue] = useState('1');
   const [activeSection, setActiveSection] = useState(role === 'ADMIN' ? adminSectionName(searchParams.get('section')) : navByRole[role][0]);
   const [exceptions, setExceptions] = useState<Ticket[]>([]);
-  const [auditEvents, setAuditEvents] = useState<Array<{ id: string; kind?: string; eventType: string; createdAt: string; actor: { name: string; role?: string } | null; ticket: { publicNo: string } }>>([]);
-  const [auditLoaded, setAuditLoaded] = useState(false);
   const [auditTicketQuery, setAuditTicketQuery] = useState('');
   const [auditActionQuery, setAuditActionQuery] = useState('');
+  const auditHistory = useAuditHistory(role === 'ADMIN' && activeSection === 'Audit', auditTicketQuery, auditActionQuery);
   const [masters, setMasters] = useState<Array<{
     id: string;
     name: string;
@@ -1305,7 +1305,6 @@ export function ManagementWorkspace({ role }: { role: 'HALL_MANAGER' | 'ADMIN' }
     setWorkforce([]);
     setPendingApprovals([]);
     setExceptions([]);
-    setAuditEvents([]);
     setMasters([]);
     setExports([]);
   });
@@ -1412,14 +1411,12 @@ export function ManagementWorkspace({ role }: { role: 'HALL_MANAGER' | 'ADMIN' }
       const requests = [
         apiFetch('/api/workforce', { credentials: 'include', cache: 'no-store' }),
         apiFetch('/api/management/exceptions', { credentials: 'include', cache: 'no-store' }),
-        apiFetch('/api/management/audit', { credentials: 'include', cache: 'no-store' }),
         ...(role === 'ADMIN' ? [apiFetch('/api/workforce/pending', { credentials: 'include', cache: 'no-store' })] : []),
       ];
       const responses = await Promise.all(requests);
       if (responses[0].ok) setWorkforce(await responses[0].json() as typeof workforce);
       if (responses[1].ok) setExceptions(((await responses[1].json()) as ApiTicket[]).map(mapTicket));
-      if (responses[2].ok) { setAuditEvents(await responses[2].json() as typeof auditEvents); setAuditLoaded(true); }
-      if (role === 'ADMIN' && responses[3]?.ok) setPendingApprovals(await responses[3].json() as typeof pendingApprovals);
+      if (role === 'ADMIN' && responses[2]?.ok) setPendingApprovals(await responses[2].json() as typeof pendingApprovals);
     }
     if (panelTimer.current) return;
     const elapsed = Date.now() - panelStamp.current;
@@ -1430,22 +1427,6 @@ export function ManagementWorkspace({ role }: { role: 'HALL_MANAGER' | 'ADMIN' }
       void loadOperationalPanels().catch(() => setManagementError('Operational panels could not be loaded. Showing the last loaded records.'));
     }, wait);
   }, [lastUpdatedAt, role]);
-  useEffect(() => {
-    if (role !== 'ADMIN' || activeSection !== 'Audit') return;
-    const parameters = new URLSearchParams();
-    if (auditTicketQuery.trim()) parameters.set('ticket', auditTicketQuery.trim());
-    if (auditActionQuery.trim()) parameters.set('action', auditActionQuery.trim());
-    const timer = setTimeout(() => {
-      void apiFetch('/api/management/audit?' + parameters.toString(), { credentials: 'include', cache: 'no-store' })
-        .then(async (response) => {
-          if (response.ok) setAuditEvents(await response.json() as typeof auditEvents);
-          else setManagementError(response.status === 429 ? 'Audit history is busy right now. Showing the last loaded records.' : 'Audit history could not be loaded. Showing the last loaded records.');
-          setAuditLoaded(true);
-        })
-        .catch(() => { setAuditLoaded(true); setManagementError('Audit history could not be loaded. Showing the last loaded records.'); });
-    }, 300);
-    return () => clearTimeout(timer);
-  }, [role, activeSection, auditTicketQuery, auditActionQuery]);
 
   async function refreshWorkforcePanels() {
     const list = await apiFetch('/api/workforce', { credentials: 'include', cache: 'no-store' });
@@ -1465,6 +1446,18 @@ export function ManagementWorkspace({ role }: { role: 'HALL_MANAGER' | 'ADMIN' }
       if (exportsResponse.ok) setExports(await exportsResponse.json() as typeof exports);
     }).catch(() => setManagementError('Administration data could not be loaded'));
   }, [role]);
+
+  useEffect(() => {
+    if (role !== 'ADMIN') return;
+    if (!exports.some((job) => job.status === 'PENDING' || job.status === 'PROCESSING')) return;
+    const timer = window.setTimeout(() => {
+      void apiFetch('/api/management/exports', { credentials: 'include', cache: 'no-store' }).then(async (response) => {
+        if (response.status === 429) return;
+        if (response.ok) setExports(await response.json() as typeof exports);
+      });
+    }, 2000);
+    return () => window.clearTimeout(timer);
+  }, [role, exports]);
 
   useEffect(() => {
     if (!showAddPerson || personHallId) return;
@@ -1559,7 +1552,13 @@ export function ManagementWorkspace({ role }: { role: 'HALL_MANAGER' | 'ADMIN' }
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ format: 'CSV', filters: { status: statusFilter || undefined, category: categoryFilter || undefined, search: search || undefined }, columns: [] }),
     });
-    setManagementError(response.ok ? 'Export queued. It will appear in Reports when ready.' : 'Export could not be queued');
+    if (!response.ok) {
+      setManagementError('Export could not be queued');
+      return;
+    }
+    setManagementError('Export queued. It will appear in Reports when ready.');
+    const jobs = await apiFetch('/api/management/exports', { credentials: 'include', cache: 'no-store' });
+    if (jobs.ok) setExports(await jobs.json() as typeof exports);
   }
 
   async function createMaster(event: FormEvent<HTMLFormElement>) {
@@ -1858,7 +1857,7 @@ export function ManagementWorkspace({ role }: { role: 'HALL_MANAGER' | 'ADMIN' }
             const subtypeOptions = [...new Set(poolSubtypes.length ? poolSubtypes : (personServiceCategory === 'ELECTRICAL' ? ['Lighting', 'NCP', 'General'] : ['General']))];
             return <form className="authority-action" onSubmit={(event) => void createPerson(event)}>
               <label>Name<span aria-hidden="true"> *</span><input name="name" required minLength={2} autoComplete="name" /></label>
-              <label>Login email<span aria-hidden="true"> *</span><input name="email" type="email" required autoComplete="username" /></label>
+              <label>User ID<span aria-hidden="true"> *</span><input name="email" type="text" required autoComplete="username" minLength={2} maxLength={254} spellCheck={false} /></label>
               <label>Phone<input name="phone" autoComplete="tel" /></label>
               <label>Temporary password<span aria-hidden="true"> *</span><input name="password" type="password" required minLength={PASSWORD_MIN_LENGTH} maxLength={PASSWORD_MAX_BYTES} pattern={NEW_PASSWORD_PATTERN.source} title="Include at least one letter and one number" autoComplete="new-password" /><span className="otp-hint">Must be changed on first sign-in.</span></label>
               {role === 'ADMIN' ? (
@@ -1915,7 +1914,7 @@ export function ManagementWorkspace({ role }: { role: 'HALL_MANAGER' | 'ADMIN' }
           })()}{visibleWorkforce.length ? visibleWorkforce.map((membership) => <article key={membership.user.id + membership.pool.category + membership.pool.subtype}><div><strong>{membership.user.name}</strong><span>{membership.user.role === 'HALL_MANAGER' ? 'Hall manager' : 'Staff'} · {serviceLabel(membership.pool.category)} · {membership.pool.subtype}</span><span>{masters.flatMap((event) => event.halls).find((hall) => hall.id === membership.pool.hallId)?.name ?? 'Event scope'}{membership.user.employeeCode ? ` · ${membership.user.employeeCode}` : ''}</span>{membership.user.email ? <span>{membership.user.email}</span> : null}</div><div><span>Duty</span><strong>{membership.availability.toLowerCase().replaceAll('_', ' ').replace(/\b\w/g, (letter) => letter.toUpperCase())}</strong></div><div><span>Load</span><strong>{membership.activeAssignmentCount ?? membership.activeCount ?? 0}/{membership.capacity ?? 1}</strong></div><div><span>Approval</span><strong>{(membership.user.approvalStatus ?? 'APPROVED').replaceAll('_', ' ')}</strong></div><div><span>Account</span><strong>{membership.user.status ?? 'ACTIVE'}</strong></div>{membership.user.rejectionReason && <div><span>Rejection</span><strong>{membership.user.rejectionReason}</strong></div>}{role === 'ADMIN' && membership.user.approvalStatus === 'PENDING_APPROVAL' && <div className="drawer-actions"><button className="primary" type="button" onClick={() => void approvePerson(membership.user.id)}>Approve</button><button className="critical-button" type="button" onClick={() => void rejectPerson(membership.user.id)}>{rejectUserId === membership.user.id ? 'Confirm reject' : 'Reject'}</button></div>}{rejectUserId === membership.user.id && <form className="authority-action" onSubmit={(event) => { event.preventDefault(); void rejectPerson(membership.user.id); }}><label>Rejection reason<span aria-hidden="true"> *</span><input value={rejectReason} onChange={(change) => setRejectReason(change.target.value)} required minLength={3} /></label>{rejectError && <p className="form-error" role="alert">{rejectError}</p>}<div className="drawer-actions"><button type="button" onClick={() => { setRejectUserId(null); setRejectError(''); }}>Cancel</button><button className="critical-button" type="submit">Submit rejection</button></div></form>}<div className="drawer-actions">{capacityEditUserId === membership.user.id ? <form className="authority-action" onSubmit={(event) => { event.preventDefault(); const nextCapacity = Number(capacityValue); if (Number.isInteger(nextCapacity) && nextCapacity >= 1) void updatePersonCapacity(membership.user.id, nextCapacity); }}><label>Capacity<span aria-hidden="true"> *</span><input type="number" min={1} max={20} value={capacityValue} onChange={(change) => setCapacityValue(change.target.value)} required /></label><div className="drawer-actions"><button type="button" onClick={() => setCapacityEditUserId(null)}>Cancel</button><button className="primary" type="submit">Save capacity</button></div></form> : <button type="button" onClick={() => { setCapacityEditUserId(membership.user.id); setCapacityValue(String(membership.capacity ?? 1)); }}>Edit capacity</button>}<button type="button" onClick={() => void updatePersonStatus(membership.user.id, membership.user.status === 'DISABLED' ? 'ACTIVE' : 'DISABLED')}>{membership.user.status === 'DISABLED' ? 'Activate' : 'Deactivate'}</button></div></article>) : <p className="empty-state">No workforce identities match this filter.</p>}</section>;
         })()}
         {activeSection === 'Exceptions' && <section className="portfolio-list"><div className="section-title"><div><h2>Exception inbox</h2><p>Queued, overdue, complaint, reopened, and escalated tickets</p></div></div>{exceptions.length ? exceptions.map((ticket) => <div key={ticket.id}><TicketCard ticket={ticket} /><div className="drawer-actions"><button type="button" onClick={() => { setSelected(ticket); setActiveSection('Tickets'); }}>Open ticket</button></div></div>) : <p className="empty-state">No unresolved exceptions.</p>}</section>}
-        {activeSection === 'Audit' && <section className="portfolio-list"><div className="section-title"><div><h2>Administrative history</h2><p>Registration, workforce, configuration, and ticket lifecycle events for {eventName}. Ticket activity for one request stays on that ticket. This list cannot be edited.</p></div><div className="drawer-actions"><label>Ticket or account<input aria-label="Audit ticket" value={auditTicketQuery} onChange={(event) => setAuditTicketQuery(event.target.value)} /></label><label>Action<input aria-label="Audit action" value={auditActionQuery} onChange={(event) => setAuditActionQuery(event.target.value)} /></label></div></div>{!auditLoaded ? <p className="empty-state">Loading history…</p> : auditEvents.length ? auditEvents.map((event) => <article key={event.id}><div><strong>{event.ticket.publicNo}</strong><span>{event.actor?.name ?? 'System'}{event.actor?.role ? ` · ${event.actor.role.replaceAll('_', ' ')}` : ''}</span></div><div><span>Record</span><strong>{event.kind === 'workforce' ? 'Administrative change' : 'Ticket lifecycle'}</strong></div><div><span>Action</span><strong>{event.eventType.replaceAll('_', ' ')}</strong></div><div><span>Server time</span><strong>{eventTime(event.createdAt)}</strong></div></article>) : <p className="empty-state">No history matches this search.</p>}</section>}
+        {activeSection === 'Audit' && <section className="portfolio-list"><div className="section-title"><div><h2>Administrative history</h2><p>Registration, workforce, configuration, and ticket lifecycle events for {eventName}. Ticket activity for one request stays on that ticket. This list cannot be edited. Refresh shows records added since this page was opened. Load more continues older records. Showing {auditHistory.items.length}.</p></div><div className="drawer-actions"><label>Ticket or account<input aria-label="Audit ticket" value={auditTicketQuery} onChange={(event) => setAuditTicketQuery(event.target.value)} /></label><label>Action<input aria-label="Audit action" value={auditActionQuery} onChange={(event) => setAuditActionQuery(event.target.value)} /></label><button type="button" onClick={() => void auditHistory.refresh()}>Refresh</button></div></div>{auditHistory.stale && auditHistory.error ? <p className="alert-line" role="status">{auditHistory.error}</p> : null}{!auditHistory.loaded ? <p className="empty-state">Loading history…</p> : auditHistory.error && !auditHistory.items.length ? <p className="form-error" role="alert">{auditHistory.error}</p> : auditHistory.items.length ? <>{auditHistory.items.map((event) => <article key={(event.kind ?? 'ticket') + event.id}><div><strong>{event.ticket.publicNo}</strong><span>{event.actor?.name ?? 'System'}{event.actor?.role ? ` · ${event.actor.role.replaceAll('_', ' ')}` : ''}</span></div><div><span>Record</span><strong>{event.kind === 'workforce' ? 'Administrative change' : 'Ticket lifecycle'}</strong></div><div><span>Action</span><strong>{event.eventType.replaceAll('_', ' ')}</strong></div><div><span>Server time</span><strong>{eventTime(event.createdAt)}</strong></div></article>)}{auditHistory.nextCursor ? <button type="button" onClick={() => void auditHistory.loadMore()}>Load more</button> : null}</> : <p className="empty-state">No history matches this search.</p>}</section>}
         {activeSection === 'Event setup' && <section className="portfolio-list"><div className="section-title"><div><h2>Event setup</h2><p>Halls, zones, and service timing for {eventName}. Stall records and exhibitor logins are created in Registrations, so saving a stall here cannot be mistaken for creating a login.</p></div><div className="drawer-actions"><button type="button" onClick={() => { setMasterForm(masterForm === 'hall' ? null : 'hall'); setMasterFormError(''); }}>Add hall</button><button type="button" onClick={() => { setMasterForm(masterForm === 'zone' ? null : 'zone'); setMasterFormError(''); }}>Add zone</button><Link href="/admin/registrations">Open registrations</Link></div></div>
           {masterForm === 'hall' && <form className="authority-action" onSubmit={(event) => void createMaster(event)}><label>Hall code<span aria-hidden="true"> *</span><input name="code" required minLength={1} /></label><label>Hall name<span aria-hidden="true"> *</span><input name="name" required minLength={1} /></label><label>Status<select name="status" defaultValue="ACTIVE"><option value="ACTIVE">Active</option><option value="INACTIVE">Inactive</option></select></label>{masterFormError && <p className="form-error" role="alert">{masterFormError}</p>}<div className="drawer-actions"><button type="button" onClick={() => setMasterForm(null)}>Cancel</button><button className="primary" type="submit" disabled={masterSubmitting}>{masterSubmitting ? 'Saving…' : 'Create hall'}</button></div></form>}
           {masterForm === 'zone' && <form className="authority-action" onSubmit={(event) => void createMaster(event)}><label>Hall<span aria-hidden="true"> *</span><select name="hallId" required>{masters.flatMap((event) => event.halls).map((hall) => <option key={hall.id} value={hall.id}>{hall.name}</option>)}</select></label><label>Zone code<span aria-hidden="true"> *</span><input name="code" required minLength={1} /></label>{masterFormError && <p className="form-error" role="alert">{masterFormError}</p>}<div className="drawer-actions"><button type="button" onClick={() => setMasterForm(null)}>Cancel</button><button className="primary" type="submit" disabled={masterSubmitting}>{masterSubmitting ? 'Saving…' : 'Create zone'}</button></div></form>}
@@ -1967,7 +1966,9 @@ export function SuperAdminWorkspace() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const [admins, setAdmins] = useState<Array<{ id: string; name: string; email: string; status: string; scopes: Array<{ event: { name: string } }> }>>([]);
-  const [governanceAudit, setGovernanceAudit] = useState<Array<{ id: string; kind?: string; eventType: string; createdAt: string; ticket: { publicNo: string }; actor: { name: string; role?: string } | null }>>([]);
+  const [auditTicket, setAuditTicket] = useState('');
+  const [auditAction, setAuditAction] = useState('');
+  const governanceHistory = useAuditHistory(section === 'Audit', auditTicket, auditAction);
   const [governanceExports, setGovernanceExports] = useState<Array<{ id: string; format: string; status: string; rowCount: number | null; createdAt: string }>>([]);
   const [showAddAdmin, setShowAddAdmin] = useState(false);
   const [adminFormError, setAdminFormError] = useState('');
@@ -1976,15 +1977,12 @@ export function SuperAdminWorkspace() {
   const [openedTicket, setOpenedTicket] = useState<Ticket | null>(null);
   const [analytics, setAnalytics] = useState<OperationalMetrics>({});
   const [analyticsError, setAnalyticsError] = useState('');
-  const [auditTicket, setAuditTicket] = useState('');
-  const [auditAction, setAuditAction] = useState('');
   const [governanceMasters, setGovernanceMasters] = useState<Array<{ id: string; name: string; pools: Array<{ id: string; category: string; subtype: string; responseTargetSeconds: number; resolutionTargetSeconds: number; active: boolean }> }>>([]);
   const [slaPoolId, setSlaPoolId] = useState<string | null>(null);
   const [slaError, setSlaError] = useState('');
   useAuthLoss(() => {
     setPortfolio([]);
     setAdmins([]);
-    setGovernanceAudit([]);
     setGovernanceExports([]);
     setAnalytics({});
     setGovernanceMasters([]);
@@ -2037,28 +2035,12 @@ export function SuperAdminWorkspace() {
   useEffect(() => {
     void Promise.all([
       apiFetch('/api/management/admins', { credentials: 'include', cache: 'no-store' }),
-      apiFetch('/api/management/audit', { credentials: 'include', cache: 'no-store' }),
       apiFetch('/api/management/exports', { credentials: 'include', cache: 'no-store' }),
-    ]).then(async ([adminResponse, auditResponse, exportResponse]) => {
+    ]).then(async ([adminResponse, exportResponse]) => {
       if (adminResponse.ok) setAdmins(await adminResponse.json() as typeof admins);
-      if (auditResponse.ok) setGovernanceAudit(await auditResponse.json() as typeof governanceAudit);
       if (exportResponse.ok) setGovernanceExports(await exportResponse.json() as typeof governanceExports);
     }).catch(() => setError('Governance data could not be loaded'));
   }, []);
-  useEffect(() => {
-    if (section !== 'Audit') return;
-    const parameters = new URLSearchParams();
-    if (auditTicket.trim()) parameters.set('ticket', auditTicket.trim());
-    if (auditAction.trim()) parameters.set('action', auditAction.trim());
-    const timer = setTimeout(() => {
-      void apiFetch('/api/management/audit?' + parameters.toString(), { credentials: 'include', cache: 'no-store' })
-        .then(async (response) => {
-          if (response.ok) setGovernanceAudit(await response.json() as typeof governanceAudit);
-        })
-        .catch(() => setError('Audit history could not be loaded'));
-    }, 300);
-    return () => clearTimeout(timer);
-  }, [section, auditTicket, auditAction]);
   useEffect(() => {
     if (section !== 'Reports') return;
     const parameters = new URLSearchParams();
@@ -2197,9 +2179,9 @@ export function SuperAdminWorkspace() {
         ].map((metric) => <article key={metric.label} className="metric"><span>{metric.label}</span><strong>{metric.value}</strong><small>{metric.detail}</small></article>)}</section><div className="drawer-actions"><button type="button" onClick={() => openGovernance({ section: 'Events' })}>Review events</button><button type="button" onClick={() => openGovernance({ section: 'Tickets' })}>Review tickets</button></div></section>}
         {section === 'Events' && <section className="portfolio-list"><div className="section-title"><div><h2>Authorized events</h2><p>{selectedEvent ? `${selectedEventName} is selected in the header.` : 'Every event this account can open. Choosing one limits tickets, reports, and exports to that event.'}</p></div></div>{loading ? <p className="empty-state">Loading authorized events…</p> : error ? <p className="form-error" role="alert">{error}</p> : visibleEvents.length ? visibleEvents.map((event) => <article key={event.id}><div><strong>{event.event}</strong><span>{event.venue}{event.status ? ` · ${event.status}` : ''}</span></div><div><span>Open</span><strong>{event.open}</strong></div><div><span>Exceptions</span><strong className={event.exceptions ? 'red' : undefined}>{event.exceptions}</strong></div><div><span>Median response</span><strong>{event.medianResponseSeconds == null ? '—' : duration(event.medianResponseSeconds)}</strong></div><button type="button" onClick={() => openGovernance({ section: 'Tickets', event: event.id })}>Open tickets</button></article>) : <p className="empty-state">No events are assigned to this account.</p>}</section>}
         {section === 'Tickets' && <section className={openedTicket ? 'workspace manager-focus' : 'workspace'}><div className="operations"><div className="section-title"><div><h2>{selectedEvent ? selectedEventName : 'Cross-event tickets'}</h2><p>{ticketsLoading && !eventTickets.length ? 'Loading authorized tickets…' : `${eventTicketTotal} authorized tickets. Showing ${eventTickets.length}.`} Open a row for activity. This account does not accept, snooze, or close work from here.</p></div></div><div className="filters"><select aria-label="Explorer status" value={explorerStatus} onChange={(event) => openGovernance({ section: 'Tickets', status: event.target.value || null, ticket: null })}><option value="">All statuses</option>{Object.keys(statusLabels).map((status) => <option key={status} value={status}>{statusLabels[status as TicketStatus]}</option>)}</select><select aria-label="Explorer service" value={explorerCategory} onChange={(event) => openGovernance({ section: 'Tickets', category: event.target.value || null, ticket: null })}><option value="">All services</option><option value="ELECTRICAL">Electrical</option><option value="HOUSE_HELP">House Help</option><option value="HALL_MANAGER">Hall Manager</option></select>{(explorerStatus || explorerCategory || selectedEvent) && <button type="button" onClick={() => openGovernance({ section: 'Tickets', status: null, category: null, event: null, ticket: null })}>Clear filters</button>}</div>{ticketsLoading && !eventTickets.length ? <p className="empty-state">Loading tickets…</p> : eventTickets.length ? <><div className="manager-list">{eventTickets.map((ticket) => <button type="button" key={ticket.id} className={openedTicket?.id === ticket.id ? 'manager-card selected' : 'manager-card'} onClick={() => openGovernance({ section: 'Tickets', ticket: ticket.id })}><strong>{ticket.no}</strong><span>{ticket.location}</span><span>{ticket.service}</span><span>{statusLabels[ticket.status]}</span></button>)}</div>{eventTicketCursor && <button type="button" onClick={() => void loadMoreEventTickets()}>Load more</button>}</> : <p className="empty-state">No tickets match this explorer.</p>}</div>{openedTicket && <aside className="drawer" aria-label={'Ticket ' + openedTicket.no + ' detail'}><button type="button" onClick={() => openGovernance({ ticket: null })}>Back to the list</button><div className="drawer-head"><div><span className="eyebrow">{openedTicket.no}</span><h2>{openedTicket.service}</h2></div><Status value={openedTicket.status} audience="manager" /></div><p>{openedTicket.location}</p><p className="description">{openedTicket.description}</p><TicketActivity ticketId={openedTicket.id} /></aside>}</section>}
-        {section === 'Admins' && <section className="portfolio-list"><div className="section-title"><div><h2>Admin accounts</h2><p>Event access is chosen from the events this organization account can already open. Creating an admin does not add events or grant hall-manager actions.</p></div><button type="button" onClick={() => { setShowAddAdmin((value) => !value); setAdminFormError(''); setAdminEventIds(selectedEvent ? [selectedEvent] : []); }}>{showAddAdmin ? 'Close form' : 'Add admin'}</button></div>{showAddAdmin && <form className="authority-action" onSubmit={(event) => void createAdmin(event)}><label>Name<span aria-hidden="true"> *</span><input name="name" required minLength={2} /></label><label>Email<span aria-hidden="true"> *</span><input name="email" type="email" required /></label><label>Temporary password<span aria-hidden="true"> *</span><input name="password" type="password" required minLength={PASSWORD_MIN_LENGTH} maxLength={PASSWORD_MAX_BYTES} pattern={NEW_PASSWORD_PATTERN.source} title="Include at least one letter and one number" /></label><fieldset><legend>Event access</legend>{portfolio.map((event) => <label key={event.id}><input type="checkbox" checked={adminEventIds.includes(event.id)} onChange={(change) => setAdminEventIds((current) => change.target.checked ? [...current, event.id] : current.filter((id) => id !== event.id))} /> {event.event}</label>)}</fieldset>{adminFormError && <p className="form-error" role="alert">{adminFormError}</p>}<div className="drawer-actions"><button type="button" onClick={() => setShowAddAdmin(false)}>Cancel</button><button className="primary" type="submit" disabled={adminSubmitting}>{adminSubmitting ? 'Creating…' : 'Create admin'}</button></div></form>}{admins.length ? admins.map((admin) => <article key={admin.id}><div><strong>{admin.name}</strong><span>{admin.email}</span></div><div><span>Status</span><strong>{admin.status}</strong></div><div><span>Events</span><strong>{admin.scopes.map((scope) => scope.event.name).join(', ') || 'No event access'}</strong></div></article>) : <p className="empty-state">No admin accounts are visible in this organization.</p>}</section>}
+        {section === 'Admins' && <section className="portfolio-list"><div className="section-title"><div><h2>Admin accounts</h2><p>Event access is chosen from the events this organization account can already open. Creating an admin does not add events or grant hall-manager actions.</p></div><button type="button" onClick={() => { setShowAddAdmin((value) => !value); setAdminFormError(''); setAdminEventIds(selectedEvent ? [selectedEvent] : []); }}>{showAddAdmin ? 'Close form' : 'Add admin'}</button></div>{showAddAdmin && <form className="authority-action" onSubmit={(event) => void createAdmin(event)}><label>Name<span aria-hidden="true"> *</span><input name="name" required minLength={2} /></label><label>User ID<span aria-hidden="true"> *</span><input name="email" type="text" required minLength={2} maxLength={254} spellCheck={false} /></label><label>Temporary password<span aria-hidden="true"> *</span><input name="password" type="password" required minLength={PASSWORD_MIN_LENGTH} maxLength={PASSWORD_MAX_BYTES} pattern={NEW_PASSWORD_PATTERN.source} title="Include at least one letter and one number" /></label><fieldset><legend>Event access</legend>{portfolio.map((event) => <label key={event.id}><input type="checkbox" checked={adminEventIds.includes(event.id)} onChange={(change) => setAdminEventIds((current) => change.target.checked ? [...current, event.id] : current.filter((id) => id !== event.id))} /> {event.event}</label>)}</fieldset>{adminFormError && <p className="form-error" role="alert">{adminFormError}</p>}<div className="drawer-actions"><button type="button" onClick={() => setShowAddAdmin(false)}>Cancel</button><button className="primary" type="submit" disabled={adminSubmitting}>{adminSubmitting ? 'Creating…' : 'Create admin'}</button></div></form>}{admins.length ? admins.map((admin) => <article key={admin.id}><div><strong>{admin.name}</strong><span>{admin.email}</span></div><div><span>Status</span><strong>{admin.status}</strong></div><div><span>Events</span><strong>{admin.scopes.map((scope) => scope.event.name).join(', ') || 'No event access'}</strong></div></article>) : <p className="empty-state">No admin accounts are visible in this organization.</p>}</section>}
         {section === 'Reports' && <section className="portfolio-list"><div className="section-title"><div><h2>Reports and exports</h2><p>Figures use {selectedEvent ? selectedEventName : 'every authorized event'}. Open is not closed or cancelled. Averages and medians use completed timestamps only; a dash means there is no completed sample or the figure has not loaded. CSV export uses the selected event and expires after 24 hours. An empty file still downloads when the filter matches nothing.</p></div><button type="button" onClick={() => void exportPortfolio()}>Queue CSV export</button></div>{analyticsError && <p className="form-error" role="alert">{analyticsError}</p>}<CommandInsights metrics={analytics} />{governanceExports.length ? governanceExports.map((job) => <article key={job.id}><div><strong>{job.format}</strong><span>{eventTime(job.createdAt)}</span></div><div><span>Status</span><strong>{job.status}</strong></div><div><span>Rows</span><strong>{job.rowCount ?? 'Pending'}</strong></div>{job.status === 'READY' && <a href={'/api/management/exports/' + job.id + '/download'}>Download</a>}</article>) : <p className="empty-state">No export jobs yet.</p>}</section>}
-        {section === 'Audit' && <section className="portfolio-list"><div className="section-title"><div><h2>Administrative history</h2><p>Registration, workforce, configuration, and ticket lifecycle records for authorized events. This list cannot be edited.</p></div><div className="drawer-actions"><label>Ticket or account<input aria-label="Audit ticket" value={auditTicket} onChange={(event) => setAuditTicket(event.target.value)} /></label><label>Action<input aria-label="Audit action" value={auditAction} onChange={(event) => setAuditAction(event.target.value)} /></label></div></div>{governanceAudit.length ? governanceAudit.map((event) => <article key={event.id}><div><strong>{event.ticket.publicNo}</strong><span>{event.actor?.name ?? 'System'}{event.actor?.role ? ` · ${event.actor.role.replaceAll('_', ' ')}` : ''}</span></div><div><span>Record</span><strong>{event.kind === 'workforce' ? 'Administrative change' : 'Ticket lifecycle'}</strong></div><div><span>Action</span><strong>{event.eventType.replaceAll('_', ' ')}</strong></div><div><span>Time</span><strong>{eventTime(event.createdAt)}</strong></div></article>) : <p className="empty-state">No history matches this search.</p>}</section>}
+        {section === 'Audit' && <section className="portfolio-list"><div className="section-title"><div><h2>Administrative history</h2><p>Registration, workforce, configuration, and ticket lifecycle records for authorized events. This list cannot be edited. Refresh shows records added since this page was opened. Load more continues older records. Showing {governanceHistory.items.length}.</p></div><div className="drawer-actions"><label>Ticket or account<input aria-label="Audit ticket" value={auditTicket} onChange={(event) => setAuditTicket(event.target.value)} /></label><label>Action<input aria-label="Audit action" value={auditAction} onChange={(event) => setAuditAction(event.target.value)} /></label><button type="button" onClick={() => void governanceHistory.refresh()}>Refresh</button></div></div>{governanceHistory.stale && governanceHistory.error ? <p className="alert-line" role="status">{governanceHistory.error}</p> : null}{!governanceHistory.loaded ? <p className="empty-state">Loading history…</p> : governanceHistory.error && !governanceHistory.items.length ? <p className="form-error" role="alert">{governanceHistory.error}</p> : governanceHistory.items.length ? <>{governanceHistory.items.map((event) => <article key={(event.kind ?? 'ticket') + event.id}><div><strong>{event.ticket.publicNo}</strong><span>{event.actor?.name ?? 'System'}{event.actor?.role ? ` · ${event.actor.role.replaceAll('_', ' ')}` : ''}</span></div><div><span>Record</span><strong>{event.kind === 'workforce' ? 'Administrative change' : 'Ticket lifecycle'}</strong></div><div><span>Action</span><strong>{event.eventType.replaceAll('_', ' ')}</strong></div><div><span>Time</span><strong>{eventTime(event.createdAt)}</strong></div></article>)}{governanceHistory.nextCursor ? <button type="button" onClick={() => void governanceHistory.loadMore()}>Load more</button> : null}</> : <p className="empty-state">No history matches this search.</p>}</section>}
         {section === 'Configuration' && <section className="portfolio-list"><div className="section-title"><div><h2>Service configuration</h2><p>SLA defaults for authorized events. Export files expire after 24 hours.</p></div></div>{governanceMasters.length ? governanceMasters.map((event) => <div key={event.id}>{event.pools.map((pool) => <article key={pool.id}><div><strong>{event.name}</strong><span>{pool.category} · {pool.subtype} · {pool.active ? 'Active' : 'Inactive'}</span></div><div><span>Response SLA</span><strong>{duration(pool.responseTargetSeconds)}</strong></div><div><span>Resolution SLA</span><strong>{duration(pool.resolutionTargetSeconds)}</strong></div>{slaPoolId === pool.id ? <form className="authority-action" onSubmit={(formEvent) => void savePoolSla(formEvent, pool.id)}><label>Response target (seconds)<span aria-hidden="true"> *</span><input name="responseTargetSeconds" type="number" min={1} required defaultValue={pool.responseTargetSeconds} /></label><label>Resolution target (seconds)<span aria-hidden="true"> *</span><input name="resolutionTargetSeconds" type="number" min={1} required defaultValue={pool.resolutionTargetSeconds} /></label>{slaError && <p className="form-error" role="alert">{slaError}</p>}<div className="drawer-actions"><button type="button" onClick={() => setSlaPoolId(null)}>Cancel</button><button className="primary" type="submit">Save SLA</button></div></form> : <button type="button" onClick={() => { setSlaPoolId(pool.id); setSlaError(''); }}>Edit SLA</button>}</article>)}</div>) : <p className="empty-state">No service pools are configured for authorized events.</p>}</section>}
       </main>
     </div>

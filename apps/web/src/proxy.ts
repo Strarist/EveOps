@@ -37,6 +37,17 @@ export async function proxy(request: NextRequest) {
       headers: { cookie: request.headers.get('cookie') ?? '' },
       cache: 'no-store',
     });
+    if (response.status === 429) {
+      const retryAfter = response.headers.get('retry-after') ?? '60';
+      return new NextResponse('EveOps is temporarily busy. Your session is still valid.', {
+        status: 429,
+        headers: {
+          'content-type': 'text/plain; charset=utf-8',
+          'retry-after': retryAfter,
+          'cache-control': 'no-store',
+        },
+      });
+    }
     if (!response.ok) throw new Error('Session rejected');
     const scope = (await response.json()) as { role: Role; mustChangePassword?: boolean };
     if (scope.mustChangePassword && !request.nextUrl.pathname.startsWith('/change-password')) {

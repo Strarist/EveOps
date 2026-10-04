@@ -16,12 +16,11 @@ import {
   Post,
   UseGuards,
 } from '@nestjs/common';
-import type { AuthScope, Role } from '@eveops/contracts';
+import { LOGIN_IDENTIFIER_PATTERN, USER_ID_MESSAGE, type AuthScope, type Role } from '@eveops/contracts';
 import { fanOutTicketAlerts, serviceQueueOrderBy } from '@eveops/operations';
 import { Availability, Prisma, UserStatus } from '@prisma/client';
 import { Type } from 'class-transformer';
 import {
-  IsEmail,
   IsIn,
   IsInt,
   IsOptional,
@@ -58,7 +57,7 @@ export class AvailabilityDto {
 
 export class CreatePersonDto {
   @IsString() @MinLength(2) name!: string;
-  @IsEmail() email!: string;
+  @IsString() @Matches(LOGIN_IDENTIFIER_PATTERN, { message: USER_ID_MESSAGE }) email!: string;
   @IsOptional() @IsString() phone?: string;
   @IsString() @IsNewPassword() password!: string;
   @IsIn([...MANAGED_ROLES]) role!: ManagedRole;
@@ -635,6 +634,7 @@ export class WorkforceService {
             employeeCode,
             name: dto.name.trim(),
             email: dto.email.trim().toLowerCase(),
+            loginId: dto.email.trim().toLowerCase(),
             phone: dto.phone?.trim() || null,
             passwordHash,
             mustChangePassword: true,

@@ -1,8 +1,8 @@
 import { Prisma, PrismaClient } from '@prisma/client';
-import { assertEffectiveDatabase, classifyPushEndpoint, deliverPendingPushes, routeTicket } from '@eveops/operations';
+import { assertEffectiveDatabase, classifyPushEndpoint, deliverPendingPushes, resolvePushTransport, routeTicket } from '@eveops/operations';
 import ExcelJS from 'exceljs';
-import { mkdir, unlink, writeFile } from 'node:fs/promises';
-import { resolve } from 'node:path';
+import { appendFile, mkdir, unlink, writeFile } from 'node:fs/promises';
+import { dirname, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
 
 const prisma = new PrismaClient();
@@ -182,6 +182,18 @@ async function processOverdueAssignment(assignmentId: string, now: Date) {
 }
 
 async function deliverPushes() {
+  const transport = resolvePushTransport();
+  if (transport === 'disabled') return;
+  if (transport === 'capture') {
+    const capturePath = process.env.EVEOPS_PUSH_CAPTURE_LOG ?? resolve(process.cwd(), 'test-results/phase4/push-capture.jsonl');
+    await mkdir(dirname(capturePath), { recursive: true });
+    await deliverPendingPushes(prisma, async (subscription) => {
+      let host = 'invalid';
+      try { host = new URL(subscription.endpoint).host; } catch { host = 'invalid'; }
+      await appendFile(capturePath, JSON.stringify({ at: new Date().toISOString(), simulated: true, host }) + '\n');
+    });
+    return;
+  }
   if (!process.env.VAPID_PUBLIC_KEY || !process.env.VAPID_PRIVATE_KEY) return;
   const webpush = await import('web-push');
   webpush.default.setVapidDetails(process.env.VAPID_SUBJECT ?? 'mailto:ops@eveops.local', process.env.VAPID_PUBLIC_KEY, process.env.VAPID_PRIVATE_KEY);
@@ -462,9 +474,11 @@ async function processExports() {
 }
 
 async function run() {
+  const pushTransport = resolvePushTransport();
   await prisma.$connect();
   const databaseName = await assertEffectiveDatabase(prisma);
   console.log(`Effective database: ${databaseName}`);
+  console.log(`Push transport: ${pushTransport}`);
   while (true) {
     const startedAt = Date.now();
     await tick().catch(console.error);

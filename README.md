@@ -28,7 +28,7 @@ Open http://localhost:3000. API is served at http://localhost:4000/api.
 Every address requires authentication and an exact role match. Admin navigation does not expose SuperAdmin, and an Admin session cannot enter the governance workspace.
 One browser profile has one host-wide EveOps session; use isolated browser contexts for simultaneous role verification.
 
-Demo users are `stall@eveops.test`, `staff@eveops.test`, `house.staff@eveops.test`, `manager@eveops.test`, `admin@eveops.test`, and `super@eveops.test`; development password: `EveOpsDemo!2026`.
+Demo sign-in user IDs are `stall-b203`, `stf-elec-01`, `stf-house-01`, `hm-h2-01`, `adm-event-01`, and `sa-org-01`; development password: `EveOpsDemo!2026`.
 
 ## Authoritative specifications
 Read `01-product-plan.md`, `02-workflow.md`, `03-ui-ux-spec.md`, and `04-rules-permissions.md` in that order before changing architecture, data models, workflows, or permissions.
