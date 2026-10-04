@@ -3,6 +3,7 @@
 import Link from 'next/link';
 import { FormEvent, useCallback, useEffect, useRef, useState } from 'react';
 import { useRouter } from 'next/navigation';
+import { jitteredRetryMs, retryAfterMs } from '@eveops/ticket-timing';
 import { apiErrorMessage, apiFetch } from '../lib/api-client';
 import { releaseWorkAlerts } from '../lib/work-alerts';
 
@@ -45,11 +46,13 @@ export function RegistrationsView() {
   const [editingId, setEditingId] = useState<string | null>(null);
   const [transferId, setTransferId] = useState<string | null>(null);
   const [archiveId, setArchiveId] = useState<string | null>(null);
+  const [resetId, setResetId] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [zones, setZones] = useState<ZoneOption[]>([]);
   const [handoff, setHandoff] = useState<LoginHandoff | null>(null);
   const [loginStallId, setLoginStallId] = useState<string | null>(null);
   const registrationKey = useRef('');
+  const registrationRetry = useRef<ReturnType<typeof setTimeout> | null>(null);
   if (!registrationKey.current) registrationKey.current = crypto.randomUUID();
 
   const load = useCallback(async () => {
@@ -58,6 +61,16 @@ export function RegistrationsView() {
       apiFetch('/api/workforce', { cache: 'no-store' }),
       apiFetch('/api/management/masters', { cache: 'no-store' }),
     ]);
+    if (registrations.status === 429) {
+      setError('Registrations are busy right now. Showing the last loaded list.');
+      if (!registrationRetry.current) {
+        registrationRetry.current = setTimeout(() => {
+          registrationRetry.current = null;
+          void load();
+        }, jitteredRetryMs(retryAfterMs(registrations.headers.get('retry-after')), Math.random()));
+      }
+      return;
+    }
     if (!registrations.ok) {
       setError(await apiErrorMessage(registrations, 'Registrations could not be loaded'));
       return;
@@ -75,7 +88,12 @@ export function RegistrationsView() {
     setError('');
   }, []);
 
-  useEffect(() => { void load(); }, [load]);
+  useEffect(() => {
+    void load();
+    return () => {
+      if (registrationRetry.current) clearTimeout(registrationRetry.current);
+    };
+  }, [load]);
 
   async function logout() {
     releaseWorkAlerts();
@@ -157,6 +175,7 @@ export function RegistrationsView() {
     }
     const result = await response.json() as { handoff?: LoginHandoff };
     setHandoff(result.handoff ?? null);
+    setResetId(null);
     setNotice('A new initial password is ready. Earlier sessions for this account are signed out.');
     await load();
   }
@@ -167,18 +186,23 @@ export function RegistrationsView() {
 
   return (
     <div className="app-shell">
-      <aside className="sidebar">
+      <aside className="sidebar admin">
         <div className="brand"><span>E</span>EveOps</div>
-        <nav aria-label="Admin registration navigation">
-          <Link href="/admin">Command center</Link>
+        <nav aria-label="Admin navigation">
+          <Link href="/admin?section=Overview">Overview</Link>
+          <Link href="/admin?section=Tickets">Tickets</Link>
           <Link href="/admin/registrations" aria-current="page">Registrations</Link>
+          <Link href="/admin?section=Workforce">Workforce</Link>
+          <Link href="/admin?section=Event%20setup">Event setup</Link>
+          <Link href="/admin?section=Reports">Reports</Link>
+          <Link href="/admin?section=Audit">Audit</Link>
         </nav>
         <button className="logout" type="button" onClick={() => void logout()}>Sign out</button>
       </aside>
       <main className="management">
         <header className="topbar">
           <div>
-            <span className="eyebrow">Admin</span>
+            <span className="eyebrow">Admin · Stall and exhibitor accounts</span>
             <h1>Registrations</h1>
           </div>
         </header>
@@ -190,7 +214,7 @@ export function RegistrationsView() {
           <div className="section-title">
             <div>
               <h2 id="new-registration">Register a stall and login</h2>
-              <p>Create the stall and the exhibitor account together. The initial password is shown once on this page.</p>
+              <p>This is the normal way to add a stall. It creates the stall and the exhibitor login together. Zone, stall, contact, service priority, and login are saved in one step. The initial password is shown once, then the first sign-in requires a new password. Event setup does not create a login.</p>
             </div>
           </div>
           <form className="authority-action registration-create" onSubmit={(event) => void submitLogin(event, '/api/management/registrations/with-login')}>
@@ -220,7 +244,7 @@ export function RegistrationsView() {
           <div className="section-title">
             <div>
               <h2 id="stall-registrations">Stall registrations</h2>
-              <p>Edit the exhibitor record and service priority. Transfer and archive stay blocked while tickets are unresolved.</p>
+              <p>Each row shows the stall, its login, and whether the first password change is still required. Transfer moves the exhibitor and contact to another stall and signs that login out. Archive removes the login and signs it out. Both refuse to continue while this stall has open work.</p>
             </div>
           </div>
           {rows.length ? rows.map((row) => (
@@ -241,13 +265,23 @@ export function RegistrationsView() {
               )) : <div className="login-line"><span>Login</span><strong>No exhibitor login yet</strong></div>}
               {!row.archivedAt && (
                 <div className="drawer-actions">
-                  <button type="button" onClick={() => { setEditingId(editingId === row.id ? null : row.id); setTransferId(null); setArchiveId(null); }}>Edit</button>
-                  <button type="button" onClick={() => { setTransferId(transferId === row.id ? null : row.id); setEditingId(null); setArchiveId(null); }}>Transfer exhibitor</button>
-                  <button type="button" className="critical-button" onClick={() => { setArchiveId(archiveId === row.id ? null : row.id); setEditingId(null); setTransferId(null); setLoginStallId(null); }}>Archive</button>
+                  <button type="button" onClick={() => { setEditingId(editingId === row.id ? null : row.id); setTransferId(null); setArchiveId(null); setResetId(null); }}>Edit</button>
+                  <button type="button" onClick={() => { setTransferId(transferId === row.id ? null : row.id); setEditingId(null); setArchiveId(null); setResetId(null); }} disabled={row.openTicketCount > 0}>Transfer exhibitor</button>
+                  <button type="button" className="critical-button" onClick={() => { setArchiveId(archiveId === row.id ? null : row.id); setEditingId(null); setTransferId(null); setLoginStallId(null); setResetId(null); }} disabled={row.openTicketCount > 0}>Archive</button>
+                  {row.openTicketCount > 0 ? <p className="form-error" role="status">Transfer and archive are blocked while {row.openTicketCount} request{row.openTicketCount === 1 ? '' : 's'} {row.openTicketCount === 1 ? 'is' : 'are'} still open. <Link href={'/admin?section=Tickets&stall=' + encodeURIComponent(row.id)}>Review this stall’s tickets</Link></p> : null}
                   {row.exhibitors.length
-                    ? <button type="button" onClick={() => void resetLogin(row.id)} disabled={busy}>Reset initial password</button>
-                    : <button type="button" onClick={() => { setLoginStallId(loginStallId === row.id ? null : row.id); setEditingId(null); setTransferId(null); setArchiveId(null); }}>Create exhibitor login</button>}
+                    ? <button type="button" onClick={() => { setResetId(resetId === row.id ? null : row.id); setEditingId(null); setTransferId(null); setArchiveId(null); }} disabled={busy}>Reset initial password</button>
+                    : <button type="button" onClick={() => { setLoginStallId(loginStallId === row.id ? null : row.id); setEditingId(null); setTransferId(null); setArchiveId(null); setResetId(null); }}>Create exhibitor login</button>}
                 </div>
+              )}
+              {resetId === row.id && (
+                <form className="authority-action" onSubmit={(event) => { event.preventDefault(); void resetLogin(row.id); }}>
+                  <p>Reset replaces the initial password, shows the new one once on this page, and signs out any current session. The next sign-in must change that password.</p>
+                  <div className="drawer-actions">
+                    <button type="button" onClick={() => setResetId(null)}>Cancel</button>
+                    <button className="primary" type="submit" disabled={busy}>{busy ? 'Resetting…' : 'Reset and sign out earlier sessions'}</button>
+                  </div>
+                </form>
               )}
               {loginStallId === row.id && !row.exhibitors.length && (
                 <form className="authority-action" onSubmit={(event) => void submitLogin(event, '/api/management/registrations/' + row.id + '/exhibitor-login')}>
@@ -279,6 +313,7 @@ export function RegistrationsView() {
               )}
               {transferId === row.id && (
                 <form className="authority-action" onSubmit={(event) => void submit(event, '/api/management/registrations/' + row.id + '/transfer', 'POST')}>
+                  <p>This moves the exhibitor name and contact onto the destination stall, revokes the current login session, and leaves ticket history on this stall. It does not run while open requests remain.</p>
                   <label>Destination stall
                     <select name="destinationStallId" required defaultValue="">
                       <option value="" disabled>Choose a stall</option>
@@ -296,6 +331,7 @@ export function RegistrationsView() {
               )}
               {archiveId === row.id && (
                 <form className="authority-action" onSubmit={(event) => void submit(event, '/api/management/registrations/' + row.id + '/archive', 'POST')}>
+                  <p>Archiving deactivates this stall, removes its exhibitor login, and signs that account out. Ticket history stays. Open requests block the archive.</p>
                   <label>Reason<textarea name="reason" required minLength={3} /></label>
                   <div className="drawer-actions">
                     <button type="button" onClick={() => setArchiveId(null)}>Cancel</button>
@@ -312,7 +348,7 @@ export function RegistrationsView() {
         </section>
 
         <section className="portfolio-list" aria-labelledby="staff-accounts">
-          <div className="section-title"><div><h2 id="staff-accounts">Staff</h2><p>Staff accounts stay in Workforce. They are not stall registrations.</p></div><Link href="/admin">Open workforce</Link></div>
+          <div className="section-title"><div><h2 id="staff-accounts">Staff</h2><p>Staff accounts stay in Workforce. They are not stall registrations.</p></div><Link href="/admin?section=Workforce">Open workforce</Link></div>
           {staff.length ? staff.map((row) => (
             <article key={row.user.id + row.pool.category + row.pool.subtype}>
               <div><strong>{row.user.name}</strong><span>{row.user.employeeCode ?? row.user.email}</span></div>
@@ -323,7 +359,7 @@ export function RegistrationsView() {
         </section>
 
         <section className="portfolio-list" aria-labelledby="manager-accounts">
-          <div className="section-title"><div><h2 id="manager-accounts">Hall managers</h2><p>Hall manager accounts stay in Workforce.</p></div><Link href="/admin">Open workforce</Link></div>
+          <div className="section-title"><div><h2 id="manager-accounts">Hall managers</h2><p>Hall manager accounts stay in Workforce.</p></div><Link href="/admin?section=Workforce">Open workforce</Link></div>
           {managers.length ? managers.map((row) => (
             <article key={row.user.id + row.pool.category + row.pool.subtype}>
               <div><strong>{row.user.name}</strong><span>{row.user.employeeCode ?? row.user.email}</span></div>
@@ -338,7 +374,7 @@ export function RegistrationsView() {
 }
 
 function CredentialHandoff({ handoff, onDismiss }: { handoff: LoginHandoff; onDismiss: () => void }) {
-  const [copied, setCopied] = useState(false);
+  const [copyState, setCopyState] = useState<'idle' | 'copied' | 'failed'>('idle');
   const loginUrl = `${window.location.origin}${handoff.loginPath}`;
   const text = [
     `Login URL: ${loginUrl}`,
@@ -359,7 +395,7 @@ function CredentialHandoff({ handoff, onDismiss }: { handoff: LoginHandoff; onDi
       </dl>
       <p>First sign-in asks for a new password. This password is not stored in the registration list.</p>
       <div className="drawer-actions">
-        <button type="button" className="primary" onClick={() => void navigator.clipboard.writeText(text).then(() => setCopied(true))}>{copied ? 'Copied' : 'Copy login instructions'}</button>
+        <button type="button" className="primary" onClick={() => void navigator.clipboard.writeText(text).then(() => setCopyState('copied')).catch(() => setCopyState('failed'))}>{copyState === 'copied' ? 'Copied' : copyState === 'failed' ? 'Copy failed — select the password and copy it manually' : 'Copy login instructions'}</button>
         <button type="button" onClick={onDismiss}>Dismiss</button>
       </div>
     </section>

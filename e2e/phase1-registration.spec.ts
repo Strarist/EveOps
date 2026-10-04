@@ -117,6 +117,8 @@ test('exhibitor visibility and admin registration journeys', async ({ browser })
 
   await adminPage.setViewportSize({ width: 1280, height: 800 });
   await row.getByRole('button', { name: 'Reset initial password' }).click();
+  await expect(row.getByText('signs out any current session')).toBeVisible();
+  await row.getByRole('button', { name: 'Reset and sign out earlier sessions' }).click();
   const resetHandoff = adminPage.getByRole('status', { name: 'Exhibitor login instructions' });
   await expect(resetHandoff).toBeVisible();
   await resetHandoff.getByRole('button', { name: 'Dismiss' }).click();

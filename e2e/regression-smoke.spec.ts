@@ -29,7 +29,7 @@ test('role homes render on the regression stack', async ({ browser }) => {
     { email: 'regression.help.h1.1@volume.lab', path: '/login', button: 'Sign in', heading: 'House help H1.1', url: /\/staff/ },
     { email: 'regression.manager.h1@volume.lab', path: '/login', button: 'Sign in', heading: 'Hall 1 operations', url: /\/hall-manager/ },
     { email: 'regression.stall.h1-01@volume.lab', path: '/login', button: 'Sign in', heading: 'Stall H1-01', url: /\/stall/ },
-    { email: 'regression.admin@volume.lab', path: '/login', button: 'Sign in', heading: 'Event command center', url: /\/admin/ },
+    { email: 'regression.admin@volume.lab', path: '/login', button: 'Sign in', heading: 'Overview', url: /\/admin/ },
     { email: 'regression.super@volume.lab', path: '/governance-access', button: 'Enter governance workspace', heading: 'Portfolio overview', url: /\/super-admin/ },
   ];
   for (const journey of journeys) {
