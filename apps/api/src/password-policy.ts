@@ -1,6 +1,6 @@
 import { compare } from 'bcryptjs';
 import { Matches, MaxLength, MinLength, registerDecorator, type ValidationOptions } from 'class-validator';
-import { NEW_PASSWORD_MESSAGE, NEW_PASSWORD_PATTERN, PASSWORD_MAX_BYTES, PASSWORD_MIN_LENGTH } from '@eveops/contracts';
+import { NEW_PASSWORD_MESSAGE, NEW_PASSWORD_MIN_LENGTH, NEW_PASSWORD_PATTERN, PASSWORD_MAX_BYTES, PASSWORD_MIN_LENGTH } from '@eveops/contracts';
 
 /** Cost-12 hash used so an unknown account still pays for one password compare. */
 const UNKNOWN_ACCOUNT_HASH = '$2b$12$oMgi.0eby3bvSL6zNnDbf.f3FJUtOVNkNDxnvDUtCqkUH9atGrQhe';
@@ -41,10 +41,12 @@ export function IsAcceptedPassword(): PropertyDecorator {
   ]);
 }
 
-/** Length bounds plus a letter and a number, for a password being chosen. */
+/** Chosen and provisioned passwords are at least 8 characters and include a letter and a number. */
 export function IsNewPassword(): PropertyDecorator {
   return applyDecorators([
-    IsAcceptedPassword(),
+    MinLength(NEW_PASSWORD_MIN_LENGTH),
+    MaxLength(PASSWORD_MAX_BYTES),
+    IsPasswordByteLimit(),
     Matches(NEW_PASSWORD_PATTERN, { message: NEW_PASSWORD_MESSAGE }),
   ]);
 }

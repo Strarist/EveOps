@@ -1,6 +1,6 @@
 'use client';
 
-import { NEW_PASSWORD_PATTERN, PASSWORD_MAX_BYTES, PASSWORD_MIN_LENGTH, type Role } from '@eveops/contracts';
+import { NEW_PASSWORD_MIN_LENGTH, NEW_PASSWORD_PATTERN, PASSWORD_MAX_BYTES, PASSWORD_MIN_LENGTH, type Role } from '@eveops/contracts';
 import { FormEvent, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { apiErrorMessage, apiFetch } from '../../lib/api-client';
@@ -76,11 +76,11 @@ export default function ChangePasswordPage() {
             </label>
             <label>
               New password
-              <input name="newPassword" type="password" autoComplete="new-password" required minLength={PASSWORD_MIN_LENGTH} maxLength={PASSWORD_MAX_BYTES} pattern={NEW_PASSWORD_PATTERN.source} title="Include at least one letter and one number" />
+              <input name="newPassword" type="password" autoComplete="new-password" required minLength={NEW_PASSWORD_MIN_LENGTH} maxLength={PASSWORD_MAX_BYTES} pattern={NEW_PASSWORD_PATTERN.source} title="Use at least 8 characters, including a letter and a number" />
             </label>
             <label>
               Confirm new password
-              <input name="confirmPassword" type="password" autoComplete="new-password" required minLength={PASSWORD_MIN_LENGTH} maxLength={PASSWORD_MAX_BYTES} pattern={NEW_PASSWORD_PATTERN.source} title="Include at least one letter and one number" />
+              <input name="confirmPassword" type="password" autoComplete="new-password" required minLength={NEW_PASSWORD_MIN_LENGTH} maxLength={PASSWORD_MAX_BYTES} pattern={NEW_PASSWORD_PATTERN.source} title="Use at least 8 characters, including a letter and a number" />
             </label>
             {error && <div className="form-error" role="alert">{error}</div>}
             <button className="primary" type="submit" disabled={loading}>

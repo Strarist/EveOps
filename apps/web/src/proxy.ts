@@ -34,11 +34,12 @@ export async function proxy(request: NextRequest) {
   try {
     const apiUrl = process.env.API_URL ?? 'http://localhost:4000/api';
     const response = await fetch(apiUrl + '/auth/me', {
-      headers: { cookie: request.headers.get('cookie') ?? '' },
+      headers: { cookie: `eveops_session=${encodeURIComponent(session.value)}` },
       cache: 'no-store',
     });
     if (response.status === 429) {
-      const retryAfter = response.headers.get('retry-after') ?? '60';
+      const rawRetry = response.headers.get('retry-after') ?? '';
+      const retryAfter = /^\d{1,5}$/.test(rawRetry) ? rawRetry : '60';
       return new NextResponse('EveOps is temporarily busy. Your session is still valid.', {
         status: 429,
         headers: {

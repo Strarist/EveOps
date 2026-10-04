@@ -71,10 +71,12 @@ describe('authentication scope shape', () => {
     expect(await validate(tooLong)).not.toHaveLength(0);
   });
 
-  it('requires a letter and a number when a password is chosen', async () => {
-    const digitsOnly = Object.assign(new ChangePasswordDto(), { currentPassword: 'ab12', newPassword: '1234' });
-    const mixed = Object.assign(new ChangePasswordDto(), { currentPassword: 'ab12', newPassword: 'ab12' });
+  it('requires 8 characters, a letter, and a number when a password is chosen', async () => {
+    const digitsOnly = Object.assign(new ChangePasswordDto(), { currentPassword: 'ab12', newPassword: '12345678' });
+    const tooShort = Object.assign(new ChangePasswordDto(), { currentPassword: 'ab12', newPassword: 'ab12' });
+    const mixed = Object.assign(new ChangePasswordDto(), { currentPassword: 'ab12', newPassword: 'abcd1234' });
     expect(await validate(digitsOnly)).not.toHaveLength(0);
+    expect(await validate(tooShort)).not.toHaveLength(0);
     expect(await validate(mixed)).toHaveLength(0);
   });
 

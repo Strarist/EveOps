@@ -11,7 +11,7 @@ export function decodeAuditCursor(value: string | undefined): AuditCursor | null
   if (!value) return null;
   try {
     const parsed = JSON.parse(Buffer.from(value, 'base64url').toString('utf8')) as { t?: unknown; i?: unknown };
-    if (typeof parsed.t !== 'string' || typeof parsed.i !== 'string' || parsed.i.length < 1) return null;
+    if (typeof parsed.t !== 'string' || typeof parsed.i !== 'string' || parsed.i.length < 1 || parsed.i.length > 128) return null;
     const createdAt = new Date(parsed.t);
     if (Number.isNaN(createdAt.getTime())) return null;
     return { createdAt, id: parsed.i };

@@ -1,5 +1,8 @@
-/** Minimum length for account passwords on sign-in, rotation, and account creation. */
+/** Minimum length accepted when signing in with an existing password. */
 export const PASSWORD_MIN_LENGTH = 4;
+
+/** Minimum length for a password being chosen or provisioned. */
+export const NEW_PASSWORD_MIN_LENGTH = 8;
 
 /** bcrypt only stores the first 72 bytes. Longer passwords are rejected instead of being truncated. */
 export const PASSWORD_MAX_BYTES = 72;

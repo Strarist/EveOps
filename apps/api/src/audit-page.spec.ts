@@ -47,5 +47,7 @@ describe('audit page merge', () => {
     expect(decodeAuditCursor(encodeAuditCursor(cursor))).toEqual(cursor);
     expect(decodeAuditCursor(undefined)).toBeNull();
     expect(decodeAuditCursor('not-a-cursor')).toBeNull();
+    const oversized = Buffer.from(JSON.stringify({ t: '2026-04-01T00:00:00.000Z', i: 'x'.repeat(129) }), 'utf8').toString('base64url');
+    expect(decodeAuditCursor(oversized)).toBeNull();
   });
 });
