@@ -10,6 +10,7 @@ export type SessionProfile = {
   email?: string | null;
   phone?: string | null;
   mustChangePassword?: boolean;
+  organization?: { name: string } | null;
   scopes: Array<{
     event: { id: string; name: string; timezone: string };
     hall: { id: string; code: string; name: string } | null;

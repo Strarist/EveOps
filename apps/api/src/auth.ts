@@ -184,6 +184,7 @@ export class AuthController {
         phone: true,
         role: true,
         mustChangePassword: true,
+        organization: { select: { name: true } },
         scopes: {
           select: {
             event: { select: { id: true, name: true, timezone: true } },

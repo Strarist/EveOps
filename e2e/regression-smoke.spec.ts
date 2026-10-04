@@ -30,7 +30,7 @@ test('role homes render on the regression stack', async ({ browser }) => {
     { email: 'regression.manager.h1@volume.lab', path: '/login', button: 'Sign in', heading: 'Hall 1 operations', url: /\/hall-manager/ },
     { email: 'regression.stall.h1-01@volume.lab', path: '/login', button: 'Sign in', heading: 'Stall H1-01', url: /\/stall/ },
     { email: 'regression.admin@volume.lab', path: '/login', button: 'Sign in', heading: 'Overview', url: /\/admin/ },
-    { email: 'regression.super@volume.lab', path: '/governance-access', button: 'Enter governance workspace', heading: 'Portfolio overview', url: /\/super-admin/ },
+    { email: 'regression.super@volume.lab', path: '/governance-access', button: 'Enter governance workspace', heading: 'Overview', url: /\/super-admin/ },
   ];
   for (const journey of journeys) {
     const context = await browser.newContext();

@@ -13,7 +13,7 @@ Role home routes stay separate. Admin registrations are a distinct page, with ex
 | `/hall-manager` | Hall Manager | Hall overview, live tickets, staff, exceptions, search |
 | `/admin` | Admin | Overview, tickets, workforce, event setup, reports, audit. Registrations is a separate page. |
 | `/admin/registrations` | Admin | Stall plus exhibitor login, existing stalls without a login, priority, transfer, and archive |
-| `/super-admin` | SuperAdmin | Portfolio, events, tickets, analytics, exports, configuration, admins, audit |
+| `/super-admin` | SuperAdmin | Overview, events, cross-event tickets, admins, reports and exports, configuration, audit |
 | `/change-password` | Any signed-in user who must rotate a password | Password change |
 
 Staff and hall-manager account changes remain on Workforce. Stall registration edit, exhibitor transfer, and archive are only on `/admin/registrations`.
