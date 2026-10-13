@@ -245,19 +245,20 @@ test.describe.serial('isolated multi-role operational acceptance', () => {
     const stallPage = await stall.newPage();
     await stallPage.goto('/stall');
     await expect(stallPage.getByText(ticket.publicNo)).toBeVisible();
-    await expect(stallPage.getByText('Waiting for completion verification')).toBeVisible();
+    await expect(stallPage.getByText('Check the work and share your completion code')).toBeVisible();
+    await stallPage.goto(`/stall/ticket/${ticket.id}`);
     const showCode = stallPage.getByRole('button', { name: /Show completion code|Loading code/ });
-    if (await showCode.isVisible().catch(() => false)) {
-      await expect.poll(async () => showCode.isEnabled(), { timeout: 15_000 }).toBe(true);
-      await showCode.click();
-    }
+    await expect(showCode).toBeVisible();
+    await expect.poll(async () => showCode.isEnabled(), { timeout: 15_000 }).toBe(true);
+    await showCode.click();
     await expect(stallPage.getByText('Completion code', { exact: true })).toBeVisible({ timeout: 15_000 });
-    await expect(stallPage.locator('.otp-digits')).toBeVisible();
+    await expect(stallPage.locator('.completion-code')).toBeVisible();
     const staffAwait = await staff.newPage();
     await staffAwait.goto('/staff');
-    await expect(staffAwait.getByText("Waiting for stall's code")).toBeVisible();
+    await expect(staffAwait.getByText('Waiting for close code')).toBeVisible();
+    await staffAwait.goto(`/staff/task/${ticket.id}`);
     await expect(staffAwait.getByRole('button', { name: 'Verify code' })).toBeVisible();
-    await expect(staffAwait.locator('.otp-digits')).toHaveCount(0);
+    await expect(staffAwait.locator('.completion-code')).toHaveCount(0);
     await closeWithOtp(stall, staff, ticket.id);
     const detail = await admin.request.get(`/api/tickets/${ticket.id}`);
     const closed = await detail.json() as { status: string; closedAt: string | null; firstAcceptedAt: string | null; firstStartedAt: string | null };
