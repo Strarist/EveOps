@@ -503,12 +503,12 @@ test.describe.serial('isolated multi-role operational acceptance', () => {
     expect(String((await missingHall.json()).message)).toMatch(/hall/i);
 
     const adminPage = await admin.newPage();
-    await adminPage.goto('/admin');
-    await adminPage.getByRole('button', { name: 'Workforce' }).click();
+    await adminPage.goto('/admin?section=Workforce');
+    await expect(adminPage.getByRole('heading', { name: 'Workforce', level: 2 })).toBeVisible();
     await adminPage.getByRole('button', { name: 'Add person' }).click();
     await expect(adminPage.getByLabel(/^Hall/)).toBeVisible();
     await adminPage.getByLabel(/^Name/).fill('Admin Created Electrician');
-    await adminPage.getByLabel(/Login email/).fill(`${runKey}.admin-created@eveops.test`);
+    await adminPage.getByLabel(/^User ID/).fill(`${runKey}.admin-created@eveops.test`);
     await adminPage.getByLabel(/Temporary password/).fill(password);
     await adminPage.getByLabel(/^Hall/).selectOption(ids.hall);
     await adminPage.getByLabel(/Service category/).selectOption('ELECTRICAL');
