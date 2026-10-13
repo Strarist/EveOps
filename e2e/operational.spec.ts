@@ -255,7 +255,7 @@ test.describe.serial('isolated multi-role operational acceptance', () => {
     await expect(stallPage.locator('.completion-code')).toBeVisible();
     const staffAwait = await staff.newPage();
     await staffAwait.goto('/staff');
-    await expect(staffAwait.getByText('Waiting for close code')).toBeVisible();
+    await expect(staffAwait.locator('.status-awaiting_otp').filter({ hasText: 'Waiting for close code' })).toBeVisible();
     await staffAwait.goto(`/staff/task/${ticket.id}`);
     await expect(staffAwait.getByRole('button', { name: 'Verify code' })).toBeVisible();
     await expect(staffAwait.locator('.completion-code')).toHaveCount(0);
