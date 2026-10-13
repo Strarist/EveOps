@@ -392,7 +392,8 @@ test.describe.serial('isolated multi-role operational acceptance', () => {
     const ticket = await createTicket(stall);
     await admin.setOffline(false);
     await adminPage.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
-    await expect(adminPage.getByText(ticket.publicNo).first()).toBeVisible({ timeout: 15_000 });
+    // Desktop hides .admin-ticket-cards (display:none); assert the visible table row.
+    await expect(adminPage.locator('.admin-ticket-table').getByText(ticket.publicNo)).toBeVisible({ timeout: 15_000 });
     await Promise.all([stall.close(), admin.close()]);
   });
 
