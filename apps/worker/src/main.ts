@@ -1,8 +1,8 @@
 import { Prisma, PrismaClient } from '@prisma/client';
-import { routeTicket } from '@eveops/operations';
+import { assertEffectiveDatabase, classifyPushEndpoint, deliverPendingPushes, resolvePushTransport, routeTicket } from '@eveops/operations';
 import ExcelJS from 'exceljs';
-import { mkdir, unlink, writeFile } from 'node:fs/promises';
-import { resolve } from 'node:path';
+import { appendFile, mkdir, unlink, writeFile } from 'node:fs/promises';
+import { dirname, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
 
 const prisma = new PrismaClient();
@@ -182,48 +182,30 @@ async function processOverdueAssignment(assignmentId: string, now: Date) {
 }
 
 async function deliverPushes() {
+  const transport = resolvePushTransport();
+  if (transport === 'disabled') return;
+  if (transport === 'capture') {
+    const capturePath = process.env.EVEOPS_PUSH_CAPTURE_LOG ?? resolve(process.cwd(), 'test-results/phase4/push-capture.jsonl');
+    await mkdir(dirname(capturePath), { recursive: true });
+    await deliverPendingPushes(prisma, async (subscription) => {
+      let host = 'invalid';
+      try { host = new URL(subscription.endpoint).host; } catch { host = 'invalid'; }
+      await appendFile(capturePath, JSON.stringify({ at: new Date().toISOString(), simulated: true, host }) + '\n');
+    });
+    return;
+  }
   if (!process.env.VAPID_PUBLIC_KEY || !process.env.VAPID_PRIVATE_KEY) return;
   const webpush = await import('web-push');
   webpush.default.setVapidDetails(process.env.VAPID_SUBJECT ?? 'mailto:ops@eveops.local', process.env.VAPID_PUBLIC_KEY, process.env.VAPID_PRIVATE_KEY);
-  const pending = await prisma.notification.findMany({
-    where: { pushedAt: null, pushAttempts: { lt: 5 }, sentAt: { gt: new Date(Date.now() - 60 * 60 * 1000) } },
-    take: 25,
-    include: { recipient: { include: { pushSubscriptions: true } } },
+  await deliverPendingPushes(prisma, async (subscription, body) => {
+    const verdict = await classifyPushEndpoint(subscription.endpoint);
+    if (verdict === 'refuse') throw Object.assign(new Error('Push endpoint refused'), { statusCode: 410 });
+    if (verdict === 'retry') throw Object.assign(new Error('Push endpoint could not be resolved'), { statusCode: 503 });
+    await webpush.default.sendNotification({
+      endpoint: subscription.endpoint,
+      keys: { p256dh: subscription.p256dh, auth: subscription.auth },
+    }, body);
   });
-  for (const notification of pending) {
-    const payload = notification.payload && typeof notification.payload === 'object' && !Array.isArray(notification.payload)
-      ? notification.payload as Record<string, unknown>
-      : {};
-    const summary = typeof payload.summary === 'string' ? payload.summary : 'You have an update';
-    const target = notification.recipient.role === 'STAFF' && notification.ticketId
-      ? '/staff/task/' + notification.ticketId
-      : notification.recipient.role === 'STALL' && notification.ticketId
-        ? '/stall/ticket/' + notification.ticketId
-        : notification.recipient.role === 'HALL_MANAGER'
-          ? '/hall-manager'
-          : '/';
-    const url = target.startsWith('/') && !target.startsWith('//') ? target : '/';
-    let failed = false;
-    for (const subscription of notification.recipient.pushSubscriptions) {
-      try {
-        await webpush.default.sendNotification({
-          endpoint: subscription.endpoint,
-          keys: { p256dh: subscription.p256dh, auth: subscription.auth },
-        }, JSON.stringify({ title: 'EveOps', body: summary, url, tag: notification.id }));
-      } catch (error) {
-        const status = (error as { statusCode?: number }).statusCode;
-        if (status === 404 || status === 410) {
-          await prisma.pushSubscription.delete({ where: { id: subscription.id } }).catch(() => undefined);
-        } else {
-          failed = true;
-        }
-      }
-    }
-    await prisma.notification.update({
-      where: { id: notification.id },
-      data: failed ? { pushAttempts: { increment: 1 } } : { pushedAt: new Date(), pushAttempts: { increment: 1 } },
-    });
-  }
 }
 
 async function processOutbox() {
@@ -492,7 +474,11 @@ async function processExports() {
 }
 
 async function run() {
+  const pushTransport = resolvePushTransport();
   await prisma.$connect();
+  const databaseName = await assertEffectiveDatabase(prisma);
+  console.log(`Effective database: ${databaseName}`);
+  console.log(`Push transport: ${pushTransport}`);
   while (true) {
     const startedAt = Date.now();
     await tick().catch(console.error);

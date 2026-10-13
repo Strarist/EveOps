@@ -6,11 +6,22 @@ import { TicketService } from './tickets';
 /** Isolated database name. The fixture refuses every other database. */
 export const REGRESSION_DATABASE_NAME = 'eveops_regression';
 
+/** Sign-in user ID for a synthetic @volume.lab account. Letters, digits, and hyphens. */
+export function regressionLoginId(email: string) {
+  return email.toLowerCase().replace(/@volume\.lab$/, '').replace(/^regression\./, '').replace(/\./g, '-');
+}
+
 /**
- * Shared lab password for synthetic @volume.lab accounts.
- * Kept in source so the fixture is reproducible. Do not print it in reports.
+ * Lab password for synthetic @volume.lab accounts.
+ * Supply REGRESSION_FIXTURE_PASSWORD in the environment. Do not commit it or print it.
  */
-export const REGRESSION_FIXTURE_PASSWORD = 'VolumeLab#40users';
+export function regressionFixturePassword() {
+  const value = process.env.REGRESSION_FIXTURE_PASSWORD ?? '';
+  if (!/^[0-9]{4,7}$/.test(value)) {
+    throw new Error('Set REGRESSION_FIXTURE_PASSWORD in the environment to 4–7 digits. Do not commit it.');
+  }
+  return value;
+}
 
 const ORG_ID = 'regression-org';
 const FOREIGN_ORG_ID = 'regression-org-foreign';
@@ -150,7 +161,7 @@ export async function ensureRegressionFixture(prisma: PrismaClient): Promise<Reg
     throw new Error('Stall priority plan must be 6 HIGH, 6 MEDIUM, and 6 LOW across 18 stalls');
   }
 
-  const passwordHash = await hash(REGRESSION_FIXTURE_PASSWORD, 12);
+  const passwordHash = await hash(regressionFixturePassword(), 12);
   const windowStart = new Date('2026-10-01T00:00:00Z');
   const windowEnd = new Date('2026-10-10T00:00:00Z');
 
@@ -538,10 +549,12 @@ async function upsertAccount(
   passwordHash: string,
   account: { id: string; email: string; name: string; role: AuthScope['role']; employeeCode: string },
 ) {
+  const loginId = regressionLoginId(account.email);
   await prisma.user.upsert({
     where: { id: account.id },
     update: {
       email: account.email,
+      loginId,
       name: account.name,
       role: account.role,
       employeeCode: account.employeeCode,
@@ -555,6 +568,7 @@ async function upsertAccount(
       id: account.id,
       organizationId: ORG_ID,
       email: account.email,
+      loginId,
       name: account.name,
       role: account.role,
       employeeCode: account.employeeCode,

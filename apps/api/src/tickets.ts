@@ -4,7 +4,7 @@ import { Transform, Type } from 'class-transformer';
 import { createCipheriv, createDecipheriv, createHash, randomBytes, randomInt } from 'node:crypto';
 import { ACTIVE_TICKET_STATUSES, TERMINAL_TICKET_STATUSES } from '@eveops/contracts';
 import type { AuthScope, TicketStatus } from '@eveops/contracts';
-import { routeTicket, serviceQueueOrderBy } from '@eveops/operations';
+import { fanOutTicketAlerts, lifecycleTiming, presentActivity, projectTicketForRole, routeTicket, serviceQueueOrderBy, ticketListOrder } from '@eveops/operations';
 import { Prisma, ServicePriority, TicketPriority } from '@prisma/client';
 import { Throttle } from '@nestjs/throttler';
 import { CurrentScope, SessionGuard } from './auth';
@@ -31,6 +31,7 @@ export class ListTicketsDto {
   @IsOptional() @IsString() stallId?: string;
   @IsOptional() @IsString() assigneeId?: string;
   @IsOptional() @IsIn(['ELECTRICAL', 'HOUSE_HELP', 'HALL_MANAGER']) category?: string;
+  @IsOptional() @IsString() @Length(1, 80) subtype?: string;
   @IsOptional() @IsIn(['NORMAL', 'URGENT']) priority?: 'NORMAL' | 'URGENT';
   @IsOptional() @Transform(({ value }) => value === true || value === 'true') @IsBoolean() complaint?: boolean;
   @IsOptional() @Transform(({ value }) => value === true || value === 'true') @IsBoolean() reopened?: boolean;
@@ -38,7 +39,8 @@ export class ListTicketsDto {
   @IsOptional() @IsDateString() createdTo?: string;
   @IsOptional() @IsString() search?: string;
   @IsOptional() @IsString() cursor?: string;
-  @IsOptional() @IsIn(['active', 'closed', 'all']) view: 'active' | 'closed' | 'all' = 'all';
+  @IsOptional() @IsIn(['active', 'closed', 'all', 'queued', 'attention']) view: 'active' | 'closed' | 'all' | 'queued' | 'attention' = 'all';
+  @IsOptional() @IsIn(['recent']) sort?: 'recent';
   @IsOptional() @Type(() => Number) @IsInt() @Min(1) @Max(100) limit = 50;
 }
 
@@ -74,43 +76,28 @@ export class ComplaintDto {
 
 async function createLifecycleNotifications(
   tx: Prisma.TransactionClient,
-  ticket: { id: string; eventId: string; hallId: string; stallId: string; version: number },
+  ticket: { id: string; eventId: string; hallId: string; stallId: string; version: number; category?: string; publicNo?: string | null },
   type: string,
   actorId?: string,
 ) {
-  const scopes = await tx.userScope.findMany({
-    where: {
+  const record = ticket.category
+    ? ticket
+    : await tx.ticket.findUnique({ where: { id: ticket.id }, select: { publicNo: true, category: true } });
+  const broadcast = ['TICKET_REOPENED', 'COMPLAINT_RAISED', 'TICKET_ESCALATED'].includes(type);
+  await fanOutTicketAlerts(tx, {
+    type,
+    mode: broadcast ? 'broadcast' : 'lifecycle',
+    actorId,
+    eventToken: String(ticket.version),
+    ticket: {
+      id: ticket.id,
       eventId: ticket.eventId,
-      OR: [
-        { stallId: ticket.stallId, user: { role: 'STALL' } },
-        { hallId: ticket.hallId, user: { role: 'HALL_MANAGER' } },
-      ],
+      hallId: ticket.hallId,
+      stallId: ticket.stallId,
+      version: ticket.version,
+      category: record?.category ?? ticket.category ?? 'HOUSE_HELP',
+      publicNo: record?.publicNo ?? ticket.publicNo ?? null,
     },
-    select: { userId: true },
-  });
-  const assignment = await tx.assignment.findFirst({
-    where: { ticketId: ticket.id, status: { in: ['ACTIVE', 'ACCEPTED'] } },
-    select: { staffId: true },
-    orderBy: { assignedAt: 'desc' },
-  });
-  const recipients = [...new Set([...scopes.map((item) => item.userId), ...(assignment ? [assignment.staffId] : [])])]
-    .filter((recipientId) => recipientId !== actorId);
-  const stall = await tx.stall.findUnique({ where: { id: ticket.stallId }, select: { stallCode: true } });
-  const record = await tx.ticket.findUnique({ where: { id: ticket.id }, select: { publicNo: true, category: true } });
-  const stallCode = stall?.stallCode ?? 'stall';
-  const summary = type === 'TICKET_REOPENED'
-    ? `Ticket opened again · Stall ${stallCode}`
-    : `Update · Stall ${stallCode}`;
-  await tx.notification.createMany({
-    data: recipients.map((recipientId) => ({
-      eventId: ticket.eventId,
-      recipientId,
-      ticketId: ticket.id,
-      type,
-      dedupeKey: `${type.toLowerCase()}:${ticket.id}:${recipientId}:${ticket.version}`,
-      payload: { hallId: ticket.hallId, stallId: ticket.stallId, stallCode, publicNo: record?.publicNo, category: record?.category, summary },
-    })),
-    skipDuplicates: true,
   });
 }
 
@@ -180,10 +167,15 @@ export class TicketService {
         : { some: { staffId: scope.userId, status: { in: ['ACTIVE', 'ACCEPTED'] } } };
     }
     if (scope.role === 'HALL_MANAGER') where.hallId = { in: scope.hallIds };
-    if (query.status) where.status = query.status;
+    if (query.view === 'queued') where.status = 'QUEUED';
+    else if (query.view === 'attention') {
+      const attention = await this.attentionEligibility(new Date(), scope.eventIds);
+      where.AND = [...(Array.isArray(where.AND) ? where.AND : where.AND ? [where.AND] : []), attention];
+    } else if (query.status) where.status = query.status;
     else if (query.view === 'active') where.status = { in: [...ACTIVE_TICKET_STATUSES] };
     else if (query.view === 'closed') where.status = 'CLOSED';
     if (query.category) where.category = query.category;
+    if (query.subtype) where.subtype = query.subtype;
     if (query.priority) where.priority = query.priority;
     if (query.zoneId) where.zoneId = query.zoneId;
     if (query.stallId) {
@@ -224,8 +216,14 @@ export class TicketService {
           hall: true,
           zone: true,
           assignments: { orderBy: { assignedAt: 'desc' }, take: 1, include: { staff: { select: { id: true, name: true } } } },
+          events: {
+            where: { eventType: { in: ['COMPLAINT_RAISED', 'STATUS_REOPENED', 'STATUS_CANCELLED'] } },
+            orderBy: { createdAt: 'desc' },
+            take: 12,
+            select: { eventType: true, createdAt: true },
+          },
         },
-        orderBy: [{ priority: 'desc' }, { createdAt: 'asc' }, { id: 'asc' }],
+        orderBy: ticketListOrder(query.view, query.sort),
         take: query.limit + 1,
         ...(query.cursor ? { cursor: { id: query.cursor }, skip: 1 } : {}),
       }),
@@ -233,10 +231,15 @@ export class TicketService {
     const hasMore = rows.length > query.limit;
     const items = hasMore ? rows.slice(0, query.limit) : rows;
     return {
-      items: items.map((ticket) => ({
-        ...ticket,
-        ...projectTicketView(ticket, scope),
-      })),
+      serverTime: new Date().toISOString(),
+      items: items.map((ticket) => {
+        const { events, ...record } = ticket;
+        return projectTicketForRole({
+          ...record,
+          ...projectTicketView(ticket, scope),
+          ...lifecycleTiming(events),
+        }, scope.role);
+      }),
       total,
       nextCursor: hasMore ? items.at(-1)?.id : null,
     };
@@ -277,12 +280,14 @@ export class TicketService {
       throw new BadRequestException('Ticket is not assigned to this staff account');
     }
     const assignmentHistory = [...ticket.assignments].reverse();
-    return {
+    // Detail dates come from the ticket timeline, independent of list order.
+    return projectTicketForRole({
       ...ticket,
       ...projectTicketView(ticket, scope),
+      ...lifecycleTiming(ticket.events),
       assignmentHistory,
       otpChallenges: ticket.otpChallenges,
-    };
+    }, scope.role);
   }
 
   async activity(id: string, scope: AuthScope, cursor?: string) {
@@ -303,13 +308,17 @@ export class TicketService {
       select: { id: true, eventType: true, createdAt: true, actor: { select: { name: true } } },
     });
     const hasMore = rows.length > 20;
-    const items = (hasMore ? rows.slice(0, 20) : rows).map((event) => ({
-      id: event.id,
-      eventType: event.eventType,
-      createdAt: event.createdAt,
-      actorName: event.actor?.name ?? 'System',
-    }));
-    return { items, nextCursor: hasMore ? items.at(-1)?.id ?? null : null };
+    const page = hasMore ? rows.slice(0, 20) : rows;
+    const items = page.flatMap((event) => {
+      const presented = presentActivity({
+        id: event.id,
+        eventType: event.eventType,
+        createdAt: event.createdAt,
+        actorName: event.actor?.name ?? 'System',
+      }, scope.role);
+      return presented ? [presented] : [];
+    });
+    return { items, nextCursor: hasMore ? page.at(-1)?.id ?? null : null };
   }
 
   async create(dto: CreateTicketDto, scope: AuthScope) {
@@ -361,33 +370,19 @@ export class TicketService {
       });
       await tx.ticketEvent.create({ data: { eventId: target.eventId, ticketId: created.id, eventType: 'TICKET_CREATED', actorId: scope.userId, toStatus: 'NEW', correlationId: requestCorrelationId() } });
       await tx.outboxEvent.create({ data: { eventId: target.eventId, aggregateType: 'Ticket', aggregateId: created.id, eventType: 'TICKET_CREATED', payload: { ticketId: created.id, ...target } } });
-      const recipients = await tx.userScope.findMany({
-        where: {
+      await fanOutTicketAlerts(tx, {
+        type: 'TICKET_CREATED',
+        mode: 'broadcast',
+        eventToken: String(created.version),
+        ticket: {
+          id: created.id,
           eventId: target.eventId,
-          OR: [
-            { stallId: target.stallId, user: { role: 'STALL' } },
-            { hallId: target.hallId, user: { role: 'HALL_MANAGER' } },
-          ],
+          hallId: target.hallId,
+          stallId: target.stallId,
+          version: created.version,
+          category: dto.category,
+          publicNo: created.publicNo,
         },
-        select: { userId: true },
-      });
-      await tx.notification.createMany({
-        data: recipients.map(({ userId }) => ({
-          eventId: target.eventId,
-          recipientId: userId,
-          ticketId: created.id,
-          type: 'TICKET_CREATED',
-          dedupeKey: 'ticket-created:' + created.id + ':' + userId,
-          payload: {
-            hallId: target.hallId,
-            stallId: target.stallId,
-            stallCode: stall.stallCode,
-            publicNo: created.publicNo,
-            category: dto.category,
-            summary: `New request · Stall ${stall.stallCode} · ${dto.category === 'HOUSE_HELP' ? 'House Help' : dto.category === 'HALL_MANAGER' ? 'Hall Manager' : 'Electrical'}`,
-          },
-        })),
-        skipDuplicates: true,
       });
       return created;
       });
@@ -503,6 +498,7 @@ export class TicketService {
     if (to === 'REOPENED') {
       await this.route(id, undefined, requestCorrelationId());
       await this.assignWaitingForReleasedStaff(result.releasedStaffId ? [result.releasedStaffId] : []);
+      return this.prisma.ticket.findUniqueOrThrow({ where: { id } });
     }
     return result.ticket;
   }
@@ -716,7 +712,7 @@ export class TicketService {
   async complaint(id: string, scope: AuthScope, reasonCode: string, comment: string | undefined, idempotencyKey: string) {
     if (scope.role === 'STAFF') throw new BadRequestException('Staff cannot raise complaints');
     if (!['WORK_INCOMPLETE', 'WORK_QUALITY', 'WRONG_SERVICE'].includes(reasonCode)) throw new BadRequestException('A valid complaint reason is required');
-    return this.prisma.$transaction(async (tx) => {
+    const updated = await this.prisma.$transaction(async (tx) => {
       await tx.$executeRaw(Prisma.sql`SELECT pg_advisory_xact_lock(hashtextextended(${`${scope.userId}:${idempotencyKey}`}, 2))`);
       const existing = await tx.complaint.findUnique({
         where: { createdBy_idempotencyKey: { createdBy: scope.userId, idempotencyKey } },
@@ -749,6 +745,7 @@ export class TicketService {
       await createLifecycleNotifications(tx, updated, 'COMPLAINT_RAISED', scope.userId);
       return updated;
     });
+    return scope.role === 'STALL' ? this.detail(updated.id, scope) : updated;
   }
 
   async overrideClose(id: string, scope: AuthScope, reason: string) {
@@ -962,6 +959,36 @@ export class TicketService {
     for (const poolId of [...new Set(memberships.map((membership) => membership.poolId))]) {
       await this.assignNextWaiting(poolId);
     }
+  }
+
+  /**
+   * Attention is decided before pagination.
+   * Statuses that always qualify stay in the query. Resolution breach uses each pool's target.
+   * Response overdue matches an open assignment the worker has already marked overdue.
+   */
+  private async attentionEligibility(now: Date, eventIds: string[]): Promise<Prisma.TicketWhereInput> {
+    const pools = await this.prisma.servicePool.findMany({
+      where: { eventId: { in: eventIds } },
+      select: { id: true, resolutionTargetSeconds: true },
+    });
+    const resolutionBreach: Prisma.TicketWhereInput[] = pools.map((pool) => ({
+      poolId: pool.id,
+      createdAt: { lt: new Date(now.getTime() - pool.resolutionTargetSeconds * 1000) },
+    }));
+    resolutionBreach.push({
+      poolId: null,
+      createdAt: { lt: new Date(now.getTime() - 3600 * 1000) },
+    });
+    return {
+      status: { in: [...ACTIVE_TICKET_STATUSES] },
+      OR: [
+        { status: { in: ['COMPLAINT_RAISED', 'ESCALATED', 'REOPENED', 'NEW', 'AWAITING_OTP', 'ASSIGNED', 'SNOOZED'] } },
+        { priority: 'URGENT' },
+        { reopenCount: { gt: 0 }, status: { in: ['NEW', 'QUEUED', 'ASSIGNED', 'SNOOZED'] } },
+        { assignments: { some: { responseOverdueAt: { not: null }, status: { in: ['ACTIVE', 'ACCEPTED'] } } } },
+        ...resolutionBreach,
+      ],
+    };
   }
 
   private otpKey() {

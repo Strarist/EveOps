@@ -118,7 +118,7 @@ the engine may assign the next FIFO ticket.
 |-------------------------------|--------------------------------------------------------|-----------------------------|
 | Eligible staff available      | Assign to lowest active load; longest idle wins tie    | ASSIGNMENT_CREATED          |
 | All eligible staff busy       | Place ticket at end of service-pool FIFO queue         | TICKET_QUEUED               |
-| Staff becomes available       | Take oldest compatible queued ticket                   | DEQUEUED_AND_ASSIGNED       |
+| Staff becomes available       | Take the next compatible waiting ticket: reasoned override, then stall service priority HIGH, MEDIUM, LOW, then creation time, then ticket ID. | DEQUEUED_AND_ASSIGNED |
 | Assigned staff accepts        | Lock as active owner                                   | ASSIGNMENT_ACCEPTED         |
 | Staff snoozes                 | Keep owner, start/continue 10-minute response deadline | ASSIGNMENT_SNOOZED          |
 | 10 min expires without accept | Alert Hall Manager + Admin; flag response overdue      | ASSIGNMENT_RESPONSE_OVERDUE |
@@ -278,7 +278,7 @@ implying a completed interval.
 | **Scenario**                                      | **Expected result**                                                 |
 |---------------------------------------------------|---------------------------------------------------------------------|
 | Electrical Lighting ticket with free electrician  | Immediate assignment, manager alert, staff accept, work, OTP close. |
-| Electrical NCP ticket with all electricians busy  | Ticket enters FIFO; oldest ticket gets next free electrician.       |
+| Electrical NCP ticket with all electricians busy  | Ticket waits in the service pool. The next free electrician receives the next ticket by the queue definition: override, then service priority, then creation time, then ticket ID. |
 | Staff snoozes and ignores                         | At 10 minutes, Hall Manager + Admin receive overdue alert.          |
 | Stall rejects completion                          | Ticket does not close; complaint path starts.                       |
 | Manager reopens closed ticket                     | Same ticket ID returns active with reopen reason preserved.         |

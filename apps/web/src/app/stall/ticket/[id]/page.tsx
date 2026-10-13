@@ -1,9 +1,9 @@
 'use client';
 
 import { useParams } from 'next/navigation';
-import { StallWorkspace } from '@/components/role-views';
+import { ExhibitorDetail } from '@/components/exhibitor/detail';
 
 export default function StallTicketPage() {
   const params = useParams<{ id: string }>();
-  return <StallWorkspace focusId={params.id} />;
+  return <ExhibitorDetail ticketId={params.id} />;
 }

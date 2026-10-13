@@ -11,8 +11,13 @@ if (process.env.NODE_ENV === 'production' && !process.env.API_URL) {
 }
 const apiUrl = process.env.API_URL ?? 'http://localhost:4000/api';
 if (!URL.canParse(apiUrl)) throw new Error('API_URL must be an absolute URL');
+const distDir = process.env.NEXT_DIST_DIR?.trim();
+if (distDir && !/^[A-Za-z0-9._-]+$/.test(distDir)) {
+  throw new Error('NEXT_DIST_DIR must be a single directory name');
+}
 const nextConfig: NextConfig = {
   reactStrictMode: true,
+  distDir: distDir || '.next',
   transpilePackages: ['@eveops/contracts'],
   async rewrites() {
     return [{ source: '/api/:path*', destination: apiUrl + '/:path*' }];

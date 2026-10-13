@@ -97,13 +97,13 @@ async function prepareFixture() {
   });
   await prisma.user.createMany({
     data: [
-      { id: ids.stallUser, organizationId: ids.organization, name: 'E2E Stall', email: emails.stall, passwordHash, role: 'STALL' },
-      { id: ids.otherStallUser, organizationId: ids.organization, name: 'Other E2E Stall', email: emails.otherStall, passwordHash, role: 'STALL' },
-      { id: ids.staffUser, organizationId: ids.organization, name: 'E2E Electrician', email: emails.staff, passwordHash, role: 'STAFF', employeeCode: 'STF-E2E-01' },
-      { id: ids.houseStaffUser, organizationId: ids.organization, name: 'E2E House Help', email: emails.houseStaff, passwordHash, role: 'STAFF', employeeCode: 'STF-E2E-HH' },
-      { id: ids.managerUser, organizationId: ids.organization, name: 'E2E Hall Manager', email: emails.manager, passwordHash, role: 'HALL_MANAGER', employeeCode: 'HM-E2E-01' },
-      { id: ids.adminUser, organizationId: ids.organization, name: 'E2E Admin', email: emails.admin, passwordHash, role: 'ADMIN' },
-      { id: ids.superUser, organizationId: ids.organization, name: 'E2E SuperAdmin', email: emails.super, passwordHash, role: 'SUPER_ADMIN' },
+      { id: ids.stallUser, organizationId: ids.organization, name: 'E2E Stall', email: emails.stall, loginId: emails.stall, passwordHash, role: 'STALL' },
+      { id: ids.otherStallUser, organizationId: ids.organization, name: 'Other E2E Stall', email: emails.otherStall, loginId: emails.otherStall, passwordHash, role: 'STALL' },
+      { id: ids.staffUser, organizationId: ids.organization, name: 'E2E Electrician', email: emails.staff, loginId: emails.staff, passwordHash, role: 'STAFF', employeeCode: 'STF-E2E-01' },
+      { id: ids.houseStaffUser, organizationId: ids.organization, name: 'E2E House Help', email: emails.houseStaff, loginId: emails.houseStaff, passwordHash, role: 'STAFF', employeeCode: 'STF-E2E-HH' },
+      { id: ids.managerUser, organizationId: ids.organization, name: 'E2E Hall Manager', email: emails.manager, loginId: emails.manager, passwordHash, role: 'HALL_MANAGER', employeeCode: 'HM-E2E-01' },
+      { id: ids.adminUser, organizationId: ids.organization, name: 'E2E Admin', email: emails.admin, loginId: emails.admin, passwordHash, role: 'ADMIN' },
+      { id: ids.superUser, organizationId: ids.organization, name: 'E2E SuperAdmin', email: emails.super, loginId: emails.super, passwordHash, role: 'SUPER_ADMIN' },
     ],
   });
   await prisma.userScope.createMany({

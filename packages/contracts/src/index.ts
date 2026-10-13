@@ -1,3 +1,22 @@
+/** Minimum length accepted when signing in with an existing password. */
+export const PASSWORD_MIN_LENGTH = 4;
+
+/** Minimum length for a password being chosen or provisioned. */
+export const NEW_PASSWORD_MIN_LENGTH = 8;
+
+/** bcrypt only stores the first 72 bytes. Longer passwords are rejected instead of being truncated. */
+export const PASSWORD_MAX_BYTES = 72;
+
+/** Newly chosen passwords must contain a letter and a number. Sign-in does not re-check this. */
+export const NEW_PASSWORD_PATTERN = /^(?=.*[A-Za-z])(?=.*\d).+$/;
+export const NEW_PASSWORD_MESSAGE = 'Password must include at least one letter and one number';
+
+/** Sign-in user ID: letters, digits, and hyphens, 2–32 characters. Stored lowercase. */
+export const USER_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9-]{1,31}$/;
+export const USER_ID_MESSAGE = 'User ID must be 2–32 letters, digits, or hyphens';
+/** User ID, or an existing email-shaped identifier still accepted at sign-in. */
+export const LOGIN_IDENTIFIER_PATTERN = /^(?:[A-Za-z0-9][A-Za-z0-9-]{1,31}|[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})$/;
+
 export const ROLES = ['STALL', 'STAFF', 'HALL_MANAGER', 'ADMIN', 'SUPER_ADMIN'] as const;
 export type Role = (typeof ROLES)[number];
 
@@ -17,6 +36,23 @@ export type TicketPriority = 'NORMAL' | 'URGENT';
 export const SERVICE_PRIORITIES = ['HIGH', 'MEDIUM', 'LOW'] as const;
 export type ServicePriority = (typeof SERVICE_PRIORITIES)[number];
 export type ServiceCategory = 'ELECTRICAL' | 'HOUSE_HELP' | 'HALL_MANAGER';
+
+type BuildEnv = {
+  BUILD_SHA?: string;
+  RENDER_GIT_COMMIT?: string;
+  NODE_ENV?: string;
+};
+
+/** Identifies a running build. The placeholder "development" is not a production release id. */
+export function publishedBuildIdentity(env: BuildEnv = process.env): string {
+  const explicit = env.BUILD_SHA?.trim() ?? '';
+  const labeled = explicit && explicit !== 'development' ? explicit : '';
+  const renderCommit = env.RENDER_GIT_COMMIT?.trim() ?? '';
+  const candidate = labeled || renderCommit;
+  if (candidate) return candidate;
+  if (env.NODE_ENV === 'production') return 'unlabeled';
+  return 'development';
+}
 
 export interface AuthScope {
   userId: string;

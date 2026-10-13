@@ -164,6 +164,8 @@ model User {
   organization         Organization          @relation(fields: [organizationId], references: [id])
   /// Public optional display ID (e.g. STF-00012); not the database primary key.
   employeeCode         String?               @unique
+  /// Sign-in identifier. Alphanumeric with hyphens, stored lowercase. Not the database primary key.
+  loginId              String                @unique
   name                 String
   email                String                @unique
   phone                String?

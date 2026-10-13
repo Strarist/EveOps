@@ -1,30 +1,36 @@
 import { BadRequestException, Body, ConflictException, Controller, ForbiddenException, Get, Injectable, NotFoundException, Param, Patch, Post, Query, Res, StreamableFile, UseGuards } from '@nestjs/common';
-import { ACTIVE_TICKET_STATUSES, type AuthScope, type ServicePriority } from '@eveops/contracts';
+import { ACTIVE_TICKET_STATUSES, LOGIN_IDENTIFIER_PATTERN, USER_ID_MESSAGE, type AuthScope, type ServicePriority } from '@eveops/contracts';
 import type { Response } from 'express';
 import { Prisma } from '@prisma/client';
+import { boundedElapsedSeconds, closedResolutionSeconds, displayLiveAgeSeconds } from '@eveops/operations';
 import { Type } from 'class-transformer';
 import {
   ArrayMinSize,
   IsArray,
   IsBoolean,
   IsDateString,
-  IsEmail,
   IsIn,
   IsInt,
   IsObject,
   IsOptional,
   IsString,
+  Matches,
+  Max,
   MaxLength,
   Min,
   MinLength,
 } from 'class-validator';
 import { hash } from 'bcryptjs';
+import { randomBytes } from 'node:crypto';
 import { createReadStream, existsSync } from 'node:fs';
 import { basename, resolve } from 'node:path';
 import { Throttle } from '@nestjs/throttler';
 import { CurrentScope, SessionGuard } from './auth';
+import { IsNewPassword } from './password-policy';
 import { requireAuthority } from './domain';
 import { PrismaService } from './prisma.service';
+import { AUDIT_PAGE_DEFAULT, auditOlderThan, decodeAuditCursor, encodeAuditCursor, mergeAuditPage } from './audit-page';
+import { stallCodeConflictMessage } from './stall-conflict';
 
 export class MetricsQueryDto {
   @IsOptional() @IsDateString() from?: string;
@@ -69,10 +75,28 @@ export class ArchiveRegistrationDto {
   @IsString() @MinLength(3) @MaxLength(500) reason!: string;
 }
 
+export class CreateRegistrationLoginDto {
+  @IsString() @MinLength(1) eventId!: string;
+  @IsString() @MinLength(1) zoneId!: string;
+  @IsString() @MinLength(1) @MaxLength(40) stallCode!: string;
+  @IsString() @MinLength(1) @MaxLength(120) exhibitorName!: string;
+  @IsOptional() @IsString() @MaxLength(80) contact?: string;
+  @IsOptional() @IsIn(['HIGH', 'MEDIUM', 'LOW']) servicePriority?: ServicePriority;
+  @IsString() @MinLength(2) @MaxLength(120) loginName!: string;
+  @IsString() @Matches(LOGIN_IDENTIFIER_PATTERN, { message: USER_ID_MESSAGE }) loginEmail!: string;
+  @IsString() @MinLength(8) @MaxLength(80) idempotencyKey!: string;
+}
+
+export class CreateExhibitorLoginDto {
+  @IsString() @MinLength(2) @MaxLength(120) loginName!: string;
+  @IsString() @Matches(LOGIN_IDENTIFIER_PATTERN, { message: USER_ID_MESSAGE }) loginEmail!: string;
+  @IsString() @MinLength(8) @MaxLength(80) idempotencyKey!: string;
+}
+
 export class CreateAdminDto {
   @IsString() @MinLength(2) name!: string;
-  @IsEmail() email!: string;
-  @IsString() @MinLength(12) password!: string;
+  @IsString() @Matches(LOGIN_IDENTIFIER_PATTERN, { message: USER_ID_MESSAGE }) email!: string;
+  @IsString() @IsNewPassword() password!: string;
   @IsArray() @ArrayMinSize(1) @IsString({ each: true }) eventIds!: string[];
 }
 
@@ -83,8 +107,10 @@ export class CreateExportDto {
 }
 
 export class AuditQueryDto {
-  @IsOptional() @IsString() action?: string;
-  @IsOptional() @IsString() ticket?: string;
+  @IsOptional() @IsString() @MaxLength(80) action?: string;
+  @IsOptional() @IsString() @MaxLength(80) ticket?: string;
+  @IsOptional() @IsString() @MaxLength(240) cursor?: string;
+  @IsOptional() @Type(() => Number) @IsInt() @Min(1) @Max(100) limit?: number;
 }
 
 @Injectable()
@@ -314,6 +340,7 @@ export class ManagementService {
       take: 1000,
       orderBy: { createdAt: 'desc' },
     });
+    const nowMs = Date.now();
     return tickets.map((ticket) => {
       const latestAssignment = ticket.assignments.at(-1);
       const queueCycles = ticket.events
@@ -347,17 +374,18 @@ export class ManagementService {
       assignToAcceptSeconds: ticket.firstAssignedAt && ticket.firstAcceptedAt ? Math.floor((ticket.firstAcceptedAt.getTime() - ticket.firstAssignedAt.getTime()) / 1000) : null,
       mobilizationSeconds: ticket.firstAcceptedAt && ticket.firstStartedAt ? Math.floor((ticket.firstStartedAt.getTime() - ticket.firstAcceptedAt.getTime()) / 1000) : null,
       activeWorkSeconds: latestAssignment?.startedAt && latestAssignment.completionRequestedAt ? Math.floor((latestAssignment.completionRequestedAt.getTime() - latestAssignment.startedAt.getTime()) / 1000) : null,
-      otpWaitSeconds: ticket.completionRequestedAt && ticket.closedAt ? Math.floor((ticket.closedAt.getTime() - ticket.completionRequestedAt.getTime()) / 1000) : null,
-      totalResolutionSeconds: ticket.closedAt ? Math.floor((ticket.closedAt.getTime() - ticket.createdAt.getTime()) / 1000) : null,
-      liveAgeSeconds: Math.floor((Date.now() - ticket.createdAt.getTime()) / 1000),
-      currentStageAgeSeconds: Math.floor((Date.now() - (
+      otpWaitSeconds: ticket.status === 'CLOSED' && ticket.completionRequestedAt && ticket.closedAt ? Math.floor((ticket.closedAt.getTime() - ticket.completionRequestedAt.getTime()) / 1000) : null,
+      totalResolutionSeconds: closedResolutionSeconds(ticket.status, ticket.createdAt, ticket.closedAt),
+      liveAgeSeconds: displayLiveAgeSeconds(ticket.status, ticket.createdAt, nowMs),
+      currentStageAgeSeconds: ticket.status === 'CLOSED' || ticket.status === 'CANCELLED' ? null : boundedElapsedSeconds(
         latestAssignment?.completionRequestedAt ??
         latestAssignment?.startedAt ??
         latestAssignment?.acceptedAt ??
         latestAssignment?.assignedAt ??
         ticket.queuedAt ??
-        ticket.createdAt
-      ).getTime()) / 1000),
+        ticket.createdAt,
+        nowMs,
+      ),
       queueCycles,
       workCycles: ticket.assignments.map((assignment, index) => {
         const nextAssignment = ticket.assignments[index + 1];
@@ -463,39 +491,57 @@ export class ManagementService {
     });
   }
 
-  async audit(scope: AuthScope, query: { action?: string; ticket?: string }) {
+  async audit(scope: AuthScope, query: { action?: string; ticket?: string; cursor?: string; limit?: number }) {
     requireAuthority(scope.role, 'HALL_MANAGER');
+    const limit = query.limit ?? AUDIT_PAGE_DEFAULT;
+    if (!Number.isInteger(limit) || limit < 1 || limit > 100) throw new BadRequestException('Audit page size must be from 1 to 100');
+    const cursor = decodeAuditCursor(query.cursor);
+    if (query.cursor && !cursor) throw new BadRequestException('Audit cursor is invalid');
+    const older = auditOlderThan(cursor);
     const ticketEvents = await this.prisma.ticketEvent.findMany({
       where: {
         eventId: { in: scope.eventIds },
         AND: [
           ...(scope.role === 'HALL_MANAGER' ? [{ ticket: { hallId: { in: scope.hallIds } } }] : []),
           ...(query.ticket ? [{ ticket: { publicNo: { contains: query.ticket, mode: 'insensitive' as const } } }] : []),
+          ...(query.action ? [{ eventType: { contains: query.action, mode: 'insensitive' as const } }] : []),
+          ...(cursor ? [older] : []),
         ],
-        ...(query.action ? { eventType: { contains: query.action, mode: 'insensitive' as const } } : {}),
       },
       include: { actor: { select: { name: true, role: true } }, ticket: { select: { publicNo: true, hallId: true } } },
-      orderBy: { createdAt: 'desc' },
-      take: 200,
+      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+      take: limit + 1,
     });
-    if (!['ADMIN', 'SUPER_ADMIN'].includes(scope.role)) return ticketEvents;
-    const managementAudits = await this.prisma.managementAudit.findMany({
-      where: {
-        OR: [
-          { eventId: { in: scope.eventIds } },
-          { eventId: null, organizationId: (await this.prisma.user.findUniqueOrThrow({ where: { id: scope.userId }, select: { organizationId: true } })).organizationId },
-        ],
-        ...(query.action ? { action: { contains: query.action, mode: 'insensitive' as const } } : {}),
-      },
-      include: {
-        actor: { select: { name: true, role: true } },
-        targetUser: { select: { name: true, employeeCode: true, role: true } },
-      },
-      orderBy: { createdAt: 'desc' },
-      take: 100,
-    });
-    return [
-      ...ticketEvents.map((event) => ({
+    const managementAudits = ['ADMIN', 'SUPER_ADMIN'].includes(scope.role)
+      ? await this.prisma.managementAudit.findMany({
+        where: {
+          AND: [
+            {
+              OR: [
+                { eventId: { in: scope.eventIds } },
+                { eventId: null, organizationId: (await this.prisma.user.findUniqueOrThrow({ where: { id: scope.userId }, select: { organizationId: true } })).organizationId },
+              ],
+            },
+            ...(query.action ? [{ action: { contains: query.action, mode: 'insensitive' as const } }] : []),
+            ...(query.ticket ? [{
+              OR: [
+                { targetUser: { is: { name: { contains: query.ticket, mode: 'insensitive' as const } } } },
+                { targetUser: { is: { employeeCode: { contains: query.ticket, mode: 'insensitive' as const } } } },
+              ],
+            }] : []),
+            ...(cursor ? [older] : []),
+          ],
+        },
+        include: {
+          actor: { select: { name: true, role: true } },
+          targetUser: { select: { name: true, employeeCode: true, role: true } },
+        },
+        orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+        take: limit + 1,
+      })
+      : [];
+    const merged = mergeAuditPage(
+      ticketEvents.map((event) => ({
         id: event.id,
         kind: 'ticket' as const,
         eventType: event.eventType,
@@ -504,7 +550,7 @@ export class ManagementService {
         ticket: event.ticket,
         target: null as null,
       })),
-      ...managementAudits.map((event) => ({
+      managementAudits.map((event) => ({
         id: event.id,
         kind: 'workforce' as const,
         eventType: event.action,
@@ -513,7 +559,13 @@ export class ManagementService {
         ticket: { publicNo: event.targetUser?.role === 'STALL' ? 'Stall account' : (event.targetUser?.employeeCode ?? event.targetUser?.name ?? 'Account') },
         target: event.targetUser,
       })),
-    ].sort((left, right) => right.createdAt.getTime() - left.createdAt.getTime()).slice(0, 200);
+      limit,
+    );
+    const last = merged.items.at(-1);
+    return {
+      items: merged.items,
+      nextCursor: merged.hasMore && last ? encodeAuditCursor({ createdAt: last.createdAt, id: last.id }) : null,
+    };
   }
 
   async masters(scope: AuthScope) {
@@ -605,6 +657,10 @@ export class ManagementService {
         },
       });
       return created;
+    }).catch((error: unknown) => {
+      const message = type === 'stall' ? stallCodeConflictMessage(error, body.stallCode ?? '') : null;
+      if (message) throw new ConflictException(message);
+      throw error;
     });
   }
 
@@ -616,7 +672,7 @@ export class ManagementService {
         zone: { include: { hall: { select: { id: true, code: true, name: true } } } },
         scopes: {
           where: { user: { role: 'STALL' } },
-          select: { user: { select: { id: true, name: true, email: true, status: true, role: true } } },
+          select: { user: { select: { id: true, name: true, email: true, status: true, role: true, mustChangePassword: true } } },
         },
         _count: { select: { tickets: { where: { status: { in: [...ACTIVE_TICKET_STATUSES] } } } } },
       },
@@ -680,9 +736,8 @@ export class ManagementService {
         return updated;
       });
     } catch (error) {
-      if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002') {
-        throw new ConflictException('That stall code is already used in this zone');
-      }
+      const message = stallCodeConflictMessage(error, stallCode ?? '');
+      if (message) throw new ConflictException(message);
       throw error;
     }
   }
@@ -731,7 +786,6 @@ export class ManagementService {
         data: { stallId: destinationRow.id, hallId: destinationRow.zone.hallId, eventId: destinationRow.eventId },
       });
       await tx.session.deleteMany({ where: { userId: { in: userIds } } });
-      await tx.pushSubscription.deleteMany({ where: { userId: { in: userIds } } });
       const previousDestination = {
         exhibitorName: destinationRow.exhibitorName,
         contact: destinationRow.contact,
@@ -776,17 +830,7 @@ export class ManagementService {
       const userIds = exhibitors.map((row) => row.userId);
       if (userIds.length) {
         await tx.userScope.deleteMany({ where: { stallId: current.id, userId: { in: userIds } } });
-        await tx.session.deleteMany({ where: { userId: { in: userIds } } });
-        await tx.pushSubscription.deleteMany({ where: { userId: { in: userIds } } });
-        const remaining = await tx.userScope.groupBy({
-          by: ['userId'],
-          where: { userId: { in: userIds } },
-        });
-        const stillScoped = new Set(remaining.map((row) => row.userId));
-        const toDisable = userIds.filter((userId) => !stillScoped.has(userId));
-        if (toDisable.length) {
-          await tx.user.updateMany({ where: { id: { in: toDisable }, role: 'STALL' }, data: { status: 'DISABLED' } });
-        }
+        await this.revokeExhibitorsWhoLostAccess(tx, userIds);
       }
       const archived = await tx.stall.update({
         where: { id: current.id },
@@ -820,6 +864,27 @@ export class ManagementService {
     }
   }
 
+  /**
+   * Archive drops only the stall scope. Sessions and push subscriptions go with an account
+   * that has no scope left. An account that still belongs to another stall keeps both.
+   * Repeated calls are safe: empty deletes and an already-disabled account are no-ops.
+   */
+  private async revokeExhibitorsWhoLostAccess(tx: Prisma.TransactionClient, userIds: string[]) {
+    const remaining = await tx.userScope.groupBy({
+      by: ['userId'],
+      where: { userId: { in: userIds } },
+    });
+    const stillScoped = new Set(remaining.map((row) => row.userId));
+    const toDisable = userIds.filter((userId) => !stillScoped.has(userId));
+    if (!toDisable.length) return;
+    await tx.session.deleteMany({ where: { userId: { in: toDisable } } });
+    await tx.pushSubscription.deleteMany({ where: { userId: { in: toDisable } } });
+    await tx.user.updateMany({
+      where: { id: { in: toDisable }, role: 'STALL', status: { not: 'DISABLED' } },
+      data: { status: 'DISABLED' },
+    });
+  }
+
   private async lockStalls(tx: Prisma.TransactionClient, stallIds: string[]) {
     for (const stallId of [...new Set(stallIds)].sort()) {
       const rows = await tx.$queryRaw<Array<{ id: string }>>(Prisma.sql`SELECT id FROM "Stall" WHERE id = ${stallId} FOR UPDATE`);
@@ -833,6 +898,7 @@ export class ManagementService {
     eventId: string,
     action: string,
     metadata: Prisma.InputJsonObject,
+    targetUserId?: string,
   ) {
     const actor = await tx.user.findUniqueOrThrow({ where: { id: scope.userId }, select: { organizationId: true } });
     await tx.managementAudit.create({
@@ -840,6 +906,7 @@ export class ManagementService {
         organizationId: actor.organizationId,
         eventId,
         actorId: scope.userId,
+        ...(targetUserId ? { targetUserId } : {}),
         action,
         metadata,
       },
@@ -854,6 +921,259 @@ export class ManagementService {
         payload: { actorId: scope.userId, ...metadata },
       },
     });
+  }
+
+  async createRegistrationWithLogin(scope: AuthScope, body: CreateRegistrationLoginDto) {
+    requireAuthority(scope.role, 'ADMIN');
+    if (!scope.eventIds.includes(body.eventId)) throw new NotFoundException('Event is unavailable');
+    const stallCode = body.stallCode.trim();
+    const exhibitorName = body.exhibitorName.trim();
+    const loginName = body.loginName.trim();
+    const loginEmail = body.loginEmail.trim().toLowerCase();
+    const idempotencyKey = body.idempotencyKey.trim();
+    try {
+      return await this.prisma.$transaction(async (tx) => {
+        await tx.$executeRaw(Prisma.sql`SELECT pg_advisory_xact_lock(hashtextextended(${'registration-login:' + idempotencyKey}, 0))`);
+        const replay = await this.replayRegistrationLogin(tx, scope, idempotencyKey, loginEmail, stallCode);
+        if (replay) return replay;
+        const zone = await tx.zone.findFirst({
+          where: { id: body.zoneId, eventId: body.eventId, active: true, hall: { active: true } },
+          include: { hall: { select: { id: true, code: true, name: true } } },
+        });
+        const event = await tx.event.findUnique({ where: { id: body.eventId }, select: { status: true } });
+        if (!zone || !stallCode || !exhibitorName || !event || ['CLOSED', 'ARCHIVED'].includes(event.status)) {
+          throw new BadRequestException('A valid active zone, stall, and exhibitor name are required');
+        }
+        const stall = await tx.stall.create({
+          data: {
+            eventId: body.eventId,
+            zoneId: zone.id,
+            stallCode,
+            exhibitorName,
+            contact: body.contact?.trim() || null,
+            servicePriority: body.servicePriority ?? 'MEDIUM',
+            active: true,
+          },
+        });
+        const issued = await this.createStallLogin(tx, scope, {
+          eventId: stall.eventId,
+          hallId: zone.hallId,
+          stallId: stall.id,
+          stallCode,
+          loginName,
+          loginEmail,
+          idempotencyKey,
+          action: 'REGISTRATION_LOGIN_CREATED',
+        });
+        return {
+          created: true,
+          credentialIssued: true,
+          registration: {
+            id: stall.id,
+            stallCode: stall.stallCode,
+            exhibitorName: stall.exhibitorName,
+            servicePriority: stall.servicePriority,
+            zone: { id: zone.id, code: zone.code, hall: zone.hall },
+          },
+          ...issued,
+        };
+      });
+    } catch (error) {
+      const message = stallCodeConflictMessage(error, stallCode);
+      if (message) throw new ConflictException(message);
+      if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002') {
+        throw new ConflictException('That login ID is already in use');
+      }
+      throw error;
+    }
+  }
+
+  async createExhibitorLogin(scope: AuthScope, stallId: string, body: CreateExhibitorLoginDto) {
+    requireAuthority(scope.role, 'ADMIN');
+    const stall = await this.requireStall(scope, stallId);
+    if (stall.archivedAt) throw new BadRequestException('Archived registrations cannot receive a new login');
+    const loginName = body.loginName.trim();
+    const loginEmail = body.loginEmail.trim().toLowerCase();
+    const idempotencyKey = body.idempotencyKey.trim();
+    try {
+      return await this.prisma.$transaction(async (tx) => {
+        await tx.$executeRaw(Prisma.sql`SELECT pg_advisory_xact_lock(hashtextextended(${'exhibitor-login:' + idempotencyKey}, 0))`);
+        await this.lockStalls(tx, [stall.id]);
+        const current = await tx.stall.findUniqueOrThrow({
+          where: { id: stall.id },
+          include: { zone: { select: { hallId: true } } },
+        });
+        if (current.archivedAt || !current.active) throw new BadRequestException('An active registration is required');
+        const replay = await this.replayRegistrationLogin(tx, scope, idempotencyKey, loginEmail, current.stallCode);
+        if (replay) return replay;
+        const issued = await this.createStallLogin(tx, scope, {
+          eventId: current.eventId,
+          hallId: current.zone.hallId,
+          stallId: current.id,
+          stallCode: current.stallCode,
+          loginName,
+          loginEmail,
+          idempotencyKey,
+          action: 'EXHIBITOR_LOGIN_CREATED',
+        });
+        return { created: true, credentialIssued: true, ...issued };
+      });
+    } catch (error) {
+      if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002') {
+        throw new ConflictException('That login ID is already in use');
+      }
+      throw error;
+    }
+  }
+
+  async resetExhibitorCredential(scope: AuthScope, stallId: string) {
+    requireAuthority(scope.role, 'ADMIN');
+    const stall = await this.requireStall(scope, stallId);
+    if (stall.archivedAt) throw new BadRequestException('Archived registrations cannot be reset');
+    return this.prisma.$transaction(async (tx) => {
+      await this.lockStalls(tx, [stall.id]);
+      const binding = await tx.userScope.findFirst({
+        where: { stallId: stall.id, user: { role: 'STALL' } },
+        select: { userId: true },
+      });
+      if (!binding) throw new BadRequestException('This registration has no exhibitor login to reset');
+      const initialCredential = randomBytes(18).toString('base64url');
+      const user = await tx.user.update({
+        where: { id: binding.userId },
+        data: { passwordHash: await hash(initialCredential, 12), mustChangePassword: true },
+        select: { id: true, name: true, email: true, status: true, mustChangePassword: true },
+      });
+      await tx.session.deleteMany({ where: { userId: user.id } });
+      await tx.pushSubscription.deleteMany({ where: { userId: user.id } });
+      await this.writeRegistrationAudit(tx, scope, stall.eventId, 'EXHIBITOR_LOGIN_RESET', {
+        stallId: stall.id,
+        stallCode: stall.stallCode,
+        email: user.email,
+        userId: user.id,
+      }, user.id);
+      return {
+        created: false,
+        credentialIssued: true,
+        account: user,
+        handoff: {
+          loginPath: '/login',
+          email: user.email,
+          initialCredential,
+          stallCode: stall.stallCode,
+          instructions: 'Sign in with this login ID and the new initial password, then set a new password. Earlier sessions for this account are signed out.',
+        },
+      };
+    });
+  }
+
+  private async replayRegistrationLogin(
+    tx: Prisma.TransactionClient,
+    scope: AuthScope,
+    idempotencyKey: string,
+    loginEmail: string,
+    stallCode: string,
+  ) {
+    const prior = await tx.managementAudit.findFirst({
+      where: {
+        actorId: scope.userId,
+        action: { in: ['REGISTRATION_LOGIN_CREATED', 'EXHIBITOR_LOGIN_CREATED'] },
+        metadata: { path: ['idempotencyKey'], equals: idempotencyKey },
+      },
+      orderBy: { createdAt: 'desc' },
+    });
+    if (!prior?.metadata || typeof prior.metadata !== 'object' || Array.isArray(prior.metadata)) return null;
+    const meta = prior.metadata as { email?: string; stallCode?: string; stallId?: string; userId?: string };
+    if (meta.email !== loginEmail || meta.stallCode !== stallCode) {
+      throw new ConflictException('This registration attempt was already used for a different stall or login');
+    }
+    const user = meta.userId
+      ? await tx.user.findUnique({
+        where: { id: meta.userId },
+        select: { id: true, name: true, email: true, status: true, mustChangePassword: true },
+      })
+      : null;
+    const stall = meta.stallId
+      ? await tx.stall.findUnique({
+        where: { id: meta.stallId },
+        include: { zone: { include: { hall: { select: { id: true, code: true, name: true } } } } },
+      })
+      : null;
+    if (!user || !stall) {
+      throw new ConflictException('This registration attempt already finished, but the login could not be loaded');
+    }
+    return {
+      created: false,
+      credentialIssued: false,
+      registration: {
+        id: stall.id,
+        stallCode: stall.stallCode,
+        exhibitorName: stall.exhibitorName,
+        servicePriority: stall.servicePriority,
+        zone: { id: stall.zone.id, code: stall.zone.code, hall: stall.zone.hall },
+      },
+      account: user,
+      handoff: {
+        loginPath: '/login',
+        email: user.email,
+        initialCredential: null as string | null,
+        stallCode: stall.stallCode,
+        instructions: 'This login already exists. Reset the initial password if the first handoff was lost. The earlier password cannot be shown again.',
+      },
+    };
+  }
+
+  private async createStallLogin(
+    tx: Prisma.TransactionClient,
+    scope: AuthScope,
+    input: {
+      eventId: string;
+      hallId: string;
+      stallId: string;
+      stallCode: string;
+      loginName: string;
+      loginEmail: string;
+      idempotencyKey: string;
+      action: 'REGISTRATION_LOGIN_CREATED' | 'EXHIBITOR_LOGIN_CREATED';
+    },
+  ) {
+    const occupied = await tx.userScope.count({ where: { stallId: input.stallId, user: { role: 'STALL' } } });
+    if (occupied) throw new ConflictException('This stall already has an exhibitor account');
+    const actor = await tx.user.findUniqueOrThrow({ where: { id: scope.userId }, select: { organizationId: true } });
+    const initialCredential = randomBytes(18).toString('base64url');
+    const user = await tx.user.create({
+      data: {
+        organizationId: actor.organizationId,
+        name: input.loginName,
+        email: input.loginEmail,
+        loginId: input.loginEmail,
+        passwordHash: await hash(initialCredential, 12),
+        mustChangePassword: true,
+        role: 'STALL',
+        status: 'ACTIVE',
+        approvalStatus: 'APPROVED',
+        approvedById: scope.userId,
+        approvedAt: new Date(),
+        scopes: { create: [{ eventId: input.eventId, hallId: input.hallId, stallId: input.stallId }] },
+      },
+      select: { id: true, name: true, email: true, status: true, mustChangePassword: true },
+    });
+    await this.writeRegistrationAudit(tx, scope, input.eventId, input.action, {
+      stallId: input.stallId,
+      stallCode: input.stallCode,
+      email: input.loginEmail,
+      idempotencyKey: input.idempotencyKey,
+      userId: user.id,
+    }, user.id);
+    return {
+      account: user,
+      handoff: {
+        loginPath: '/login',
+        email: user.email,
+        initialCredential,
+        stallCode: input.stallCode,
+        instructions: 'Sign in with this login ID and the initial password, then set a new password before using the stall.',
+      },
+    };
   }
 
   async admins(scope: AuthScope) {
@@ -878,6 +1198,7 @@ export class ManagementService {
           organizationId: actor.organizationId,
           name: body.name.trim(),
           email: body.email.trim().toLowerCase(),
+          loginId: body.email.trim().toLowerCase(),
           passwordHash: await hash(body.password, 12),
           mustChangePassword: true,
           role: 'ADMIN',
@@ -982,6 +1303,21 @@ export class ManagementController {
   @Get('audit') audit(@CurrentScope() scope: AuthScope, @Query() query: AuditQueryDto) { return this.service.audit(scope, query); }
   @Get('masters') masters(@CurrentScope() scope: AuthScope) { return this.service.masters(scope); }
   @Get('registrations') registrations(@CurrentScope() scope: AuthScope) { return this.service.registrations(scope); }
+  @Throttle({ default: { limit: 10, ttl: 60000 } })
+  @Post('registrations/with-login')
+  createRegistrationWithLogin(@CurrentScope() scope: AuthScope, @Body() body: CreateRegistrationLoginDto) {
+    return this.service.createRegistrationWithLogin(scope, body);
+  }
+  @Throttle({ default: { limit: 10, ttl: 60000 } })
+  @Post('registrations/:stallId/exhibitor-login')
+  createExhibitorLogin(@Param('stallId') stallId: string, @CurrentScope() scope: AuthScope, @Body() body: CreateExhibitorLoginDto) {
+    return this.service.createExhibitorLogin(scope, stallId, body);
+  }
+  @Throttle({ default: { limit: 5, ttl: 60000 } })
+  @Post('registrations/:stallId/exhibitor-login/reset')
+  resetExhibitorCredential(@Param('stallId') stallId: string, @CurrentScope() scope: AuthScope) {
+    return this.service.resetExhibitorCredential(scope, stallId);
+  }
   @Throttle({ default: { limit: 20, ttl: 60000 } })
   @Patch('registrations/:stallId') updateRegistration(@Param('stallId') stallId: string, @CurrentScope() scope: AuthScope, @Body() body: UpdateRegistrationDto) {
     return this.service.updateRegistration(scope, stallId, body);

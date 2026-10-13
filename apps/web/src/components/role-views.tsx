@@ -1,12 +1,17 @@
 'use client';
 
-import type { Role, TicketStatus } from '@eveops/contracts';
-import { FormEvent, KeyboardEvent, ClipboardEvent, useCallback, useEffect, useRef, useState } from 'react';
+import { NEW_PASSWORD_MIN_LENGTH, NEW_PASSWORD_PATTERN, PASSWORD_MAX_BYTES, type Role, type TicketStatus } from '@eveops/contracts';
+import { FormEvent, KeyboardEvent, ClipboardEvent, createContext, useCallback, useContext, useEffect, useRef, useState, type ReactNode } from 'react';
 import Link from 'next/link';
-import { useRouter } from 'next/navigation';
+import { useRouter, useSearchParams } from 'next/navigation';
+import { describeTicketTiming, jitteredRetryMs, managerAttentionLabel, retryAfterMs, schedulingQueueLabel, shouldRefreshForTicketEvent } from '@eveops/ticket-timing';
 import { apiFetch, apiErrorMessage, AUTH_LOST_EVENT, subscribeRealtime } from '../lib/api-client';
+import { useAuditHistory } from '../lib/audit-history';
+import { loadSessionProfile, profileSnapshot, subscribeProfile, type SessionProfile } from '../lib/session-profile';
 import { activitySentence, serviceLabel } from '../lib/activity-copy';
-import { enableSound, playOnce, playRepeatAlert, soundEnabled, stopSound, testSound } from '../lib/sounds';
+import { noteServerTime, ServerClockProvider, useOperationalNow } from '../lib/server-clock';
+import { clearPushForLogout, releaseWorkAlerts } from '../lib/work-alerts';
+import { WorkAlertHost } from './work-alerts';
 
 type Ticket = {
   id: string;
@@ -15,7 +20,6 @@ type Ticket = {
   location: string;
   locationParts: { hall: string; zone: string; stall: string };
   status: TicketStatus;
-  age: string;
   assignee: string;
   ownerId?: string;
   description: string;
@@ -25,7 +29,13 @@ type Ticket = {
   firstStartedAt?: string | null;
   completionRequestedAt?: string | null;
   closedAt?: string | null;
+  reopenCount: number;
+  complaintRaisedAt?: string | null;
+  currentCycleStartedAt?: string | null;
+  cancelledAt?: string | null;
+  progressLabel?: string;
   slaState: 'On track' | 'Response overdue' | 'SLA breached';
+  queuePriorityOverrideAt?: string | null;
   capabilities: {
     advanceHallManagerWork: boolean;
     verifyStallOtp?: boolean;
@@ -39,7 +49,7 @@ type ApiTicket = {
   category: string;
   subtype: string;
   status: TicketStatus;
-  priority: 'NORMAL' | 'URGENT';
+  priority?: 'NORMAL' | 'URGENT';
   servicePriority?: 'HIGH' | 'MEDIUM' | 'LOW';
   description: string;
   createdAt: string;
@@ -48,16 +58,22 @@ type ApiTicket = {
   firstStartedAt?: string | null;
   completionRequestedAt?: string | null;
   closedAt?: string | null;
+  reopenCount?: number;
+  complaintRaisedAt?: string | null;
+  currentCycleStartedAt?: string | null;
+  cancelledAt?: string | null;
   pool?: { responseTargetSeconds: number; resolutionTargetSeconds: number } | null;
   hall: { code: string; name?: string };
   zone?: { code: string };
   stall: { stallCode: string };
-  assignments: Array<{ status: string; staff: { name: string } }>;
-  currentAssignee: { id: string; name: string } | null;
-  lastAssignee: { id: string; name: string } | null;
-  queueState: 'QUEUED' | 'ASSIGNED' | 'NONE';
+  assignments?: Array<{ status: string; staff: { name: string } }>;
+  progressLabel?: string;
+  currentAssignee?: { id: string; name: string } | null;
+  lastAssignee?: { id: string; name: string } | null;
+  queueState?: 'QUEUED' | 'ASSIGNED' | 'NONE';
   nextAction: 'NONE' | 'WAIT_FOR_ASSIGNMENT' | 'VERIFY_OTP' | 'WAIT_FOR_OTP_VERIFICATION' | 'STAFF_VERIFY_OTP' | 'STALL_VERIFY_OTP' | 'ASSIGNEE_ACTION' | 'ROUTE';
-  slaState: 'ON_TRACK' | 'RESPONSE_OVERDUE' | 'SLA_BREACHED';
+  slaState?: 'ON_TRACK' | 'RESPONSE_OVERDUE' | 'SLA_BREACHED';
+  queuePriorityOverrideAt?: string | null;
   capabilities: {
     advanceHallManagerWork: boolean;
     verifyStallOtp?: boolean;
@@ -65,15 +81,37 @@ type ApiTicket = {
   };
 };
 
-function formatTicketAge(createdAt: string) {
-  const ageSeconds = Math.max(0, Math.floor((Date.now() - new Date(createdAt).getTime()) / 1000));
-  if (ageSeconds < 60) return ageSeconds + 's';
-  const days = Math.floor(ageSeconds / 86400);
-  const hours = Math.floor((ageSeconds % 86400) / 3600);
-  const minutes = Math.floor((ageSeconds % 3600) / 60);
-  if (days > 0) return days + 'd ' + hours + 'h';
-  if (hours > 0) return hours + 'h ' + String(minutes).padStart(2, '0') + 'm';
-  return String(minutes).padStart(2, '0') + 'm';
+const EventZoneContext = createContext('UTC');
+
+function OperationalClock({ children, timeZone }: { children: ReactNode; timeZone?: string | null }) {
+  return (
+    <ServerClockProvider>
+      <EventZoneContext.Provider value={timeZone || 'UTC'}>{children}</EventZoneContext.Provider>
+    </ServerClockProvider>
+  );
+}
+
+function TimingFacts({ ticket }: { ticket: Ticket }) {
+  const nowMs = useOperationalNow();
+  const timeZone = useContext(EventZoneContext);
+  const timing = describeTicketTiming({
+    status: ticket.status,
+    createdAt: ticket.createdAt,
+    closedAt: ticket.closedAt,
+    reopenCount: ticket.reopenCount,
+    complaintRaisedAt: ticket.complaintRaisedAt,
+    currentCycleStartedAt: ticket.currentCycleStartedAt,
+    cancelledAt: ticket.cancelledAt,
+    completionRequestedAt: ticket.completionRequestedAt,
+  }, nowMs);
+  return (
+    <>
+      {timing.facts.map((fact) => (
+        <span key={fact.label}>{fact.label} <strong>{fact.value}</strong></span>
+      ))}
+      {ticket.status === 'CLOSED' && ticket.closedAt ? <span>Closed <strong>{eventTime(ticket.closedAt, timeZone)}</strong></span> : null}
+    </>
+  );
 }
 
 function mapTicket(ticket: ApiTicket): Ticket {
@@ -87,16 +125,12 @@ function mapTicket(ticket: ApiTicket): Ticket {
     location: [hall, zone, stall].filter(Boolean).join(' · '),
     locationParts: { hall, zone, stall },
     status: ticket.status,
-    age: formatTicketAge(ticket.createdAt),
     assignee: ticket.currentAssignee?.name
-      ?? (['CLOSED', 'CANCELLED'].includes(ticket.status) && ticket.lastAssignee
-        ? `Last handled by ${ticket.lastAssignee.name}`
-        : undefined)
-      ?? (ticket.status === 'CLOSED' || ticket.status === 'CANCELLED'
-        ? 'No assignee on record'
-        : undefined)
-      ?? ticket.assignments[0]?.staff.name
+      ?? ticket.lastAssignee?.name
+      ?? ticket.assignments?.[0]?.staff.name
+      ?? (ticket.status === 'CLOSED' || ticket.status === 'CANCELLED' ? 'No assignee on record' : undefined)
       ?? (ticket.queueState === 'QUEUED' || ticket.status === 'QUEUED' ? 'Waiting in the queue' : 'Not currently assigned'),
+    progressLabel: ticket.progressLabel,
     ownerId: ticket.currentAssignee?.id,
     description: ticket.description,
     priority: ticket.priority === 'URGENT',
@@ -105,58 +139,126 @@ function mapTicket(ticket: ApiTicket): Ticket {
     firstStartedAt: ticket.firstStartedAt,
     completionRequestedAt: ticket.completionRequestedAt,
     closedAt: ticket.closedAt,
+    reopenCount: ticket.reopenCount ?? 0,
+    complaintRaisedAt: ticket.complaintRaisedAt,
+    currentCycleStartedAt: ticket.currentCycleStartedAt,
+    cancelledAt: ticket.cancelledAt,
     slaState: ticket.slaState === 'SLA_BREACHED' ? 'SLA breached' : ticket.slaState === 'RESPONSE_OVERDUE' ? 'Response overdue' : 'On track',
+    queuePriorityOverrideAt: ticket.queuePriorityOverrideAt ?? null,
     capabilities: ticket.capabilities ?? { advanceHallManagerWork: false, verifyStallOtp: false, emergencyClose: false },
   };
 }
 
-function useApiTickets(query = '') {
+function useApiTickets(query = '', options?: { enabled?: boolean }) {
+  const enabled = options?.enabled !== false;
   const [items, setItems] = useState<Ticket[]>([]);
   const [total, setTotal] = useState(0);
   const [nextCursor, setNextCursor] = useState<string | null>(null);
-  const [loading, setLoading] = useState(true);
+  const [loading, setLoading] = useState(enabled);
   const [error, setError] = useState('');
+  const [stale, setStale] = useState(false);
   const [connection, setConnection] = useState<'connecting' | 'live' | 'reconnecting'>('connecting');
   const [lastUpdatedAt, setLastUpdatedAt] = useState(0);
   const refreshTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const retryTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const seenEventIds = useRef(new Set<string>());
   const seenTicketVersions = useRef(new Map<string, number>());
   const requestSequence = useRef(0);
   const requestController = useRef<AbortController | null>(null);
   const loadedQuery = useRef('');
+  const depthRef = useRef(1);
+  const fetchedAt = useRef(0);
+  const cooldownUntil = useRef(0);
+  const queryRef = useRef(query);
+  if (queryRef.current !== query) {
+    queryRef.current = query;
+    depthRef.current = 1;
+  }
   const refresh = useCallback(async (cursor?: string, append = false) => {
+    if (!enabled || Date.now() < cooldownUntil.current) return;
     const sequence = ++requestSequence.current;
     requestController.current?.abort();
     const controller = new AbortController();
     requestController.current = controller;
     if (!append && loadedQuery.current !== query) setLoading(true);
     try {
-      const parameters = new URLSearchParams(query);
-      if (cursor) parameters.set('cursor', cursor);
-      const response = await apiFetch('/api/tickets?' + parameters.toString(), { credentials: 'include', cache: 'no-store', signal: controller.signal });
-      if (!response.ok) throw new Error('Live tickets could not be loaded');
-      const result = await response.json() as { items: ApiTicket[]; total: number; nextCursor: string | null };
+      const collected: Ticket[] = [];
+      let pageCursor = append ? cursor : undefined;
+      let total = 0;
+      let next: string | null = null;
+      const pages = append ? 1 : Math.max(1, depthRef.current);
+      let fetchedPages = 0;
+      for (let page = 0; page < pages; page += 1) {
+        const parameters = new URLSearchParams(query);
+        if (pageCursor) parameters.set('cursor', pageCursor);
+        const response = await apiFetch('/api/tickets?' + parameters.toString(), { credentials: 'include', cache: 'no-store', signal: controller.signal });
+        if (response.status === 429) {
+          const wait = jitteredRetryMs(retryAfterMs(response.headers.get('retry-after')), Math.random());
+          cooldownUntil.current = Date.now() + wait;
+          if (sequence !== requestSequence.current) return;
+          setStale(true);
+          setError('Tickets are busy right now. Showing the last loaded list.');
+          if (retryTimer.current) clearTimeout(retryTimer.current);
+          retryTimer.current = setTimeout(() => {
+            retryTimer.current = null;
+            cooldownUntil.current = 0;
+            void refresh();
+          }, wait);
+          return;
+        }
+        if (response.status === 401) {
+          setError('Session expired');
+          setStale(false);
+          return;
+        }
+        if (response.status === 403) {
+          setError('You no longer have access to these tickets.');
+          setStale(false);
+          return;
+        }
+        if (!response.ok) throw new Error('Live tickets could not be loaded');
+        const receivedAt = Date.now();
+        const result = await response.json() as { items: ApiTicket[]; total: number; nextCursor: string | null; serverTime?: string };
+        if (sequence !== requestSequence.current) return;
+        if (result.serverTime) noteServerTime(result.serverTime, receivedAt);
+        collected.push(...result.items.map(mapTicket));
+        total = result.total;
+        next = result.nextCursor;
+        fetchedPages += 1;
+        if (!next) break;
+        pageCursor = next;
+      }
       if (sequence !== requestSequence.current) return;
-      const mapped = result.items.map(mapTicket);
-      setItems((current) => append ? [...current, ...mapped] : mapped);
-      setTotal(result.total);
-      setNextCursor(result.nextCursor);
+      setItems((current) => append ? [...current, ...collected] : collected);
+      setTotal(total);
+      setNextCursor(next);
+      depthRef.current = append ? depthRef.current + 1 : fetchedPages;
+      fetchedAt.current = Date.now();
       setLastUpdatedAt(Date.now());
       setError('');
+      setStale(false);
       loadedQuery.current = query;
     } catch (cause) {
       if (controller.signal.aborted) return;
+      setStale(true);
       setError(cause instanceof Error ? cause.message : 'Live tickets could not be loaded');
     } finally {
       if (sequence === requestSequence.current) setLoading(false);
     }
-  }, [query]);
-  useEffect(() => { void refresh(); }, [refresh]);
+  }, [enabled, query]);
+  useEffect(() => { if (enabled) void refresh(); }, [enabled, refresh]);
   useEffect(() => {
+    if (!enabled) return;
+    const scheduleRefresh = () => {
+      if (Date.now() < cooldownUntil.current) return;
+      if (refreshTimer.current) clearTimeout(refreshTimer.current);
+      refreshTimer.current = setTimeout(() => void refresh(), jitteredRetryMs(300, Math.random()));
+    };
     const unsubscribe = subscribeRealtime({
       onConnection: (state) => {
         setConnection(state);
-        if (state === 'live') void refresh();
+        if (state === 'live' && Date.now() - fetchedAt.current < 1500) return;
+        if (state === 'live') scheduleRefresh();
       },
       onTicket: (event) => {
       if (event.lastEventId) {
@@ -169,63 +271,48 @@ function useApiTickets(query = '') {
       }
       try {
         const data = JSON.parse(event.data) as { ticketId?: string; version?: number };
-        if (data.ticketId && typeof data.version === 'number') {
-          const previous = seenTicketVersions.current.get(data.ticketId) ?? -1;
-          if (data.version <= previous) return;
-          seenTicketVersions.current.set(data.ticketId, data.version);
-        }
+        if (!shouldRefreshForTicketEvent(seenTicketVersions.current, data)) return;
       } catch {
         // Reconcile unknown event payloads from authoritative REST state.
       }
-      if (refreshTimer.current) clearTimeout(refreshTimer.current);
-      refreshTimer.current = setTimeout(() => void refresh(), 250);
+      scheduleRefresh();
       },
     });
-    const reconcile = () => { if (document.visibilityState === 'visible') void refresh(); };
+    const reconcile = () => { if (document.visibilityState === 'visible') scheduleRefresh(); };
     const authLost = () => {
       setItems([]);
       setTotal(0);
       setNextCursor(null);
+      setStale(false);
       setError('Session expired');
     };
     document.addEventListener('visibilitychange', reconcile);
     window.addEventListener(AUTH_LOST_EVENT, authLost);
     return () => {
       if (refreshTimer.current) clearTimeout(refreshTimer.current);
+      if (retryTimer.current) clearTimeout(retryTimer.current);
       document.removeEventListener('visibilitychange', reconcile);
       window.removeEventListener(AUTH_LOST_EVENT, authLost);
       unsubscribe();
       requestController.current?.abort();
     };
-  }, [refresh]);
-  return { items, total, nextCursor, loading, error, refresh, loadMore: () => nextCursor ? refresh(nextCursor, true) : Promise.resolve(), connection, lastUpdatedAt };
+  }, [enabled, refresh]);
+  return { items, total, nextCursor, loading, error, stale, refresh, loadMore: () => nextCursor ? refresh(nextCursor, true) : Promise.resolve(), connection, lastUpdatedAt };
 }
 
-type Profile = {
-  id: string;
-  name: string;
-  role: Role;
-  email?: string | null;
-  phone?: string | null;
-  scopes: Array<{
-    event: { id: string; name: string; timezone: string };
-    hall: { id: string; code: string; name: string } | null;
-    stall: { id?: string; stallCode: string; zone: { code: string } } | null;
-    serviceType: string | null;
-  }>;
-};
+type Profile = SessionProfile & { role: Role };
+
+function useProfileState() {
+  const [snapshot, setSnapshot] = useState(profileSnapshot);
+  useEffect(() => {
+    void loadSessionProfile();
+    return subscribeProfile(() => setSnapshot({ ...profileSnapshot() }));
+  }, []);
+  return snapshot;
+}
 
 function useProfile() {
-  const [profile, setProfile] = useState<Profile | null>(null);
-  useEffect(() => {
-    void apiFetch('/api/auth/profile', { credentials: 'include', cache: 'no-store' })
-      .then((response) => response.ok ? response.json() as Promise<Profile> : null)
-      .then(setProfile);
-    const authLost = () => setProfile(null);
-    window.addEventListener(AUTH_LOST_EVENT, authLost);
-    return () => window.removeEventListener(AUTH_LOST_EVENT, authLost);
-  }, []);
-  return profile;
+  return useProfileState().profile as Profile | null;
 }
 
 function useAuthLoss(clear: () => void) {
@@ -261,60 +348,40 @@ function statusLabelFor(value: TicketStatus, audience: 'stall' | 'staff' | 'mana
     if (value === 'AWAITING_OTP') return "Waiting for stall's code";
     if (value === 'SNOOZED') return 'Respond in 10 min';
     if (value === 'REOPENED') return 'Task opened again';
+    if (value === 'CLOSED') return 'Completed';
   }
-  if (value === 'ASSIGNED' && audience === 'stall') return 'Staff assigned';
-  if (value === 'AWAITING_OTP' && audience === 'stall') return 'Waiting for completion verification';
+  if (audience === 'stall') {
+    if (value === 'NEW') return 'Request received';
+    if (value === 'QUEUED') return 'Waiting for assistance';
+    if (value === 'ASSIGNED' || value === 'SNOOZED') return 'Staff assigned';
+    if (value === 'ACCEPTED') return 'Request accepted';
+    if (value === 'IN_PROGRESS') return 'Work in progress';
+    if (value === 'AWAITING_OTP') return 'Check the work and share your completion code';
+    if (value === 'CLOSED') return 'Completed';
+    if (value === 'COMPLAINT_RAISED') return 'Problem reported';
+    if (value === 'REOPENED') return 'Request reopened';
+    if (value === 'ESCALATED') return 'Manager reviewing your request';
+    if (value === 'CANCELLED') return 'Cancelled';
+  }
   if (value === 'AWAITING_OTP') return 'Awaiting OTP';
-  if (value === 'CLOSED' && audience === 'stall') return 'Completion verified';
   return statusLabels[value];
 }
 
 function Status({ value, audience = 'manager' }: { value: TicketStatus; audience?: 'stall' | 'staff' | 'manager' }) {
-  return <span className={'status status-' + value.toLowerCase()}>{statusLabelFor(value, audience)}</span>;
+  const appearance = audience === 'stall' && value === 'SNOOZED' ? 'ASSIGNED' : value;
+  return <span className={'status status-' + appearance.toLowerCase()}>{statusLabelFor(value, audience)}</span>;
 }
 
 function LogoutButton() {
   const router = useRouter();
   async function logout() {
-    stopSound();
-    const endpoint = window.localStorage.getItem('eveops-push-endpoint');
-    if (endpoint) {
-      await apiFetch('/api/notifications/push-subscription', {
-        method: 'DELETE',
-        credentials: 'include',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ endpoint, p256dh: 'placeholder', auth: 'placeholder' }),
-      }).catch(() => undefined);
-    }
+    await clearPushForLogout();
+    releaseWorkAlerts();
     await globalThis.fetch('/api/auth/logout', { method: 'POST', credentials: 'include' });
     router.replace('/login');
     router.refresh();
   }
   return <button className="logout" onClick={logout}>Sign out</button>;
-}
-
-function shortTime(value: string | null | undefined, timezone = 'UTC') {
-  if (!value) return null;
-  return new Intl.DateTimeFormat('en-IN', { timeZone: timezone, timeStyle: 'short' }).format(new Date(value));
-}
-
-function countdownLabel(expiresAt: string | undefined, nowMs: number) {
-  if (!expiresAt) return '';
-  const remaining = Math.max(0, Math.floor((new Date(expiresAt).getTime() - nowMs) / 1000));
-  const minutes = Math.floor(remaining / 60);
-  const seconds = remaining % 60;
-  return `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
-}
-
-function OtpDigits({ value, empty = false }: { value?: string; empty?: boolean }) {
-  const digits = (value ?? '').padEnd(6, ' ').slice(0, 6).split('');
-  return (
-    <div className="otp-digits" aria-hidden={empty || !value}>
-      {digits.map((digit, index) => (
-        <span key={index} className={digit.trim() ? 'otp-digit' : 'otp-digit otp-digit-empty'}>{digit.trim() || '·'}</span>
-      ))}
-    </div>
-  );
 }
 
 function StaffOtpEntry({ disabled, value, onChange, onSubmit, submitting, error, success }: {
@@ -385,7 +452,7 @@ function StaffOtpEntry({ disabled, value, onChange, onSubmit, submitting, error,
   );
 }
 
-function TicketCard({ ticket, actions = false, actionLabel = 'Accept assignment', actionDisabled = false, onAccept, onSnooze, audience = 'manager', loadingLabel }: {
+function TicketCard({ ticket, actions = false, actionLabel = 'Accept assignment', actionDisabled = false, onAccept, onSnooze, audience = 'manager', loadingLabel, showMilestones = false }: {
   ticket: Ticket;
   actions?: boolean;
   actionLabel?: string;
@@ -394,7 +461,9 @@ function TicketCard({ ticket, actions = false, actionLabel = 'Accept assignment'
   onSnooze?: () => void;
   audience?: 'stall' | 'staff' | 'manager';
   loadingLabel?: string;
+  showMilestones?: boolean;
 }) {
+  const closed = ['CLOSED', 'CANCELLED'].includes(ticket.status);
   return (
     <article className="ticket-card">
       <div className="ticket-top"><span className="ticket-no">{ticket.no}</span><Status value={ticket.status} audience={audience} /></div>
@@ -406,11 +475,21 @@ function TicketCard({ ticket, actions = false, actionLabel = 'Accept assignment'
         <span>{ticket.locationParts.hall} · {ticket.locationParts.zone}</span>
         <strong>Stall {ticket.locationParts.stall}</strong>
       </div>}
-      {audience === 'staff' && ticket.slaState !== 'On track' && <p className="sla breach">{ticket.slaState === 'SLA breached' ? 'Work overdue' : 'Response overdue'}</p>}
-      <div className="ticket-meta">
-        <span>Age <strong>{ticket.age}</strong></span>
-        <span>{audience === 'stall' ? 'Handled by' : audience === 'staff' ? 'This task' : 'Owner'} <strong>{audience === 'staff' ? 'Yours' : ticket.assignee}</strong></span>
-      </div>
+      {audience === 'manager' && (
+        <div className="ticket-meta">
+          <TimingFacts ticket={ticket} />
+          <span>{closed ? 'Last handled by' : 'Handled by'} <strong>{ticket.assignee}</strong></span>
+        </div>
+      )}
+      {audience === 'stall' && showMilestones && (
+        <div className="ticket-meta">
+          <span>Raised <strong>{eventTime(ticket.createdAt)}</strong></span>
+          {ticket.status === 'CLOSED' && ticket.closedAt ? <span>Completed <strong>{eventTime(ticket.closedAt)}</strong></span> : null}
+          {ticket.cancelledAt ? <span>Cancelled <strong>{eventTime(ticket.cancelledAt)}</strong></span> : null}
+          {ticket.complaintRaisedAt ? <span>Problem reported <strong>{eventTime(ticket.complaintRaisedAt)}</strong></span> : null}
+          {ticket.reopenCount > 0 ? <span>Reopened <strong>{ticket.reopenCount === 1 ? 'Once' : `${ticket.reopenCount} times`}</strong></span> : null}
+        </div>
+      )}
       {actions && (
         <div className="ticket-actions">
           <button className="primary" disabled={actionDisabled} onClick={onAccept}>{actionDisabled && loadingLabel ? loadingLabel : actionLabel}</button>
@@ -422,404 +501,49 @@ function TicketCard({ ticket, actions = false, actionLabel = 'Accept assignment'
   );
 }
 
-function ComplaintDisclosure({ ticketId, summary, onSuccess }: { ticketId: string; summary: string; onSuccess: () => Promise<unknown> }) {
-  const [submitting, setSubmitting] = useState(false);
-  const [error, setError] = useState('');
-  const [success, setSuccess] = useState('');
-  const idempotencyKey = useRef(crypto.randomUUID());
-
-  async function submitComplaint(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    if (submitting) return;
-    setSubmitting(true);
-    setError('');
-    setSuccess('');
-    const form = event.currentTarget;
-    const values = new FormData(form);
-    try {
-      const response = await apiFetch('/api/tickets/' + ticketId + '/complaints', {
-        method: 'POST',
-        credentials: 'include',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({
-          reasonCode: values.get('reasonCode'),
-          comment: values.get('comment'),
-          idempotencyKey: idempotencyKey.current,
-        }),
-      });
-      if (!response.ok) throw new Error(await apiErrorMessage(response, 'Complaint could not be raised'));
-      idempotencyKey.current = crypto.randomUUID();
-      form.reset();
-      setSuccess('Complaint recorded. Hall Manager has been notified.');
-      await onSuccess();
-    } catch (cause) {
-      setError(cause instanceof Error ? cause.message : 'Complaint could not be raised');
-    } finally {
-      setSubmitting(false);
-    }
-  }
-
-  return (
-    <details className="complaint-disclosure">
-      <summary>{summary}</summary>
-      <form onSubmit={(event) => void submitComplaint(event)}>
-        <label>What is still wrong?<select name="reasonCode" required disabled={submitting}><option value="">Choose reason</option><option value="WORK_INCOMPLETE">Work incomplete</option><option value="WORK_QUALITY">Issue returned</option><option value="WRONG_SERVICE">Wrong repair</option></select></label>
-        <label>Additional details<textarea name="comment" maxLength={500} disabled={submitting} placeholder="Optional note" /></label>
-        {error && <p className="form-error" role="alert">{error}</p>}
-        {success && <p className="form-success" role="status">{success}</p>}
-        <button type="submit" disabled={submitting}>{submitting ? 'Submitting complaint…' : 'Submit complaint'}</button>
-      </form>
-    </details>
-  );
-}
-
-export function StallWorkspace({ focusId }: { focusId?: string } = {}) {
-  const profile = useProfile();
-  const { items, total, loading, error: loadError, refresh, connection } = useApiTickets('view=active');
-  const { items: closedItems, loading: closedLoading } = useApiTickets('view=all&limit=50');
-  const [showForm, setShowForm] = useState(false);
-  const [showAll, setShowAll] = useState(false);
-  const [showHelp, setShowHelp] = useState(false);
-  const [showProfile, setShowProfile] = useState(false);
-  const [ticketSearch, setTicketSearch] = useState('');
-  const [submitted, setSubmitted] = useState('');
-  const [category, setCategory] = useState('');
-  const [submitError, setSubmitError] = useState('');
-  const [submitting, setSubmitting] = useState(false);
-  const [otpByTicket, setOtpByTicket] = useState<Record<string, string>>({});
-  const [otpExpiryByTicket, setOtpExpiryByTicket] = useState<Record<string, string>>({});
-  const [otpExpiredByTicket, setOtpExpiredByTicket] = useState<Record<string, boolean>>({});
-  const [otpPending, setOtpPending] = useState<Record<string, boolean>>({});
-  const [nowMs, setNowMs] = useState(() => Date.now());
-  const idempotencyKey = useRef('');
-  useAuthLoss(() => {
-    setOtpByTicket({});
-    setOtpExpiryByTicket({});
-    setOtpExpiredByTicket({});
-    setOtpPending({});
-    setSubmitted('');
-  });
-  useEffect(() => {
-    const timer = setInterval(() => setNowMs(Date.now()), 1000);
-    return () => clearInterval(timer);
-  }, []);
-  const stallScope = profile?.scopes.find((scope) => scope.stall);
-  const locationLabel = stallScope
-    ? [stallScope.hall?.name, 'Zone ' + stallScope.stall!.zone.code, 'Stall ' + stallScope.stall!.stallCode].filter(Boolean).join(' / ')
-    : 'Loading assigned location…';
-  const directory = showAll ? closedItems : [];
-  const filteredDirectory = directory.filter((ticket) => {
-    const query = ticketSearch.trim().toLowerCase();
-    if (!query) return true;
-    return ticket.no.toLowerCase().includes(query) || ticket.service.toLowerCase().includes(query) || ticket.description.toLowerCase().includes(query);
-  });
-
-  async function loadOtp(ticketId: string) {
-    if (otpPending[ticketId]) return;
-    setOtpPending((current) => ({ ...current, [ticketId]: true }));
-    try {
-      const response = await apiFetch('/api/tickets/' + ticketId + '/otp', { credentials: 'include', cache: 'no-store' });
-      if (!response.ok) throw new Error(await apiErrorMessage(response, 'Completion code is unavailable'));
-      const result = await response.json() as { otp?: string | null; expiresAt?: string; expired?: boolean };
-      if (result.expired || !result.otp) {
-        setOtpByTicket((current) => {
-          const next = { ...current };
-          delete next[ticketId];
-          return next;
-        });
-        setOtpExpiredByTicket((current) => ({ ...current, [ticketId]: true }));
-        if (result.expiresAt) setOtpExpiryByTicket((current) => ({ ...current, [ticketId]: result.expiresAt! }));
-      } else {
-        setOtpByTicket((current) => ({ ...current, [ticketId]: result.otp! }));
-        setOtpExpiredByTicket((current) => ({ ...current, [ticketId]: false }));
-        if (result.expiresAt) setOtpExpiryByTicket((current) => ({ ...current, [ticketId]: result.expiresAt! }));
-      }
-      setSubmitError('');
-    } catch (cause) {
-      setSubmitError(cause instanceof Error ? cause.message : 'Completion code is unavailable');
-    } finally {
-      setOtpPending((current) => ({ ...current, [ticketId]: false }));
-    }
-  }
-
-  async function regenerateOtp(ticketId: string) {
-    if (otpPending[ticketId]) return;
-    setOtpPending((current) => ({ ...current, [ticketId]: true }));
-    try {
-      const response = await apiFetch('/api/tickets/' + ticketId + '/otp/regenerate', { method: 'POST', credentials: 'include' });
-      if (!response.ok) throw new Error(await apiErrorMessage(response, 'Could not generate a new code'));
-      setOtpPending((current) => ({ ...current, [ticketId]: false }));
-      await loadOtp(ticketId);
-    } catch (cause) {
-      setSubmitError(cause instanceof Error ? cause.message : 'Could not generate a new code');
-      setOtpPending((current) => ({ ...current, [ticketId]: false }));
-    }
-  }
-
-  useEffect(() => {
-    for (const ticket of items) {
-      if (ticket.status === 'AWAITING_OTP' && !otpByTicket[ticket.id] && !otpExpiredByTicket[ticket.id] && !otpPending[ticket.id]) {
-        void loadOtp(ticket.id);
-      }
-      if (ticket.status !== 'AWAITING_OTP' && otpByTicket[ticket.id]) {
-        setOtpByTicket((current) => {
-          const next = { ...current };
-          delete next[ticket.id];
-          return next;
-        });
-      }
-    }
-    // Auto-fetch once per awaiting ticket; pending/otp maps intentionally omitted to avoid loops.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [items]);
-
-  async function submit(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    setSubmitting(true);
-    setSubmitError('');
-    const form = new FormData(event.currentTarget);
-    try {
-      const response = await apiFetch('/api/tickets', {
-        method: 'POST',
-        credentials: 'include',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({
-          category,
-          subtype: category === 'ELECTRICAL' ? String(form.get('subtype') ?? '') : 'General',
-          description: String(form.get('description') ?? ''),
-          priority: form.get('urgent') ? 'URGENT' : 'NORMAL',
-          idempotencyKey: idempotencyKey.current || (idempotencyKey.current = crypto.randomUUID()),
-        }),
-      });
-      if (!response.ok) throw new Error(await apiErrorMessage(response, 'Ticket could not be created'));
-      const result = await response.json() as { publicNo?: string };
-      if (!result.publicNo) throw new Error('Ticket could not be created');
-      setSubmitted(result.publicNo);
-      idempotencyKey.current = '';
-      await refresh();
-    } catch (cause) {
-      setSubmitError(cause instanceof Error ? cause.message : 'Ticket could not be created');
-    } finally {
-      setSubmitting(false);
-    }
-  }
-
-  if (focusId) {
-    const ticket = [...items, ...closedItems].find((item) => item.id === focusId);
-    return (
-      <div className="mobile-page">
-        <main className="mobile-shell">
-          <a className="back" href="/stall">← Back</a>
-          {ticket ? <TicketCard ticket={ticket} audience="stall" /> : <p className="empty-state">This request is not in your stall list.</p>}
-          <TicketActivity ticketId={focusId} />
-        </main>
-      </div>
-    );
-  }
-
-  return (
-    <div className="mobile-page">
-      <main className="mobile-shell">
-        <header className="mobile-header">
-          <div><span className="eyebrow">{stallScope?.event.name ?? 'EveOps event'}</span><h1>{stallScope?.stall ? 'Stall ' + stallScope.stall.stallCode : 'Your stall'}</h1></div>
-          <span className="online">{connection === 'live' ? 'Live' : connection === 'reconnecting' ? 'Reconnecting…' : 'Connecting…'}</span>
-        </header>
-        {submitted ? (
-          <section className="success-panel">
-            <span className="success-mark" aria-hidden="true">✓</span>
-            <h2>Ticket {submitted} confirmed</h2>
-            <p>The server confirmed your ticket. Hall Manager notified; waiting for assignment.</p>
-            <button onClick={() => { setSubmitted(''); setShowForm(false); }}>View ticket</button>
-          </section>
-        ) : showForm ? (
-          <form className="raise-form" onSubmit={submit}>
-            <button type="button" className="back" onClick={() => setShowForm(false)}>← Back</button>
-            <span className="eyebrow">Locked location · {locationLabel}</span>
-            <h2>What do you need?</h2>
-            <fieldset className="service-grid">
-              <legend>Service category</legend>
-              <label><input type="radio" name="service" required value="ELECTRICAL" onChange={() => setCategory('ELECTRICAL')} />Electrical</label>
-              <label><input type="radio" name="service" value="HOUSE_HELP" onChange={() => setCategory('HOUSE_HELP')} />House Help</label>
-              <label><input type="radio" name="service" value="HALL_MANAGER" onChange={() => setCategory('HALL_MANAGER')} />Hall Manager</label>
-            </fieldset>
-            {category === 'ELECTRICAL' && <label className="field">Electrical subtype<select name="subtype" required><option value="">Choose subtype</option><option value="NCP">NCP</option><option value="Lighting">Lighting</option></select></label>}
-            <label className="field">Brief description<textarea name="description" required minLength={3} maxLength={500} placeholder="Tell us what needs attention" /></label>
-            <label className="urgent"><input type="checkbox" name="urgent" /> Mark as urgent</label>
-            {submitError && <div className="form-error" role="alert">{submitError}</div>}
-            <button className="primary full-width" type="submit" disabled={submitting || !category}>{submitting ? 'Confirming…' : 'Raise ticket'}</button>
-          </form>
-        ) : showProfile ? (
-          <section className="success-panel">
-            <h2>Your stall</h2>
-            <p>{profile?.name}</p>
-            <p>{profile?.email}</p>
-            {profile?.phone && <p>{profile.phone}</p>}
-            <p>{locationLabel}</p>
-            <PushOptIn />
-            <button type="button" onClick={() => setShowProfile(false)}>Back to requests</button>
-          </section>
-        ) : showAll ? (
-          <section>
-            <button type="button" className="back" onClick={() => setShowAll(false)}>← Back</button>
-            <h2>My tickets</h2>
-            <label className="field">Search<input value={ticketSearch} onChange={(event) => setTicketSearch(event.target.value)} placeholder="Ticket number or issue" /></label>
-            {filteredDirectory.length ? filteredDirectory.map((ticket) => <a key={ticket.id} href={'/stall/ticket/' + ticket.id}><TicketCard ticket={ticket} audience="stall" /></a>) : <p className="empty-state">No tickets match this search.</p>}
-          </section>
-        ) : showHelp ? (
-          <section className="success-panel">
-            <h2>Need operational help?</h2>
-            <p>Raise a Hall Manager ticket for event assistance. For an existing request, include the ticket number when speaking with your Hall Manager.</p>
-            <button className="primary" onClick={() => { idempotencyKey.current = crypto.randomUUID(); setShowHelp(false); setShowForm(true); }}>Raise a help ticket</button>
-            <button onClick={() => setShowHelp(false)}>Back to tickets</button>
-          </section>
-        ) : (
-          <>
-            <button className="raise" onClick={() => { idempotencyKey.current = crypto.randomUUID(); setShowForm(true); }}><span aria-hidden="true">＋</span> Raise a ticket</button>
-            <section>
-              <div className="section-title"><h2>Active requests</h2><span>{total} open</span></div>
-              {submitError && <div className="form-error" role="alert">{submitError}</div>}
-              {loading ? <p className="empty-state">Loading your requests…</p> : loadError ? <p className="form-error">{loadError}</p> : items.length ? (showAll ? items : items.slice(0, 3)).map((ticket) => (
-                <div key={ticket.id}>
-                  <TicketCard ticket={ticket} audience="stall" />
-                  {ticket.status === 'AWAITING_OTP' && (
-                    <div className="otp-panel otp-display-panel">
-                      <p className="otp-kicker">Staff has requested completion</p>
-                      <p>Check the work before sharing this code.</p>
-                      {(ticket.firstStartedAt || ticket.completionRequestedAt) && (
-                        <div className="otp-milestones">
-                          {ticket.firstStartedAt && <span>Work started · {shortTime(ticket.firstStartedAt) ?? '—'}</span>}
-                          {ticket.completionRequestedAt && <span>Completion requested · {shortTime(ticket.completionRequestedAt) ?? '—'}</span>}
-                        </div>
-                      )}
-                      {otpByTicket[ticket.id] && countdownLabel(otpExpiryByTicket[ticket.id], nowMs) !== '00:00' ? (
-                        <>
-                          <p className="otp-code-label">Completion code</p>
-                          <div aria-label={`Completion code ${otpByTicket[ticket.id].split('').join(' ')}`}>
-                            <OtpDigits value={otpByTicket[ticket.id]} />
-                          </div>
-                          <p className="otp-expiry">Expires in {countdownLabel(otpExpiryByTicket[ticket.id], nowMs)}</p>
-                          <p className="otp-hint">Tell this code to the assigned worker or hall manager only if the work is complete.</p>
-                          <button type="button" className="secondary-action" disabled={otpPending[ticket.id]} onClick={() => void regenerateOtp(ticket.id)}>
-                            Request new completion code
-                          </button>
-                        </>
-                      ) : otpExpiredByTicket[ticket.id] || (otpByTicket[ticket.id] && countdownLabel(otpExpiryByTicket[ticket.id], nowMs) === '00:00') ? (
-                        <>
-                          <p className="form-error" role="alert">Verification code expired</p>
-                          <button type="button" className="primary" disabled={otpPending[ticket.id]} onClick={() => void regenerateOtp(ticket.id)}>
-                            {otpPending[ticket.id] ? 'Generating…' : 'Generate new code'}
-                          </button>
-                        </>
-                      ) : (
-                        <button type="button" className="primary" disabled={otpPending[ticket.id]} onClick={() => void loadOtp(ticket.id)}>
-                          {otpPending[ticket.id] ? 'Loading code…' : 'Show completion code'}
-                        </button>
-                      )}
-                      <ComplaintDisclosure ticketId={ticket.id} summary="Work is not satisfactory" onSuccess={async () => { setOtpByTicket((current) => { const next = { ...current }; delete next[ticket.id]; return next; }); await refresh(); }} />
-                    </div>
-                  )}
-                </div>
-              )) : <p className="empty-state">No active requests for this stall.</p>}
-            </section>
-            <section>
-              <div className="section-title"><h2>Recently resolved</h2><button className="link" onClick={() => setShowAll(true)}>View all</button></div>
-              {closedLoading ? <p className="empty-state">Loading resolved requests…</p> : closedItems.filter((ticket) => ticket.status === 'CLOSED').length ? closedItems.filter((ticket) => ticket.status === 'CLOSED').slice(0, 5).map((ticket) => (
-                <div key={ticket.id}>
-                  <div className="recent"><Status value="CLOSED" audience="stall" /><strong>{ticket.no} · {ticket.service}</strong><span>{ticket.closedAt ? `Closed · ${shortTime(ticket.closedAt)}` : `${ticket.age} since raised`}</span></div>
-                  <ComplaintDisclosure ticketId={ticket.id} summary="Report a problem" onSuccess={refresh} />
-                </div>
-              )) : <p className="empty-state">No resolved requests yet.</p>}
-            </section>
-          </>
-        )}
-        <nav className="bottom-nav" aria-label="Stall navigation"><button onClick={() => { setShowHelp(false); setShowAll(false); setShowProfile(false); }}>Home</button><button onClick={() => { setShowHelp(false); setShowProfile(false); setShowAll(true); }}>My tickets</button><button onClick={() => { setShowHelp(false); setShowAll(false); setShowProfile(true); }}>Profile</button><LogoutButton /></nav>
-      </main>
-    </div>
-  );
-}
-
-function urlBase64ToBytes(value: string) {
-  const padding = '='.repeat((4 - (value.length % 4)) % 4);
-  const base64 = (value + padding).replace(/-/g, '+').replace(/_/g, '/');
-  const raw = window.atob(base64);
-  const output = new Uint8Array(raw.length);
-  for (let index = 0; index < raw.length; index += 1) output[index] = raw.charCodeAt(index);
-  return output;
-}
-
-function PushOptIn() {
-  const [message, setMessage] = useState('Background alerts use the browser’s notification permission.');
-  async function enable() {
-    if (!('serviceWorker' in navigator) || !('PushManager' in window)) {
-      setMessage('This browser does not support background notifications.');
-      return;
-    }
-    const permission = await Notification.requestPermission();
-    if (permission !== 'granted') {
-      setMessage(permission === 'denied' ? 'Notifications are blocked in the browser settings.' : 'Notification permission was not granted.');
-      return;
-    }
-    const config = await apiFetch('/api/notifications/push-config', { credentials: 'include', cache: 'no-store' });
-    const body = await config.json() as { configured: boolean; publicKey: string | null };
-    if (!config.ok || !body.configured || !body.publicKey) {
-      setMessage('Background alerts are not configured on this server yet. On-screen alerts still work.');
-      return;
-    }
-    const registration = await navigator.serviceWorker.register('/sw.js');
-    const subscription = await registration.pushManager.subscribe({
-      userVisibleOnly: true,
-      applicationServerKey: urlBase64ToBytes(body.publicKey),
-    });
-    const json = subscription.toJSON();
-    const saved = await apiFetch('/api/notifications/push-subscription', {
-      method: 'POST',
-      credentials: 'include',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ endpoint: json.endpoint, p256dh: json.keys?.p256dh, auth: json.keys?.auth }),
-    });
-    setMessage(saved.ok ? 'Background alerts are on for this browser.' : 'The subscription could not be saved.');
-    if (json.endpoint) window.localStorage.setItem('eveops-push-endpoint', json.endpoint);
-  }
-  return (
-    <div>
-      <button type="button" onClick={() => void enable()}>Allow background alerts</button>
-      <p className="otp-hint">{message}</p>
-    </div>
-  );
-}
-
 function TicketActivity({ ticketId }: { ticketId: string }) {
-  const [items, setItems] = useState<Array<{ id: string; eventType: string; createdAt: string; actorName: string }>>([]);
+  const [items, setItems] = useState<Array<{ id: string; eventType?: string; createdAt: string; actorName?: string; summary?: string }>>([]);
   const [cursor, setCursor] = useState<string | null>(null);
   const [error, setError] = useState('');
+  const [loading, setLoading] = useState(true);
   const load = useCallback(async (next?: string) => {
+    setLoading(true);
+    setError('');
     const response = await apiFetch('/api/tickets/' + ticketId + '/activity' + (next ? '?cursor=' + encodeURIComponent(next) : ''), { credentials: 'include', cache: 'no-store' });
-    if (!response.ok) { setError('Activity could not be loaded'); return; }
-    const result = await response.json() as { items: Array<{ id: string; eventType: string; createdAt: string; actorName: string }>; nextCursor: string | null };
+    if (!response.ok) {
+      setError('Activity could not be loaded');
+      setLoading(false);
+      return;
+    }
+    const result = await response.json() as { items: Array<{ id: string; eventType?: string; createdAt: string; actorName?: string; summary?: string }>; nextCursor: string | null };
     setItems((current) => next ? [...current, ...result.items] : result.items);
     setCursor(result.nextCursor);
+    setLoading(false);
   }, [ticketId]);
   useEffect(() => { void load(); }, [load]);
-  if (error) return <p className="form-error">{error}</p>;
   return (
     <div className="timeline">
       <h3>Activity</h3>
-      {items.length ? items.map((event) => (
+      {loading && !items.length ? <p className="empty-state">Loading activity…</p> : null}
+      {error ? <p className="form-error" role="alert">{error} <button type="button" onClick={() => void load()}>Try again</button></p> : null}
+      {!loading && !error && !items.length ? <p className="empty-state">No activity yet.</p> : null}
+      {items.map((event) => (
         <div className="timeline-item" key={event.id}>
           <i className="active"></i>
           <div>
-            <strong>{activitySentence(event.eventType, event.actorName)}</strong>
+            <strong>{event.summary || activitySentence(event.eventType ?? '', event.actorName || 'The system')}</strong>
             <span>{eventTime(event.createdAt)}</span>
           </div>
         </div>
-      )) : <p className="empty-state">No activity yet.</p>}
-      {cursor && <button type="button" onClick={() => void load(cursor)}>Load more</button>}
+      ))}
+      {cursor && <button type="button" onClick={() => void load(cursor)} disabled={loading}>{loading ? 'Loading…' : 'Load more'}</button>}
     </div>
   );
 }
 
 export function StaffWorkspace({ focusId }: { focusId?: string } = {}) {
   const profile = useProfile();
+  const sectionQuery = useSearchParams().get('section');
   const { items, loading, error: loadError, refresh, connection } = useApiTickets('view=active');
   const { items: history } = useApiTickets('view=closed&limit=10');
   const [actionError, setActionError] = useState('');
@@ -829,6 +553,7 @@ export function StaffWorkspace({ focusId }: { focusId?: string } = {}) {
   const [availability, setAvailability] = useState<'ON_DUTY' | 'PAUSED' | 'OFF_DUTY' | 'OFFLINE'>('OFF_DUTY');
   const [workload, setWorkload] = useState({ activeCount: 0, completedToday: 0, capacity: 0 });
   const [actionPending, setActionPending] = useState(false);
+  const [pendingTicketId, setPendingTicketId] = useState<string | null>(null);
   const [section, setSection] = useState<'task' | 'history' | 'availability'>('task');
   useAuthLoss(() => {
     setAvailability('OFF_DUTY');
@@ -839,19 +564,14 @@ export function StaffWorkspace({ focusId }: { focusId?: string } = {}) {
     setOtpError('');
     setOtpSuccess('');
   });
-  const [detailTab, setDetailTab] = useState<'details' | 'activity'>('details');
-  const [soundOn, setSoundOn] = useState(false);
-  const [silenced, setSilenced] = useState<string[]>([]);
-  const ordered = [...items].sort((left, right) => Number(Boolean(right.priority)) - Number(Boolean(left.priority)));
+  const ordered = [...items].sort((left, right) => left.no.localeCompare(right.no));
   const focused = focusId ? (ordered.find((ticket) => ticket.id === focusId) ?? history.find((ticket) => ticket.id === focusId)) : undefined;
-  const current = focused ?? ordered.find((ticket) => ['ASSIGNED', 'SNOOZED'].includes(ticket.status)) ?? ordered[0];
-  const incoming = ordered.filter((ticket) => ['ASSIGNED', 'SNOOZED'].includes(ticket.status) && !silenced.includes(ticket.id));
 
   useEffect(() => {
     setOtpValue('');
     setOtpError('');
     setOtpSuccess('');
-  }, [current?.id, current?.status]);
+  }, [focused?.id, focused?.status]);
 
   const refreshWorkload = useCallback(async () => {
     const response = await apiFetch('/api/workforce/me', { credentials: 'include', cache: 'no-store' });
@@ -861,14 +581,10 @@ export function StaffWorkspace({ focusId }: { focusId?: string } = {}) {
     setWorkload(result);
   }, []);
   useEffect(() => { void refreshWorkload(); }, [refreshWorkload]);
-  useEffect(() => { setSoundOn(soundEnabled()); }, []);
-  const incomingId = incoming[0]?.id;
   useEffect(() => {
-    if (!incomingId || !soundOn) return;
-    void playRepeatAlert('assign:' + incomingId, 20000);
-    return () => stopSound();
-  }, [incomingId, soundOn]);
-
+    if (sectionQuery === 'completed') setSection('history');
+    if (sectionQuery === 'availability') setSection('availability');
+  }, [sectionQuery]);
   async function setAvailabilityValue(value: 'ON_DUTY' | 'PAUSED' | 'OFF_DUTY') {
     setActionPending(true);
     const response = await apiFetch('/api/workforce/availability', {
@@ -889,10 +605,11 @@ export function StaffWorkspace({ focusId }: { focusId?: string } = {}) {
     setActionPending(false);
   }
 
-  async function transition(ticket = current) {
+  async function transition(ticket?: Ticket) {
     if (!ticket) return;
     if (!['ASSIGNED', 'SNOOZED', 'ACCEPTED', 'IN_PROGRESS'].includes(ticket.status)) return;
     setActionPending(true);
+    setPendingTicketId(ticket.id);
     const next = ticket.status === 'ACCEPTED' ? 'IN_PROGRESS' : ticket.status === 'IN_PROGRESS' ? 'AWAITING_OTP' : 'ACCEPTED';
     const response = await apiFetch('/api/tickets/' + ticket.id + '/transition', {
       method: 'POST',
@@ -903,35 +620,38 @@ export function StaffWorkspace({ focusId }: { focusId?: string } = {}) {
     if (!response.ok) {
       setActionError(await apiErrorMessage(response, next === 'AWAITING_OTP' ? 'Could not request completion. Try again.' : 'Action could not be confirmed'));
       setActionPending(false);
+      setPendingTicketId(null);
       return;
     }
     setActionError('');
-    stopSound();
     await refresh();
     await refreshWorkload();
     setActionPending(false);
+    setPendingTicketId(null);
   }
 
-  async function snooze(ticket = current) {
+  async function snooze(ticket?: Ticket) {
     if (!ticket) return;
     setActionPending(true);
+    setPendingTicketId(ticket.id);
     const response = await apiFetch('/api/tickets/' + ticket.id + '/snooze', { method: 'POST', credentials: 'include' });
     if (!response.ok) {
       setActionError(await apiErrorMessage(response, 'Snooze could not be confirmed'));
       setActionPending(false);
+      setPendingTicketId(null);
       return;
     }
     setActionError('');
-    stopSound();
     await refresh();
     setActionPending(false);
+    setPendingTicketId(null);
   }
 
   async function verifyOtp() {
-    if (!current || otpValue.length !== 6 || actionPending) return;
+    if (!focused || otpValue.length !== 6 || actionPending) return;
     setActionPending(true);
     setOtpError('');
-    const response = await apiFetch('/api/tickets/' + current.id + '/otp/verify', {
+    const response = await apiFetch('/api/tickets/' + focused.id + '/otp/verify', {
       method: 'POST',
       credentials: 'include',
       headers: { 'content-type': 'application/json' },
@@ -949,127 +669,220 @@ export function StaffWorkspace({ focusId }: { focusId?: string } = {}) {
     setActionPending(false);
   }
 
-  const actionLabel = current?.status === 'ACCEPTED'
-    ? 'Start work'
-    : current?.status === 'IN_PROGRESS'
-      ? 'Work done'
-      : 'Accept task';
-  const loadingLabel = current?.status === 'ACCEPTED'
-    ? 'Starting…'
-    : current?.status === 'IN_PROGRESS'
-      ? 'Requesting completion…'
-      : 'Accepting…';
-  const atCapacity = workload.capacity > 0 && workload.activeCount >= workload.capacity;
+  const serviceName = serviceLabel(profile?.scopes.find((scope) => scope.serviceType)?.serviceType ?? '');
 
   return (
+    <OperationalClock timeZone={profile?.scopes[0]?.event.timezone}>
     <div className="mobile-page">
       <main className="mobile-shell staff">
         <header className="mobile-header">
           <div>
-            <span className="eyebrow">{profile?.scopes[0]?.event.name ?? 'Current shift'} · {connection === 'live' ? 'Live' : 'Reconnecting'}</span>
+            <span className="eyebrow">Your tasks · {connection === 'live' ? 'Live' : 'Reconnecting'}</span>
             <h1>{profile?.name ?? 'Service workspace'}</h1>
+            {serviceName ? <p className="staff-role">{serviceName}</p> : null}
           </div>
           <span className={'duty duty-badge ' + availability.toLowerCase()} aria-label={`Availability ${availability.replaceAll('_', ' ')}`}>
             {availability === 'ON_DUTY' ? 'On duty' : availability === 'PAUSED' ? 'Paused' : 'Off duty'}
           </span>
         </header>
-        {!focusId && !!incoming.length && (
-          <div className="task-alert" role="status">
-            <strong>{incoming.length > 1 ? `${incoming.length} new tasks` : 'New task'}</strong>
-            <p className="stall-hero">Stall {incoming[0].locationParts.stall}</p>
-            <p>{incoming[0].locationParts.hall} · Zone {incoming[0].locationParts.zone}</p>
-            <p>{incoming[0].service} · {incoming[0].description}</p>
-            {incoming[0].priority && <p>Urgent</p>}
-            <div className="ticket-actions">
-              <a className="secondary-action" href={'/staff/task/' + incoming[0].id}>View task</a>
-              <button type="button" onClick={() => { stopSound(); setSilenced((currentIds) => [...currentIds, incoming[0].id]); }}>Silence</button>
-              <button type="button" className="primary" disabled={actionPending} onClick={() => void transition(incoming[0])}>Accept task</button>
-              {incoming[0].status === 'ASSIGNED' && <button type="button" disabled={actionPending} onClick={() => void snooze(incoming[0])}>10 min later</button>}
-            </div>
-          </div>
-        )}
-        {section === 'task' && (
+        {actionError && <div className="form-error" role="alert">{actionError}</div>}
+        {focusId ? (
+          <StaffTaskDetail
+            ticket={focused}
+            loading={loading}
+            error={loadError}
+            actionPending={actionPending}
+            otpValue={otpValue}
+            otpError={otpError}
+            otpSuccess={otpSuccess}
+            backHref={focused && ['CLOSED', 'CANCELLED'].includes(focused.status) ? '/staff?section=completed' : '/staff'}
+            onTransition={() => void transition(focused)}
+            onSnooze={() => void snooze(focused)}
+            onOtpChange={(next) => { setOtpValue(next); setOtpError(''); }}
+            onVerify={() => void verifyOtp()}
+          />
+        ) : (
           <>
-            {actionError && <div className="form-error" role="alert">{actionError}</div>}
-            {loading && !items.length ? <p className="empty-state">Loading current task…</p> : !current ? (loadError ? <p className="form-error">{loadError}</p> : <p className="empty-state">No current task. New work appears here when you are on duty.</p>) : (
-              <>
-                <TicketCard
-                  ticket={current}
-                  audience="staff"
-                  actions={['ASSIGNED', 'SNOOZED', 'ACCEPTED', 'IN_PROGRESS'].includes(current.status) && (Boolean(focusId) || current.id !== incoming[0]?.id)}
-                  actionLabel={actionLabel}
-                  actionDisabled={actionPending}
-                  loadingLabel={loadingLabel}
-                  onAccept={() => void transition()}
-                  onSnooze={() => void snooze()}
-                />
-                {focusId && (
-                  <div className="drawer-actions">
-                    <button type="button" className={detailTab === 'details' ? 'primary' : ''} onClick={() => setDetailTab('details')}>Details</button>
-                    <button type="button" className={detailTab === 'activity' ? 'primary' : ''} onClick={() => setDetailTab('activity')}>Activity</button>
-                    <a href="/staff">Back to tasks</a>
-                  </div>
-                )}
-                {detailTab === 'activity' && focusId ? <TicketActivity ticketId={focusId} /> : null}
-                {(!focusId || detailTab === 'details') && current.status === 'AWAITING_OTP' && (
-                  <StaffOtpEntry
-                    value={otpValue}
-                    onChange={(next) => { setOtpValue(next); setOtpError(''); }}
-                    onSubmit={() => void verifyOtp()}
-                    submitting={actionPending}
-                    error={otpError}
-                    success={otpSuccess}
-                  />
-                )}
-              </>
+            {profile?.id ? <WorkAlertHost userId={profile.id} /> : null}
+            {section === 'task' && (
+              <section className="staff-board" aria-label="Active tasks">
+                <div className="section-title"><div><h2>Active tasks</h2><p>{ordered.length ? `${ordered.length} on your list` : 'Nothing active'}</p></div></div>
+                {loadError && ordered.length ? <p className="alert-line" role="status">{loadError}</p> : null}
+                {loading && !ordered.length ? <p className="empty-state">Loading tasks…</p> : loadError && !ordered.length ? <p className="form-error" role="alert">{loadError}</p> : ordered.length ? ordered.map((ticket) => (
+                  <StaffTaskSummary key={ticket.id} ticket={ticket} pending={actionPending && pendingTicketId === ticket.id} locked={actionPending} onTransition={() => void transition(ticket)} onSnooze={() => void snooze(ticket)} />
+                )) : <p className="empty-state">No active tasks. New work appears here when you are on duty and free.</p>}
+              </section>
             )}
-            {ordered.length > 1 && <section><div className="section-title"><h2>Other open tasks</h2></div>{ordered.filter((ticket) => ticket.id !== current?.id).map((ticket) => <a key={ticket.id} href={'/staff/task/' + ticket.id}><TicketCard ticket={ticket} audience="staff" /></a>)}</section>}
-            <section>
-              <div className="section-title"><h2>Today</h2></div>
-              <div className="stats-row">
-                <div><strong>{workload.completedToday}</strong><span>Completed</span></div>
-                <div><strong>{workload.activeCount}</strong><span>Active{atCapacity ? ' · At capacity' : ''}</span></div>
-                <div><strong>{workload.capacity}</strong><span>Capacity</span></div>
-              </div>
-            </section>
+            {section === 'history' && (
+              <section aria-label="Completed tasks">
+                <div className="section-title"><h2>Completed tasks</h2></div>
+                {history.length ? history.map((ticket) => <StaffTaskSummary key={ticket.id} ticket={ticket} />) : <p className="empty-state">No completed work yet.</p>}
+              </section>
+            )}
+            {section === 'availability' && (
+              <section className="availability-panel">
+                <div className="section-title"><h2>Availability</h2></div>
+                <p>Choose whether you can take new tasks. Tasks already assigned to you stay on your list. {workload.activeCount} active now.</p>
+                <button type="button" className={availability === 'ON_DUTY' ? 'primary' : 'secondary-action'} disabled={actionPending} onClick={() => void setAvailabilityValue('ON_DUTY')}>{actionPending ? 'Saving…' : 'On duty · ready for new tasks'}</button>
+                <button type="button" className={availability === 'PAUSED' ? 'primary' : 'secondary-action'} disabled={actionPending} onClick={() => void setAvailabilityValue('PAUSED')}>{actionPending ? 'Saving…' : 'Paused · finish current tasks, no new ones'}</button>
+                <button type="button" className={availability === 'OFF_DUTY' ? 'primary' : 'secondary-action'} disabled={actionPending} onClick={() => void setAvailabilityValue('OFF_DUTY')}>{actionPending ? 'Saving…' : 'Off duty · not available'}</button>
+              </section>
+            )}
           </>
         )}
-        {section === 'history' && (
-          <section>
-            <div className="section-title"><h2>Recent history</h2></div>
-            {history.length ? history.map((ticket) => <a key={ticket.id} href={'/staff/task/' + ticket.id}><TicketCard ticket={ticket} audience="staff" /></a>) : <p className="empty-state">No completed work yet.</p>}
-          </section>
-        )}
-        {section === 'availability' && (
-          <section className="availability-panel">
-            <div className="section-title"><h2>Availability</h2></div>
-            <p>Choose how new work should reach you. Active tickets stay with you until closed or reassigned.</p>
-            <button type="button" className={availability === 'ON_DUTY' ? 'primary' : 'secondary-action'} disabled={actionPending} onClick={() => void setAvailabilityValue('ON_DUTY')}>On duty · ready for new assignments</button>
-            <button type="button" className={availability === 'PAUSED' ? 'primary' : 'secondary-action'} disabled={actionPending} onClick={() => void setAvailabilityValue('PAUSED')}>Paused · finish current work, no new jobs</button>
-            <button type="button" className={availability === 'OFF_DUTY' ? 'primary' : 'secondary-action'} disabled={actionPending} onClick={() => void setAvailabilityValue('OFF_DUTY')}>Off duty · not available</button>
-            <h3>Sound</h3>
-            <p>{soundOn ? 'Sound is on for new tasks.' : 'Sound is off. Alerts still show on screen.'}</p>
-            <button type="button" onClick={() => void enableSound().then((ok) => setSoundOn(ok))}>Enable sound</button>
-            <button type="button" onClick={() => void testSound().then((ok) => setSoundOn(ok))}>Test sound</button>
-            <p className="otp-hint">On iPhone or iPad, add EveOps to the Home Screen before expecting alerts while the app is closed. Locked-screen sound follows the device settings and does not loop.</p>
-            <PushOptIn />
-          </section>
-        )}
         <nav className="bottom-nav" aria-label="Staff navigation">
-          <button type="button" className={section === 'task' ? 'nav-active' : undefined} onClick={() => setSection('task')}>Current task</button>
-          <button type="button" className={section === 'history' ? 'nav-active' : undefined} onClick={() => setSection('history')}>History</button>
-          <button type="button" className={section === 'availability' ? 'nav-active' : undefined} onClick={() => setSection('availability')}>Availability</button>
+          <a className={!focusId && section === 'task' ? 'nav-active' : undefined} href="/staff">Active</a>
+          <a className={!focusId && section === 'history' ? 'nav-active' : undefined} href="/staff?section=completed">Completed</a>
+          <a className={!focusId && section === 'availability' ? 'nav-active' : undefined} href="/staff?section=availability">Availability</a>
           <LogoutButton />
         </nav>
       </main>
     </div>
+    </OperationalClock>
+  );
+}
+
+function staffStatus(status: string) {
+  const labels: Record<string, string> = {
+    ASSIGNED: 'New task',
+    SNOOZED: 'Snoozed',
+    ACCEPTED: 'Accepted',
+    IN_PROGRESS: 'In progress',
+    AWAITING_OTP: 'Waiting for close code',
+    CLOSED: 'Completed',
+    CANCELLED: 'Cancelled',
+  };
+  return labels[status] ?? 'Update';
+}
+
+function staffNext(status: string) {
+  if (status === 'ACCEPTED') return { label: 'Start work', pending: 'Starting…' };
+  if (status === 'IN_PROGRESS') return { label: 'Work done', pending: 'Asking for the close code…' };
+  if (status === 'ASSIGNED' || status === 'SNOOZED') return { label: 'Accept task', pending: 'Accepting…' };
+  return null;
+}
+
+function StaffTaskSummary({ ticket, pending = false, locked = false, onTransition, onSnooze }: {
+  ticket: Ticket;
+  pending?: boolean;
+  locked?: boolean;
+  onTransition?: () => void;
+  onSnooze?: () => void;
+}) {
+  const next = staffNext(ticket.status);
+  return (
+    <article className="task-summary">
+      <div className="ticket-top">
+        <h2>Stall {ticket.locationParts.stall}</h2>
+        <span className={'status status-' + ticket.status.toLowerCase()}>{staffStatus(ticket.status)}</span>
+      </div>
+      <p>{ticket.locationParts.hall} · Zone {ticket.locationParts.zone}</p>
+      <p>{ticket.service}</p>
+      <p className="description">{ticket.description}</p>
+      <p className="next-action">{next ? `Next: ${next.label}` : staffStatus(ticket.status)}</p>
+      <p className="when-line">{ticket.status === 'CLOSED' && ticket.closedAt ? `Completed ${eventTime(ticket.closedAt)}` : `Raised ${eventTime(ticket.createdAt)}`}</p>
+      <div className="staff-actions">
+        <a href={'/staff/task/' + ticket.id}>Open task</a>
+        {next && onTransition ? <button type="button" className="primary" disabled={locked} onClick={onTransition}>{pending ? next.pending : next.label}</button> : null}
+        {ticket.status === 'ASSIGNED' && onSnooze ? <button type="button" disabled={locked} onClick={onSnooze}>10 min later</button> : null}
+      </div>
+    </article>
+  );
+}
+
+function StaffTaskDetail({ ticket, loading, error, actionPending, otpValue, otpError, otpSuccess, backHref, onTransition, onSnooze, onOtpChange, onVerify }: {
+  ticket?: Ticket;
+  loading: boolean;
+  error: string;
+  actionPending: boolean;
+  otpValue: string;
+  otpError: string;
+  otpSuccess: string;
+  backHref: string;
+  onTransition: () => void;
+  onSnooze: () => void;
+  onOtpChange: (next: string) => void;
+  onVerify: () => void;
+}) {
+  const next = ticket ? staffNext(ticket.status) : null;
+  return (
+    <section className="staff-detail" aria-label="Task details">
+      <a className="back" href={backHref}>Back to tasks</a>
+      {loading && !ticket ? <p className="empty-state">Loading task…</p> : null}
+      {!loading && !ticket ? <p className="form-error" role="alert">{error || 'This task is not on your list.'}</p> : null}
+      {ticket ? (
+        <>
+          <div className="ticket-top">
+            <h2>Stall {ticket.locationParts.stall}</h2>
+            <span className={'status status-' + ticket.status.toLowerCase()}>{staffStatus(ticket.status)}</span>
+          </div>
+          <p>{ticket.locationParts.hall} · Zone {ticket.locationParts.zone}</p>
+          <p>{ticket.service}</p>
+          <p className="description">{ticket.description}</p>
+          <p className="next-action">{next ? `Next: ${next.label}` : ticket.status === 'AWAITING_OTP' ? 'Next: ask for the completion code' : staffStatus(ticket.status)}</p>
+          <p className="when-line">{ticket.status === 'CLOSED' && ticket.closedAt ? `Completed ${eventTime(ticket.closedAt)}` : `Raised ${eventTime(ticket.createdAt)}`}</p>
+          {next ? (
+            <div className="staff-actions">
+              <button type="button" className="primary" disabled={actionPending} onClick={onTransition}>{actionPending ? next.pending : next.label}</button>
+              {ticket.status === 'ASSIGNED' ? <button type="button" disabled={actionPending} onClick={onSnooze}>10 min later</button> : null}
+            </div>
+          ) : null}
+          {ticket.status === 'AWAITING_OTP' ? (
+            <StaffOtpEntry
+              value={otpValue}
+              onChange={onOtpChange}
+              onSubmit={onVerify}
+              submitting={actionPending}
+              error={otpError}
+              success={otpSuccess}
+            />
+          ) : null}
+          <TicketActivity ticketId={ticket.id} />
+        </>
+      ) : null}
+    </section>
   );
 }
 
 const navByRole: Record<'HALL_MANAGER' | 'ADMIN', string[]> = {
-  HALL_MANAGER: ['Hall overview', 'Live tickets', 'Staff', 'Exceptions', 'Search'],
-  ADMIN: ['Command center', 'Tickets', 'Halls / Zones / Stalls', 'Workforce', 'Reports', 'Masters', 'Audit'],
+  HALL_MANAGER: ['Attention', 'Tickets', 'Queue', 'Staff'],
+  ADMIN: ['Overview', 'Tickets', 'Registrations', 'Workforce', 'Event setup', 'Reports', 'Audit'],
 };
+
+function adminSectionName(value: string | null) {
+  return ['Tickets', 'Workforce', 'Event setup', 'Reports', 'Audit'].includes(value ?? '') ? value ?? 'Overview' : 'Overview';
+}
+
+function attentionReason(ticket: Ticket): string | null {
+  return managerAttentionLabel({
+    status: ticket.status,
+    slaState: ticket.slaState,
+    priority: ticket.priority,
+    reopenCount: ticket.reopenCount,
+  });
+}
+
+function managementStatusIsSuccess(message: string) {
+  return message.startsWith('Export queued')
+    || message.startsWith('Created ')
+    || message.includes('sent for Admin approval')
+    || message.startsWith('Staff approved')
+    || message.startsWith('Staff request rejected')
+    || message.endsWith('created.')
+    || message.startsWith('SLA targets')
+    || message.includes('Temporary password must be changed')
+    || message.startsWith('Completion verified');
+}
+
+function managerNextStep(ticket: Ticket): string {
+  if (ticket.status === 'AWAITING_OTP' && ticket.capabilities.verifyStallOtp) return 'Enter the completion code';
+  if (ticket.status === 'QUEUED') return 'Move it ahead in the queue, with a reason';
+  if (['ASSIGNED', 'SNOOZED', 'ACCEPTED'].includes(ticket.status)) return 'Message the worker or reassign';
+  if (ticket.status === 'COMPLAINT_RAISED' || ticket.status === 'CLOSED' || ticket.status === 'ESCALATED') return 'Reopen with a reason';
+  if (ticket.status === 'IN_PROGRESS') return 'Follow the worker, or escalate with a reason';
+  if (ticket.status === 'NEW' || ticket.status === 'REOPENED') return 'It assigns when a free worker is on duty';
+  return 'Open the ticket';
+}
 
 type TimingRecord = {
   id: string;
@@ -1104,6 +917,7 @@ type TicketDetail = ApiTicket & {
 
 function duration(value: number | null | undefined) {
   if (value == null) return 'Pending';
+  if (!Number.isFinite(value) || value < 0) return 'Unavailable';
   if (value < 60) return value + 's';
   return Math.floor(value / 60) + 'm ' + String(value % 60).padStart(2, '0') + 's';
 }
@@ -1145,7 +959,7 @@ function CommandInsights({ metrics }: { metrics: OperationalMetrics }) {
     <>
       <section className="portfolio-list" aria-label="Hall status">
         <div className="section-title"><div><h2>Hall status</h2><p>Open backlog and critical exceptions for each hall in scope</p></div></div>
-        {(metrics.halls ?? []).length ? metrics.halls!.map((hall) => (
+        {metrics.halls == null ? <p className="empty-state">Hall figures have not loaded.</p> : metrics.halls.length ? metrics.halls.map((hall) => (
           <article key={hall.id}>
             <div><strong>{hall.code}</strong><span>{hall.name}</span></div>
             <div><span>Open</span><strong>{hall.open}</strong></div>
@@ -1163,7 +977,7 @@ function CommandInsights({ metrics }: { metrics: OperationalMetrics }) {
           <div><span>Complaint rate</span><strong>{percent(metrics.complaintRate)}</strong></div>
           <div><span>Staff utilization</span><strong>{percent(metrics.staffUtilization)}</strong></div>
         </article>
-        {(metrics.categoryBacklog ?? []).length ? metrics.categoryBacklog!.map((row) => (
+        {metrics.categoryBacklog == null ? <p className="empty-state">Category backlog has not loaded.</p> : metrics.categoryBacklog.length ? metrics.categoryBacklog.map((row) => (
           <article key={row.category}>
             <div><strong>{row.category.replaceAll('_', ' ')}</strong><span>Open category backlog</span></div>
             <div><span>Open</span><strong>{row.open}</strong></div>
@@ -1190,7 +1004,7 @@ function CommandInsights({ metrics }: { metrics: OperationalMetrics }) {
       </section>
       <section className="portfolio-list" aria-label="Workforce load">
         <div className="section-title"><div><h2>Workforce load</h2><p>Approved staff by hall and service</p></div></div>
-        {(metrics.workforceLoad ?? []).length ? metrics.workforceLoad!.map((row) => (
+        {metrics.workforceLoad == null ? <p className="empty-state">Workforce load has not loaded.</p> : metrics.workforceLoad.length ? metrics.workforceLoad.map((row) => (
           <article key={row.hallCode + row.category}>
             <div><strong>{row.hallCode}</strong><span>{row.category.replaceAll('_', ' ')}</span></div>
             <div><span>On duty</span><strong>{row.onDuty}</strong></div>
@@ -1208,7 +1022,7 @@ function eventTime(value: string | null | undefined, timezone = 'UTC') {
   return new Intl.DateTimeFormat('en-IN', { timeZone: timezone, dateStyle: 'medium', timeStyle: 'short' }).format(new Date(value));
 }
 
-function TicketDrawer({ ticket, timing, detail, eligibleStaff, onPing, onReassign, onReopen, onEscalate, onOverrideClose, onAdvance, onPrioritize, onSetServicePriority, onCancel, onVerifyOtp, canAdmin, canAdvance, canEmergencyClose, canVerifyOtp }: {
+function TicketDrawer({ ticket, timing, detail, eligibleStaff, onPing, onReassign, onReopen, onEscalate, onOverrideClose, onAdvance, onPrioritize, onSetServicePriority, onCancel, onVerifyOtp, canAdmin, canAdvance, canEmergencyClose, canVerifyOtp, activityOpen = false, onBack, actionError }: {
   ticket: Ticket;
   timing?: TimingRecord;
   detail?: TicketDetail;
@@ -1227,6 +1041,9 @@ function TicketDrawer({ ticket, timing, detail, eligibleStaff, onPing, onReassig
   canAdvance: boolean;
   canEmergencyClose: boolean;
   canVerifyOtp?: boolean;
+  activityOpen?: boolean;
+  onBack?: () => void;
+  actionError?: string;
 }) {
   const [pendingAction, setPendingAction] = useState<'ping' | 'reassign' | 'reopen' | 'escalate' | 'override' | 'prioritize' | 'service-priority' | 'cancel' | null>(null);
   const [submitting, setSubmitting] = useState(false);
@@ -1246,19 +1063,25 @@ function TicketDrawer({ ticket, timing, detail, eligibleStaff, onPing, onReassig
     ['Accepted', timing?.firstAcceptedAt ?? detail?.firstAcceptedAt, timing?.assignToAcceptSeconds != null ? duration(timing.assignToAcceptSeconds) + ' after assignment' : null],
     ['Work started', timing?.firstStartedAt ?? detail?.firstStartedAt, timing?.mobilizationSeconds != null ? duration(timing.mobilizationSeconds) + ' after acceptance' : null],
     ['Completion requested', timing?.completionRequestedAt ?? detail?.completionRequestedAt, timing?.activeWorkSeconds != null ? duration(timing.activeWorkSeconds) + ' work duration' : null],
-    ['Closed', timing?.closedAt ?? detail?.closedAt, timing?.otpWaitSeconds != null ? duration(timing.otpWaitSeconds) + ' verification wait' : (ticket.status === 'AWAITING_OTP' ? 'Pending verification' : null)],
+    ['Closed', ticket.status === 'CLOSED' ? (timing?.closedAt ?? detail?.closedAt) : null, ticket.status === 'CLOSED' && timing?.otpWaitSeconds != null ? duration(timing.otpWaitSeconds) + ' verification wait' : (ticket.status === 'AWAITING_OTP' ? 'Pending verification' : null)],
   ];
+  const overrideEvent = [...(detail?.events ?? [])].reverse().find((event) => event.eventType === 'QUEUE_PRIORITY_OVERRIDDEN');
+  const overrideReason = overrideEvent && overrideEvent.metadata && typeof overrideEvent.metadata === 'object' && 'reason' in overrideEvent.metadata
+    ? String((overrideEvent.metadata as { reason?: unknown }).reason ?? '')
+    : '';
   return (
     <aside className="drawer" aria-label={'Ticket ' + ticket.no + ' detail'}>
+      {onBack ? <button type="button" onClick={onBack}>Back to the list</button> : null}
       <div className="drawer-head"><div><span className="eyebrow">{ticket.no}</span><h2>{ticket.service}</h2></div><Status value={ticket.status} audience="manager" /></div>
       <p className="description">{ticket.description}</p>
-      <div className="drawer-location location-emphasis"><span>{ticket.locationParts.hall} · {ticket.locationParts.zone}</span><strong>Stall {ticket.locationParts.stall}</strong>{ticket.servicePriority && <span>Service priority {ticket.servicePriority}</span>}</div>
-      <div className="cycles"><h3>Assignment</h3><div><strong>{detail?.currentAssignee?.name ?? (ticket.status === 'CLOSED' || ticket.status === 'CANCELLED' ? (detail?.lastAssignee?.name ? `Last handled by ${detail.lastAssignee.name}` : ticket.assignee) : ticket.assignee)}</strong><span>{detail?.currentAssignee ? 'Current assignee' : (detail?.lastAssignee ? 'Last assignee' : 'Queue / ownership')}</span></div></div>
+      <div className="ticket-meta"><TimingFacts ticket={ticket} /></div>
+      <div className="drawer-location location-emphasis"><span>{ticket.locationParts.hall} · {ticket.locationParts.zone}</span><strong>Stall {ticket.locationParts.stall}</strong>{ticket.servicePriority && <span>Stall priority {ticket.servicePriority}</span>}{ticket.priority ? <span>Urgent</span> : null}<span>SLA {ticket.slaState}</span>{ticket.queuePriorityOverrideAt ? <span>Moved ahead in the queue{overrideReason ? `: ${overrideReason}` : ''}</span> : null}</div>
+      <div className="cycles"><h3>Assignment</h3><div><strong>{detail?.currentAssignee?.name ?? detail?.lastAssignee?.name ?? ticket.assignee}</strong><span>{detail?.currentAssignee ? 'Current assignee' : (detail?.lastAssignee ? 'Last assignee' : 'Queue / ownership')}</span></div></div>
       <div className="timing"><h3>Service timing</h3><div className="timing-strip"><span><b>{duration(timing?.raiseToAssignSeconds)}</b>Dispatch</span><span><b>{duration(timing?.assignToAcceptSeconds)}</b>Response</span><span><b>{duration(timing?.mobilizationSeconds)}</b>Mobilize</span><span><b>{duration(timing?.activeWorkSeconds)}</b>Work</span><span><b>{duration(timing?.otpWaitSeconds)}</b>OTP wait</span><span><b>{duration(timing?.totalResolutionSeconds)}</b>Total</span></div></div>
       <div className="timeline"><h3>Lifecycle milestones</h3>{milestones.map(([event, time, relative], index) => <div key={event} className="timeline-item"><i className={time ? 'active' : ''}></i><div><strong>{event}</strong><span>{time ? eventTime(time, timing?.eventTimezone) : (event === 'Closed' && ticket.status === 'AWAITING_OTP' ? 'Pending verification' : '—')}</span>{relative && <span>{relative}</span>}</div><time>{index === 0 ? 'Event time' : ''}</time></div>)}</div>
       {!!timing?.workCycles.length && <div className="cycles"><h3>Work cycles</h3>{timing.workCycles.map((cycle) => <div key={cycle.attempt}><strong>Attempt {cycle.attempt}</strong><span>{eventTime(cycle.assignedAt, timing.eventTimezone)} · {cycle.releasedAt ? 'Completed/released' : 'Active'}</span></div>)}</div>}
       {!!detail?.complaints.length && <div className="cycles"><h3>Complaints</h3>{detail.complaints.map((complaint) => <div key={complaint.id}><strong>{complaint.reasonCode.replaceAll('_', ' ')}</strong><span>{complaint.comment || 'No additional note'} · {eventTime(complaint.createdAt, timing?.eventTimezone)}</span></div>)}</div>}
-      <details className="complaint-disclosure"><summary>Activity</summary><TicketActivity ticketId={ticket.id} /></details>
+      {activityOpen ? <section aria-label="Activity"><TicketActivity ticketId={ticket.id} /></section> : <details className="complaint-disclosure"><summary>Activity</summary><TicketActivity ticketId={ticket.id} /></details>}
       {canVerifyOtp && ticket.status === 'AWAITING_OTP' && onVerifyOtp && (
         <StaffOtpEntry
           value={otpValue}
@@ -1286,11 +1109,11 @@ function TicketDrawer({ ticket, timing, detail, eligibleStaff, onPing, onReassig
       )}
       <div className="drawer-actions">
         {canAdvance && ticket.service.startsWith('HALL MANAGER') && ['ASSIGNED', 'SNOOZED', 'ACCEPTED', 'IN_PROGRESS'].includes(ticket.status) && <button className="primary" onClick={onAdvance}>{ticket.status === 'ACCEPTED' ? 'Start work' : ticket.status === 'IN_PROGRESS' ? 'Request completion' : 'Accept'}</button>}
-        {['ASSIGNED', 'SNOOZED', 'ACCEPTED'].includes(ticket.status) && <><button onClick={() => setPendingAction('ping')}>Ping staff</button><button onClick={() => setPendingAction('reassign')}>Reassign</button></>}
-        {['CLOSED', 'COMPLAINT_RAISED'].includes(ticket.status) && <button onClick={() => setPendingAction('reopen')}>Reopen</button>}
-        {ticket.status === 'QUEUED' && <button onClick={() => setPendingAction('prioritize')}>Move ahead</button>}
-        {['NEW', 'QUEUED', 'REOPENED'].includes(ticket.status) && <button onClick={() => setPendingAction('service-priority')}>Set service priority</button>}
-        {['SNOOZED', 'IN_PROGRESS', 'COMPLAINT_RAISED'].includes(ticket.status) && <button className="critical-button" onClick={() => setPendingAction('escalate')}>Escalate</button>}
+        {['ASSIGNED', 'SNOOZED', 'ACCEPTED'].includes(ticket.status) && <><button onClick={() => setPendingAction('ping')}>Message the worker</button><button onClick={() => setPendingAction('reassign')}>Reassign worker</button></>}
+        {['CLOSED', 'COMPLAINT_RAISED', 'ESCALATED'].includes(ticket.status) && <button onClick={() => setPendingAction('reopen')}>Reopen with a reason</button>}
+        {ticket.status === 'QUEUED' && <button onClick={() => setPendingAction('prioritize')}>Move ahead in the queue</button>}
+        {['NEW', 'QUEUED', 'REOPENED'].includes(ticket.status) && <button onClick={() => setPendingAction('service-priority')}>Change stall priority</button>}
+        {['SNOOZED', 'IN_PROGRESS', 'COMPLAINT_RAISED'].includes(ticket.status) && <button className="critical-button" onClick={() => setPendingAction('escalate')}>Escalate with a reason</button>}
         {canEmergencyClose && ['AWAITING_OTP', 'ESCALATED'].includes(ticket.status) && <button className="critical-button" onClick={() => setPendingAction('override')}>Emergency close</button>}
         {canAdmin && ['NEW', 'QUEUED'].includes(ticket.status) && <button className="critical-button" onClick={() => setPendingAction('cancel')}>Cancel</button>}
       </div>
@@ -1317,43 +1140,97 @@ function TicketDrawer({ ticket, timing, detail, eligibleStaff, onPing, onReassig
         {pendingAction === 'reassign' && <label>Eligible worker<select name="staffId" required disabled={submitting}><option value="">Choose worker</option>{eligibleStaff.map((membership) => <option key={membership.user.id} value={membership.user.id}>{membership.user.name}{membership.user.employeeCode ? ` · ${membership.user.employeeCode}` : ''} · {membership.pool.category} {membership.pool.subtype}</option>)}</select></label>}
         {pendingAction === 'service-priority' && <label>Service priority<select name="servicePriority" required defaultValue={ticket.servicePriority ?? 'MEDIUM'} disabled={submitting}><option value="HIGH">High</option><option value="MEDIUM">Medium</option><option value="LOW">Low</option></select></label>}
         <label>{pendingAction === 'ping' ? 'Message' : 'Required reason'}<textarea name="reason" required minLength={3} maxLength={500} disabled={submitting} /></label>
-        <div><button type="button" disabled={submitting} onClick={() => setPendingAction(null)}>Back</button><button className={['override', 'cancel'].includes(pendingAction) ? 'critical-button' : 'primary'} type="submit" disabled={submitting}>{submitting ? 'Confirming…' : 'Confirm action'}</button></div>
+        {actionError ? <p className="form-error" role="alert">{actionError}</p> : null}
+        <div><button type="button" disabled={submitting} onClick={() => setPendingAction(null)}>Back</button><button className={['override', 'cancel'].includes(pendingAction) ? 'critical-button' : 'primary'} type="submit" disabled={submitting}>{submitting ? 'Saving…' : 'Confirm'}</button></div>
       </form>}
     </aside>
   );
 }
 
 export function ManagementWorkspace({ role }: { role: 'HALL_MANAGER' | 'ADMIN' }) {
-  const profile = useProfile();
+  const profileState = useProfileState();
+  const profile = profileState.profile as Profile | null;
+  const searchParams = useSearchParams();
+  const router = useRouter();
   const [selected, setSelected] = useState<Ticket | null>(null);
-  const [statusFilter, setStatusFilter] = useState('');
-  const [categoryFilter, setCategoryFilter] = useState('');
-  const [hallFilter, setHallFilter] = useState('');
+  const [statusFilter, setStatusFilter] = useState(role === 'ADMIN' ? (searchParams.get('status') ?? '') : '');
+  const [categoryFilter, setCategoryFilter] = useState(role === 'ADMIN' ? (searchParams.get('category') ?? '') : '');
+  const [hallFilter, setHallFilter] = useState(role === 'ADMIN' ? (searchParams.get('hall') ?? '') : '');
+  const [listView, setListView] = useState<'all' | 'active'>(role === 'ADMIN' && searchParams.get('view') === 'active' ? 'active' : 'all');
+  const [stallFilter, setStallFilter] = useState(role === 'ADMIN' ? (searchParams.get('stall') ?? '') : '');
   const [createdFrom, setCreatedFrom] = useState('');
   const [createdTo, setCreatedTo] = useState('');
-  const [search, setSearch] = useState('');
-  const [debouncedSearch, setDebouncedSearch] = useState('');
+  const [search, setSearch] = useState(role === 'ADMIN' ? (searchParams.get('q') ?? '') : '');
+  const [debouncedSearch, setDebouncedSearch] = useState(role === 'ADMIN' ? (searchParams.get('q') ?? '') : '');
   useEffect(() => {
     const timer = setTimeout(() => setDebouncedSearch(search.trim()), 300);
     return () => clearTimeout(timer);
   }, [search]);
+  const adminQuery = searchParams.toString();
+  useEffect(() => {
+    if (role !== 'ADMIN' || searchParams.get('section') !== 'Tickets') return;
+    const current = new URLSearchParams(adminQuery).get('q') ?? '';
+    if (current === debouncedSearch) return;
+    const params = new URLSearchParams(adminQuery);
+    params.set('section', 'Tickets');
+    if (debouncedSearch) params.set('q', debouncedSearch);
+    else params.delete('q');
+    router.push('/admin?' + params.toString(), { scroll: false });
+  }, [debouncedSearch, role, adminQuery, router, searchParams]);
+  useEffect(() => {
+    if (role !== 'ADMIN') return;
+    setActiveSection(adminSectionName(searchParams.get('section')));
+    setStatusFilter(searchParams.get('status') ?? '');
+    setCategoryFilter(searchParams.get('category') ?? '');
+    setHallFilter(searchParams.get('hall') ?? '');
+    setCreatedFrom(searchParams.get('from') ?? '');
+    setCreatedTo(searchParams.get('to') ?? '');
+    setListView(searchParams.get('view') === 'active' ? 'active' : 'all');
+    setStallFilter(searchParams.get('stall') ?? '');
+    const q = searchParams.get('q') ?? '';
+    setSearch((current) => current.trim() === q || debouncedSearch === q ? current : q);
+    setDebouncedSearch((current) => current === q ? current : q);
+  }, [role, adminQuery, searchParams, debouncedSearch]);
   const ticketQuery = new URLSearchParams({
-    view: 'all',
+    view: role === 'ADMIN' ? listView : 'all',
     ...(statusFilter ? { status: statusFilter } : {}),
     ...(categoryFilter ? { category: categoryFilter } : {}),
     ...(hallFilter ? { hallId: hallFilter } : {}),
+    ...(stallFilter ? { stallId: stallFilter } : {}),
     ...(createdFrom ? { createdFrom: new Date(createdFrom).toISOString() } : {}),
     ...(createdTo ? { createdTo: new Date(createdTo).toISOString() } : {}),
     ...(debouncedSearch ? { search: debouncedSearch } : {}),
   }).toString();
-  const { items, total, nextCursor, loading, error: loadError, refresh, loadMore, connection, lastUpdatedAt } = useApiTickets(ticketQuery);
+  const adminOnTickets = role !== 'ADMIN' || searchParams.get('section') === 'Tickets';
+  const { items, total, nextCursor, loading, error: loadError, stale: ticketsStale, refresh, loadMore, connection, lastUpdatedAt } = useApiTickets(ticketQuery, { enabled: adminOnTickets });
+  const [adminConnection, setAdminConnection] = useState<'connecting' | 'live' | 'reconnecting'>('connecting');
+  useEffect(() => {
+    if (role !== 'ADMIN') return;
+    return subscribeRealtime({ onConnection: setAdminConnection, onTicket: () => undefined });
+  }, [role]);
+  const [subtypeFilter, setSubtypeFilter] = useState('');
+  const queueQuery = new URLSearchParams({
+    view: 'queued',
+    limit: '50',
+    ...(categoryFilter ? { category: categoryFilter } : {}),
+    ...(subtypeFilter ? { subtype: subtypeFilter } : {}),
+    ...(hallFilter ? { hallId: hallFilter } : {}),
+    ...(debouncedSearch ? { search: debouncedSearch } : {}),
+  }).toString();
+  const attentionQuery = 'view=attention&limit=50';
+  const managerLists = role === 'HALL_MANAGER';
+  const { items: queuedItems, total: queueTotal, nextCursor: queueCursor, loading: queueLoading, error: queueError, stale: queueStale, refresh: refreshQueue, loadMore: loadMoreQueue } = useApiTickets(queueQuery, { enabled: managerLists });
+  const { items: attentionSource, total: attentionTotal, nextCursor: attentionCursor, loading: attentionLoading, error: attentionError, stale: attentionStale, refresh: refreshAttention, loadMore: loadMoreAttention } = useApiTickets(attentionQuery, { enabled: managerLists });
   const [timings, setTimings] = useState<Record<string, TimingRecord>>({});
   const [liveMetrics, setLiveMetrics] = useState<OperationalMetrics>({});
+  const [metricsStale, setMetricsStale] = useState(false);
   const [detail, setDetail] = useState<TicketDetail>();
   const [managementError, setManagementError] = useState('');
   const [notifications, setNotifications] = useState<Array<{ id: string; type: string; readAt: string | null; sentAt: string; ticketId?: string | null; payload?: { summary?: string } | null }>>([]);
   const [managerToast, setManagerToast] = useState<{ text: string; ticketId?: string | null } | null>(null);
   const seenManagerAlerts = useRef(new Set<string>());
+  const panelTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const panelStamp = useRef(0);
   const [showNotifications, setShowNotifications] = useState(false);
   const [workforce, setWorkforce] = useState<Array<{
     id?: string;
@@ -1392,7 +1269,7 @@ export function ManagementWorkspace({ role }: { role: 'HALL_MANAGER' | 'ADMIN' }
   const [personRole, setPersonRole] = useState<'STAFF' | 'HALL_MANAGER'>('STAFF');
   const [personHallId, setPersonHallId] = useState('');
   const [personServiceCategory, setPersonServiceCategory] = useState('HOUSE_HELP');
-  const [masterForm, setMasterForm] = useState<'hall' | 'zone' | 'stall' | null>(null);
+  const [masterForm, setMasterForm] = useState<'hall' | 'zone' | null>(null);
   const [masterFormError, setMasterFormError] = useState('');
   const [masterSubmitting, setMasterSubmitting] = useState(false);
   const [slaEditPoolId, setSlaEditPoolId] = useState<string | null>(null);
@@ -1403,9 +1280,11 @@ export function ManagementWorkspace({ role }: { role: 'HALL_MANAGER' | 'ADMIN' }
   const [rejectError, setRejectError] = useState('');
   const [capacityEditUserId, setCapacityEditUserId] = useState<string | null>(null);
   const [capacityValue, setCapacityValue] = useState('1');
-  const [activeSection, setActiveSection] = useState(navByRole[role][0]);
+  const [activeSection, setActiveSection] = useState(role === 'ADMIN' ? adminSectionName(searchParams.get('section')) : navByRole[role][0]);
   const [exceptions, setExceptions] = useState<Ticket[]>([]);
-  const [auditEvents, setAuditEvents] = useState<Array<{ id: string; eventType: string; createdAt: string; actor: { name: string } | null; ticket: { publicNo: string } }>>([]);
+  const [auditTicketQuery, setAuditTicketQuery] = useState('');
+  const [auditActionQuery, setAuditActionQuery] = useState('');
+  const auditHistory = useAuditHistory(role === 'ADMIN' && activeSection === 'Audit', auditTicketQuery, auditActionQuery);
   const [masters, setMasters] = useState<Array<{
     id: string;
     name: string;
@@ -1426,28 +1305,52 @@ export function ManagementWorkspace({ role }: { role: 'HALL_MANAGER' | 'ADMIN' }
     setWorkforce([]);
     setPendingApprovals([]);
     setExceptions([]);
-    setAuditEvents([]);
     setMasters([]);
     setExports([]);
   });
-  const title = role === 'HALL_MANAGER' ? (profile?.scopes[0]?.hall?.name ?? 'Hall') + ' operations' : 'Event command center';
-  const showLive = ['Command center', 'Hall overview', 'Tickets', 'Live tickets', 'Search'].includes(activeSection);
-  const showCommand = activeSection === 'Command center' || activeSection === 'Hall overview';
+  const title = role === 'HALL_MANAGER' ? (profile?.scopes[0]?.hall?.name ?? 'Hall') + ' operations' : activeSection;
+  const showLive = activeSection === 'Tickets';
+  const eventName = profile?.scopes[0]?.event.name ?? 'EveOps event';
   const hallOptions = liveMetrics.halls ?? [];
-  const filtersActive = Boolean(statusFilter || categoryFilter || hallFilter || createdFrom || createdTo || search);
-  const metrics = [
-    { label: 'Open now', value: String(liveMetrics.open ?? '—') },
-    { label: 'Queued', value: String(liveMetrics.queued ?? '—') },
-    { label: 'Response overdue', value: String(liveMetrics.overdue ?? '—'), critical: true },
-    { label: 'Escalated & complaints', value: liveMetrics.open == null && liveMetrics.queued == null ? '—' : String((liveMetrics.escalated ?? 0) + (liveMetrics.complaints ?? 0)), critical: true },
-    { label: 'Closed today', value: String(liveMetrics.closedToday ?? '—') },
-    { label: 'SLA breached', value: String(liveMetrics.slaBreached ?? '—'), critical: true },
-    { label: 'Avg. response', value: duration(liveMetrics.avgResponseSeconds) },
-  ];
+  const filtersActive = Boolean(statusFilter || categoryFilter || subtypeFilter || hallFilter || createdFrom || createdTo || search);
+  const scopedHallCount = new Set((profile?.scopes ?? []).flatMap((scope) => scope.hall?.id ? [scope.hall.id] : [])).size;
+  const subtypeChoices = categoryFilter === 'ELECTRICAL' ? ['Lighting', 'NCP'] : categoryFilter === 'HOUSE_HELP' || categoryFilter === 'HALL_MANAGER' ? ['General'] : [];
+
+  const attentionItems = role === 'HALL_MANAGER' ? attentionSource : [];
 
   useEffect(() => {
-    setSelected((current) => current ? items.find((ticket) => ticket.id === current.id) ?? null : items[0] ?? null);
-  }, [items]);
+    if (role === 'HALL_MANAGER') {
+      setSelected((current) => {
+        if (!current) return null;
+        return items.find((ticket) => ticket.id === current.id)
+          ?? attentionSource.find((ticket) => ticket.id === current.id)
+          ?? queuedItems.find((ticket) => ticket.id === current.id)
+          ?? current;
+      });
+      return;
+    }
+    setSelected((current) => current ? items.find((ticket) => ticket.id === current.id) ?? current : null);
+  }, [items, attentionSource, queuedItems, role]);
+
+  useEffect(() => {
+    if (role !== 'ADMIN' || searchParams.get('section') !== 'Tickets') return;
+    const ticketId = searchParams.get('ticket');
+    if (!ticketId) return;
+    const listed = items.find((ticket) => ticket.id === ticketId);
+    if (listed) {
+      setSelected((current) => current?.id === listed.id ? current : listed);
+      return;
+    }
+    let cancelled = false;
+    void apiFetch('/api/tickets/' + encodeURIComponent(ticketId), { credentials: 'include', cache: 'no-store' })
+      .then(async (response) => {
+        if (cancelled || !response.ok) return;
+        const body = await response.json() as ApiTicket;
+        if (body.id && body.publicNo && body.hall && body.stall) setSelected(mapTicket(body));
+      })
+      .catch(() => undefined);
+    return () => { cancelled = true; };
+  }, [role, adminQuery, items, searchParams]);
 
   const loadManagement = useCallback(async () => {
     try {
@@ -1463,43 +1366,66 @@ export function ManagementWorkspace({ role }: { role: 'HALL_MANAGER' | 'ADMIN' }
       apiFetch('/api/management/timing', { credentials: 'include', cache: 'no-store' }),
       ]);
       const errors: string[] = [];
+      if (metricResponse.status === 401 || timingResponse.status === 401) {
+        setManagementError('Session expired');
+        return;
+      }
       if (metricResponse.ok) {
         setLiveMetrics(await metricResponse.json() as OperationalMetrics);
+        setMetricsStale(false);
       } else {
-        setLiveMetrics({});
-        errors.push('Live metrics are unavailable');
+        setMetricsStale(true);
+        errors.push(metricResponse.status === 429 ? 'Live metrics are busy right now. Showing the last loaded summary.' : metricResponse.status === 403 ? 'You no longer have access to these figures.' : 'Live metrics are unavailable');
       }
       if (timingResponse.ok) {
         const values = await timingResponse.json() as TimingRecord[];
         setTimings(Object.fromEntries(values.map((value) => [value.id, value])));
       } else {
-        setTimings({});
-        errors.push('Timing data is unavailable');
+        setMetricsStale(true);
+        errors.push(timingResponse.status === 429 ? 'Timing data is busy right now. Showing the last loaded timing.' : timingResponse.status === 403 ? 'You no longer have access to timing data.' : 'Timing data is unavailable');
       }
-      if (errors.length) setManagementError(errors.join('. '));
+      if (errors.length) setManagementError(errors.join(' '));
     } catch {
-      setLiveMetrics({});
-      setTimings({});
-      setManagementError('Management APIs are unavailable');
+      setMetricsStale(true);
+      setManagementError('Management APIs are unavailable. Showing the last loaded summary.');
     }
   }, [reportRange, reportFrom, reportTo]);
-  useEffect(() => { void loadManagement(); }, [loadManagement, lastUpdatedAt]);
+  useEffect(() => { void loadManagement(); }, [loadManagement]);
+  const metricsTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const metricsStamp = useRef(0);
+  useEffect(() => {
+    const section = searchParams.get('section');
+    if (role === 'ADMIN' && section && !['Overview', 'Reports'].includes(section)) return;
+    if (!lastUpdatedAt || metricsTimer.current) return;
+    const elapsed = Date.now() - metricsStamp.current;
+    const wait = metricsStamp.current === 0 ? 0 : Math.max(0, 8000 - elapsed);
+    metricsTimer.current = setTimeout(() => {
+      metricsTimer.current = null;
+      metricsStamp.current = Date.now();
+      void loadManagement();
+    }, wait);
+  }, [lastUpdatedAt, loadManagement, role, searchParams]);
 
   useEffect(() => {
     async function loadOperationalPanels() {
       const requests = [
         apiFetch('/api/workforce', { credentials: 'include', cache: 'no-store' }),
         apiFetch('/api/management/exceptions', { credentials: 'include', cache: 'no-store' }),
-        apiFetch('/api/management/audit', { credentials: 'include', cache: 'no-store' }),
         ...(role === 'ADMIN' ? [apiFetch('/api/workforce/pending', { credentials: 'include', cache: 'no-store' })] : []),
       ];
       const responses = await Promise.all(requests);
       if (responses[0].ok) setWorkforce(await responses[0].json() as typeof workforce);
       if (responses[1].ok) setExceptions(((await responses[1].json()) as ApiTicket[]).map(mapTicket));
-      if (responses[2].ok) setAuditEvents(await responses[2].json() as typeof auditEvents);
-      if (role === 'ADMIN' && responses[3]?.ok) setPendingApprovals(await responses[3].json() as typeof pendingApprovals);
+      if (role === 'ADMIN' && responses[2]?.ok) setPendingApprovals(await responses[2].json() as typeof pendingApprovals);
     }
-    void loadOperationalPanels().catch(() => setManagementError('Operational panels could not be loaded'));
+    if (panelTimer.current) return;
+    const elapsed = Date.now() - panelStamp.current;
+    const wait = panelStamp.current === 0 ? 0 : Math.max(0, 8000 - elapsed);
+    panelTimer.current = setTimeout(() => {
+      panelTimer.current = null;
+      panelStamp.current = Date.now();
+      void loadOperationalPanels().catch(() => setManagementError('Operational panels could not be loaded. Showing the last loaded records.'));
+    }, wait);
   }, [lastUpdatedAt, role]);
 
   async function refreshWorkforcePanels() {
@@ -1522,6 +1448,18 @@ export function ManagementWorkspace({ role }: { role: 'HALL_MANAGER' | 'ADMIN' }
   }, [role]);
 
   useEffect(() => {
+    if (role !== 'ADMIN') return;
+    if (!exports.some((job) => job.status === 'PENDING' || job.status === 'PROCESSING')) return;
+    const timer = window.setTimeout(() => {
+      void apiFetch('/api/management/exports', { credentials: 'include', cache: 'no-store' }).then(async (response) => {
+        if (response.status === 429) return;
+        if (response.ok) setExports(await response.json() as typeof exports);
+      });
+    }, 2000);
+    return () => window.clearTimeout(timer);
+  }, [role, exports]);
+
+  useEffect(() => {
     if (!showAddPerson || personHallId) return;
     const halls = role === 'ADMIN'
       ? masters.flatMap((event) => event.halls)
@@ -1537,23 +1475,28 @@ export function ManagementWorkspace({ role }: { role: 'HALL_MANAGER' | 'ADMIN' }
       .catch(() => setManagementError('Ticket detail could not be loaded'));
   }, [selected, lastUpdatedAt]);
 
+  const notificationStamp = useRef(0);
   useEffect(() => {
+    if (role === 'ADMIN' && notificationStamp.current) return;
+    if (role === 'HALL_MANAGER' && lastUpdatedAt && Date.now() - notificationStamp.current < 8000) return;
+    notificationStamp.current = Date.now();
     void apiFetch('/api/notifications', { credentials: 'include', cache: 'no-store' })
       .then(async (response) => {
+        if (response.status === 429) return;
         if (!response.ok) return;
         const rows = await response.json() as typeof notifications;
         setNotifications(rows);
+        if (role !== 'HALL_MANAGER') return;
         const fresh = rows.find((row) => !row.readAt && ['TICKET_CREATED', 'TICKET_REOPENED'].includes(row.type) && !seenManagerAlerts.current.has(row.id) && Date.now() - new Date(row.sentAt).getTime() < 120000);
         if (!fresh) return;
         for (const row of rows) seenManagerAlerts.current.add(row.id);
         setManagerToast({ text: fresh.payload?.summary ?? (fresh.type === 'TICKET_REOPENED' ? 'Ticket opened again' : 'New request'), ticketId: fresh.ticketId });
-        if (soundEnabled()) void playOnce('manager:' + fresh.id);
       })
       .catch(() => undefined);
-  }, [lastUpdatedAt]);
+  }, [lastUpdatedAt, role]);
   async function openManagerAlert(alert: { ticketId?: string | null }) {
     setManagerToast(null);
-    setActiveSection(role === 'ADMIN' ? 'Tickets' : 'Live tickets');
+    setActiveSection('Tickets');
     if (!alert.ticketId) return;
     const existing = items.find((ticket) => ticket.id === alert.ticketId);
     if (existing) { setSelected(existing); return; }
@@ -1577,7 +1520,7 @@ export function ManagementWorkspace({ role }: { role: 'HALL_MANAGER' | 'ADMIN' }
     });
     if (!response.ok) { setManagementError(await apiErrorMessage(response, 'Ticket action failed')); return false; }
     setManagementError('');
-    await refresh();
+    await Promise.all([refresh(), refreshQueue(), refreshAttention()]);
     return true;
   }
 
@@ -1598,7 +1541,7 @@ export function ManagementWorkspace({ role }: { role: 'HALL_MANAGER' | 'ADMIN' }
       return false;
     }
     setManagementError('');
-    await refresh();
+    await Promise.all([refresh(), refreshQueue(), refreshAttention()]);
     return true;
   }
 
@@ -1609,7 +1552,13 @@ export function ManagementWorkspace({ role }: { role: 'HALL_MANAGER' | 'ADMIN' }
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ format: 'CSV', filters: { status: statusFilter || undefined, category: categoryFilter || undefined, search: search || undefined }, columns: [] }),
     });
-    setManagementError(response.ok ? 'Export queued. It will appear in Reports when ready.' : 'Export could not be queued');
+    if (!response.ok) {
+      setManagementError('Export could not be queued');
+      return;
+    }
+    setManagementError('Export queued. It will appear in Reports when ready.');
+    const jobs = await apiFetch('/api/management/exports', { credentials: 'include', cache: 'no-store' });
+    if (jobs.ok) setExports(await jobs.json() as typeof exports);
   }
 
   async function createMaster(event: FormEvent<HTMLFormElement>) {
@@ -1628,16 +1577,9 @@ export function ManagementWorkspace({ role }: { role: 'HALL_MANAGER' | 'ADMIN' }
       body.code = String(values.get('code') ?? '').trim();
       body.name = String(values.get('name') ?? '').trim();
       body.status = String(values.get('status') ?? 'ACTIVE');
-    } else if (masterForm === 'zone') {
+    } else {
       body.hallId = String(values.get('hallId') ?? '');
       body.code = String(values.get('code') ?? '').trim();
-    } else {
-      body.zoneId = String(values.get('zoneId') ?? '');
-      body.stallCode = String(values.get('stallCode') ?? '').trim();
-      body.exhibitorName = String(values.get('exhibitorName') ?? '').trim();
-      body.contact = String(values.get('contact') ?? '').trim() || undefined;
-      body.servicePriority = String(values.get('servicePriority') ?? 'MEDIUM');
-      body.active = String(values.get('active') ?? 'true') === 'true';
     }
     const response = await apiFetch('/api/management/masters/' + masterForm, {
       method: 'POST',
@@ -1684,8 +1626,8 @@ export function ManagementWorkspace({ role }: { role: 'HALL_MANAGER' | 'ADMIN' }
       return;
     }
     const password = String(values.get('password') ?? '');
-    if (password.length < 10) {
-      setPersonFormError('Temporary password must be at least 10 characters.');
+    if (password.length < NEW_PASSWORD_MIN_LENGTH || password.length > PASSWORD_MAX_BYTES || !NEW_PASSWORD_PATTERN.test(password)) {
+      setPersonFormError(`Temporary password must be ${NEW_PASSWORD_MIN_LENGTH} to ${PASSWORD_MAX_BYTES} characters and include a letter and a number.`);
       setPersonSubmitting(false);
       return;
     }
@@ -1834,27 +1776,75 @@ export function ManagementWorkspace({ role }: { role: 'HALL_MANAGER' | 'ADMIN' }
     if (mastersResponse.ok) setMasters(await mastersResponse.json());
   }
 
+  const eligibleStaff = workforce.filter((membership) => membership.availability === 'ON_DUTY' && (membership.user.approvalStatus ?? 'APPROVED') === 'APPROVED' && membership.user.status !== 'DISABLED');
+  const ticketPanel = selected ? (
+    <TicketDrawer
+      ticket={selected}
+      timing={timings[selected.id]}
+      detail={detail}
+      canAdmin={role === 'ADMIN'}
+      canEmergencyClose={selected.capabilities.emergencyClose}
+      canAdvance={selected.capabilities.advanceHallManagerWork}
+      canVerifyOtp={!!selected.capabilities.verifyStallOtp}
+      eligibleStaff={eligibleStaff}
+      activityOpen={role === 'HALL_MANAGER' || role === 'ADMIN'}
+      onBack={role === 'HALL_MANAGER' ? () => setSelected(null) : () => { setSelected(null); const params = new URLSearchParams(searchParams.toString()); params.delete('ticket'); router.push('/admin?' + params.toString(), { scroll: false }); }}
+      actionError={managementError && !managementStatusIsSuccess(managementError) ? managementError : ''}
+      onAdvance={() => void runTicketAction('/transition', { to: selected.status === 'ACCEPTED' ? 'IN_PROGRESS' : selected.status === 'IN_PROGRESS' ? 'AWAITING_OTP' : 'ACCEPTED' })}
+      onPing={(message) => runTicketAction('/ping', { message })}
+      onReassign={reassignSelected}
+      onReopen={(reason) => transitionSelected('REOPENED', reason)}
+      onEscalate={(reason) => transitionSelected('ESCALATED', reason)}
+      onPrioritize={(reason) => runTicketAction('/prioritize', { reason })}
+      onSetServicePriority={(servicePriority, reason) => runTicketAction('/service-priority', { servicePriority, reason })}
+      onCancel={(reason) => transitionSelected('CANCELLED', reason)}
+      onOverrideClose={(reason) => runTicketAction('/override-close', { reason })}
+      onVerifyOtp={async (otp) => {
+        const response = await apiFetch('/api/tickets/' + selected.id + '/otp/verify', {
+          method: 'POST',
+          credentials: 'include',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ otp }),
+        });
+        if (!response.ok) {
+          setManagementError(await apiErrorMessage(response, 'Could not verify the completion code'));
+          return false;
+        }
+        setManagementError('Completion verified. Ticket closed.');
+        await Promise.all([refresh(), refreshQueue(), refreshAttention()]);
+        return true;
+      }}
+    />
+  ) : null;
+
   return (
+    <OperationalClock timeZone={profile?.scopes[0]?.event.timezone}>
     <div className="app-shell">
-      <aside className="sidebar">
+      <aside className={role === 'HALL_MANAGER' ? 'sidebar hall-manager' : 'sidebar admin'}>
         <div className="brand"><span>E</span>EveOps</div>
         <nav aria-label={role === 'ADMIN' ? 'Admin navigation' : 'Hall Manager navigation'}>
-          {navByRole[role].map((item) => <button className={activeSection === item ? 'active' : ''} onClick={() => setActiveSection(item)} key={item}>{item}{item === 'Live tickets' && <i>{liveMetrics.open ?? '—'}</i>}{item === 'Exceptions' && <i>{liveMetrics.open == null && liveMetrics.queued == null ? '—' : (liveMetrics.overdue ?? 0) + (liveMetrics.escalated ?? 0) + (liveMetrics.complaints ?? 0)}</i>}{(item === 'Workforce' || item === 'Staff') && role === 'ADMIN' && pendingApprovals.length > 0 && <i>{pendingApprovals.length}</i>}</button>)}
-          {role === 'ADMIN' && <Link href="/admin/registrations">Registrations</Link>}
+          {navByRole[role].map((item) => item === 'Registrations' ? <Link key={item} href="/admin/registrations">Registrations</Link> : <button className={activeSection === item ? 'active' : ''} aria-current={activeSection === item ? 'page' : undefined} onClick={() => { setActiveSection(item); if (role === 'ADMIN') { const params = new URLSearchParams(searchParams.toString()); params.set('section', item); router.push('/admin?' + params.toString(), { scroll: false }); } if (role === 'HALL_MANAGER') { setSelected(null); window.scrollTo({ top: 0 }); } }} key={item}>{item}{item === 'Attention' && attentionTotal > 0 ? <i>{attentionTotal}</i> : null}{item === 'Workforce' && role === 'ADMIN' && pendingApprovals.length > 0 && <i>{pendingApprovals.length}</i>}</button>)}
         </nav>
         <div className="user"><span>{role === 'ADMIN' ? 'AD' : 'HM'}</span><div><strong>{profile?.name ?? (role === 'ADMIN' ? 'Event Admin' : 'Hall Manager')}</strong><small>{role.replace('_', ' ')}</small></div></div>
         <LogoutButton />
       </aside>
       <main className="management">
-        <header className="topbar"><div><span className="eyebrow">{profile?.scopes[0]?.event.name ?? 'EveOps event'} · {connection === 'live' ? 'Live' : 'Reconnecting'}</span><h1>{title}</h1></div><div className="top-actions"><span>{profile?.scopes[0]?.hall?.name ?? 'All scoped halls'}</span><button onClick={() => void loadNotifications()}>Notifications · {notifications.filter((notification) => !notification.readAt).length}</button></div></header>
+        <header className="topbar"><div><span className="eyebrow">{eventName} · {role === 'ADMIN' ? 'This event' : (profile?.scopes[0]?.hall?.name ?? 'Hall')} · {({ connecting: 'Connecting', live: 'Live', reconnecting: 'Reconnecting' } as const)[role === 'ADMIN' ? adminConnection : connection]}</span><h1>{title}</h1></div><div className="top-actions">{profileState.error && !profile ? <span role="alert">{profileState.error}</span> : null}{profileState.stale ? <span role="status">Account details are showing the last loaded copy.</span> : null}<span>{role === 'ADMIN' ? 'All halls in this event' : (profile?.scopes[0]?.hall?.name ?? 'Hall')}</span><button onClick={() => void loadNotifications()}>Notifications · {notifications.filter((notification) => !notification.readAt).length}</button></div></header>
+        {role === 'HALL_MANAGER' && profile?.id ? <WorkAlertHost userId={profile.id} /> : null}
         {managerToast && <div className="alert-line" role="status"><span>{managerToast.text}</span><button type="button" onClick={() => void openManagerAlert(managerToast)}>Open</button><button type="button" onClick={() => setManagerToast(null)}>Dismiss</button></div>}
-        {managementError && <div className={managementError.startsWith('Export queued') || managementError.startsWith('Created ') || managementError.includes('sent for Admin approval') || managementError.startsWith('Staff approved') || managementError.startsWith('Staff request rejected') || managementError.endsWith('created.') || managementError.startsWith('SLA targets') || managementError.includes('Temporary password must be changed') || managementError.startsWith('Completion verified') ? 'alert-line' : 'form-error'} role="status">{managementError}</div>}
+        {managementError && <div className={managementStatusIsSuccess(managementError) ? 'alert-line' : 'form-error'} role="status">{managementError}</div>}
         {showNotifications && <section className="notification-panel">{notifications.length ? notifications.slice(0, 10).map((notification) => <button key={notification.id} onClick={() => void apiFetch('/api/notifications/' + notification.id + '/read', { method: 'PATCH', credentials: 'include' }).then(() => loadNotifications())}><strong>{notification.type.replaceAll('_', ' ')}</strong><span>{eventTime(notification.sentAt)}</span></button>) : <p className="empty-state">No notifications.</p>}</section>}
-        <section className="metric-grid" aria-label="Operational metrics">{metrics.map((metric) => <article key={metric.label} className={metric.critical ? 'metric critical' : 'metric'}><span>{metric.label}</span><strong>{metric.value}</strong><small>Updated live</small></article>)}</section>
-        {showCommand && <CommandInsights metrics={liveMetrics} />}
+        {role === 'ADMIN' && activeSection === 'Overview' && <section aria-label="Event overview"><div className="section-title"><div><h2>Event summary</h2><p>Counts for {eventName}. Open a figure to see the records it describes. A dash means the figure has not loaded.</p></div></div><section className="metric-grid" aria-label="Operational metrics">{[
+          { label: 'Open now', value: String(liveMetrics.open ?? '—'), detail: 'Not closed or cancelled', patch: { section: 'Tickets', view: 'active', status: '' } },
+          { label: 'Queued', value: String(liveMetrics.queued ?? '—'), detail: 'Waiting for staff', patch: { section: 'Tickets', view: '', status: 'QUEUED' } },
+          { label: 'Response overdue', value: String(liveMetrics.overdue ?? '—'), detail: 'Assignments past the response target', patch: null },
+          { label: 'Escalated', value: String(liveMetrics.escalated ?? '—'), detail: 'Status is escalated', patch: { section: 'Tickets', view: '', status: 'ESCALATED' } },
+          { label: 'Complaints', value: String(liveMetrics.complaints ?? '—'), detail: 'Unresolved complaints', patch: null },
+          { label: 'Closed today', value: String(liveMetrics.closedToday ?? '—'), detail: 'Closed since midnight in the event timezone. Review closed tickets lists every closed ticket, which is a wider set than today.', patch: { section: 'Tickets', view: '', status: 'CLOSED' }, action: 'Review closed tickets' },
+        ].map((metric) => <article key={metric.label} className="metric"><span>{metric.label}</span><strong>{metric.value}</strong><small>{metricsStale ? 'Last loaded' : metric.detail}</small>{metric.patch ? <button type="button" onClick={() => { const params = new URLSearchParams(); Object.entries(metric.patch ?? {}).forEach(([key, value]) => { if (value) params.set(key, value); }); router.push('/admin?' + params.toString(), { scroll: false }); }}>{metric.action ?? 'Review records'}</button> : <small>No single ticket filter matches this count.</small>}</article>)}</section>{(liveMetrics.halls ?? []).length ? <section className="portfolio-list" aria-label="Halls"><div className="section-title"><div><h2>Halls</h2><p>Open work in each hall. Review records opens that hall’s tickets.</p></div></div>{liveMetrics.halls?.map((hall) => <article key={hall.id}><div><strong>{hall.name}</strong><span>{hall.code}</span></div><div><span>Open</span><strong>{hall.open}</strong></div><div><span>Queued</span><strong>{hall.queued}</strong></div><div><span>Overdue</span><strong>{hall.overdue}</strong></div><button type="button" onClick={() => router.push('/admin?section=Tickets&hall=' + encodeURIComponent(hall.id) + '&view=active', { scroll: false })}>Review hall tickets</button></article>)}</section> : <p className="empty-state">Hall figures appear when the summary loads.</p>}<p className="exhibitor-note"><Link href="/admin/registrations">Registrations</Link> are stall and exhibitor accounts. Workforce approvals stay in Workforce.</p></section>}
         {(activeSection === 'Staff' || activeSection === 'Workforce') && (() => {
           const visibleWorkforce = workforce.filter((membership) => workforceFilter === 'ALL' || membership.user.approvalStatus === workforceFilter);
-          return <section className="portfolio-list"><div className="section-title"><div><h2>Workforce</h2><p>{role === 'HALL_MANAGER' ? 'Create Electrical or House Help staff for Admin approval. Ticket age is never edited here.' : 'Approve Hall Manager staff requests and manage event workforce identities.'}</p></div><div className="drawer-actions"><select aria-label="Approval filter" value={workforceFilter} onChange={(event) => setWorkforceFilter(event.target.value as typeof workforceFilter)}><option value="ALL">All</option><option value="PENDING_APPROVAL">Pending approval</option><option value="APPROVED">Approved</option><option value="REJECTED">Rejected</option></select><button onClick={() => { const next = !showAddPerson; setShowAddPerson(next); setPersonFormError(''); if (next) { setPersonRole('STAFF'); setPersonServiceCategory('HOUSE_HELP'); const halls = role === 'ADMIN' ? masters.flatMap((event) => event.halls).filter((hall) => hall.active !== false) : (profile?.scopes.flatMap((scope) => scope.hall ? [{ id: scope.hall.id, code: scope.hall.code, name: scope.hall.name }] : []) ?? []); setPersonHallId(halls[0]?.id ?? ''); if (role === 'ADMIN' && !masters.length) void apiFetch('/api/management/masters', { credentials: 'include', cache: 'no-store' }).then(async (response) => { if (response.ok) setMasters(await response.json() as typeof masters); }); } }}>{showAddPerson ? 'Close form' : (role === 'HALL_MANAGER' ? 'Add Staff' : 'Add person')}</button></div></div>{role === 'ADMIN' && !!pendingApprovals.length && <div className="portfolio-list"><div className="section-title"><div><h2>Pending approvals</h2><p>{pendingApprovals.length} awaiting review</p></div></div>{pendingApprovals.map((person) => <article key={person.id}><div><strong>{person.name}</strong><span>{person.employeeCode ?? 'No public ID'} · {person.memberships[0]?.pool.category ?? 'Staff'}</span></div><div><span>Requested by</span><strong>{person.requestedBy?.name ?? 'Hall Manager'}</strong></div><div><span>Created</span><strong>{eventTime(person.createdAt)}</strong></div><div className="drawer-actions"><button className="primary" type="button" onClick={() => void approvePerson(person.id)}>Approve</button><button className="critical-button" type="button" onClick={() => void rejectPerson(person.id)}>{rejectUserId === person.id ? 'Confirm reject' : 'Reject'}</button></div>{rejectUserId === person.id && <form className="authority-action" onSubmit={(event) => { event.preventDefault(); void rejectPerson(person.id); }}><label>Rejection reason<span aria-hidden="true"> *</span><input value={rejectReason} onChange={(change) => setRejectReason(change.target.value)} required minLength={3} /></label>{rejectError && <p className="form-error" role="alert">{rejectError}</p>}<div className="drawer-actions"><button type="button" onClick={() => { setRejectUserId(null); setRejectError(''); }}>Cancel</button><button className="critical-button" type="submit">Submit rejection</button></div></form>}</article>)}</div>}{showAddPerson && (() => {
+          return <section className="portfolio-list"><div className="section-title"><div><h2>Workforce</h2><p>{role === 'HALL_MANAGER' ? 'Request Electrical or House Help staff. An Admin approves them before they can sign in. Stall registration and exhibitor logins stay with Admin.' : 'Approve Hall Manager staff requests and manage event workforce identities.'}</p></div><div className="drawer-actions"><select aria-label="Approval filter" value={workforceFilter} onChange={(event) => setWorkforceFilter(event.target.value as typeof workforceFilter)}><option value="ALL">All</option><option value="PENDING_APPROVAL">Pending approval</option><option value="APPROVED">Approved</option><option value="REJECTED">Rejected</option></select><button onClick={() => { const next = !showAddPerson; setShowAddPerson(next); setPersonFormError(''); if (next) { setPersonRole('STAFF'); setPersonServiceCategory('HOUSE_HELP'); const halls = role === 'ADMIN' ? masters.flatMap((event) => event.halls).filter((hall) => hall.active !== false) : (profile?.scopes.flatMap((scope) => scope.hall ? [{ id: scope.hall.id, code: scope.hall.code, name: scope.hall.name }] : []) ?? []); setPersonHallId(halls[0]?.id ?? ''); if (role === 'ADMIN' && !masters.length) void apiFetch('/api/management/masters', { credentials: 'include', cache: 'no-store' }).then(async (response) => { if (response.ok) setMasters(await response.json() as typeof masters); }); } }}>{showAddPerson ? 'Close form' : (role === 'HALL_MANAGER' ? 'Add Staff' : 'Add person')}</button></div></div>{role === 'ADMIN' && !!pendingApprovals.length && <div className="portfolio-list"><div className="section-title"><div><h2>Pending approvals</h2><p>{pendingApprovals.length} awaiting review</p></div></div>{pendingApprovals.map((person) => <article key={person.id}><div><strong>{person.name}</strong><span>{person.employeeCode ?? 'No public ID'} · {person.memberships[0]?.pool.category ?? 'Staff'}</span></div><div><span>Requested by</span><strong>{person.requestedBy?.name ?? 'Hall Manager'}</strong></div><div><span>Created</span><strong>{eventTime(person.createdAt)}</strong></div><div className="drawer-actions"><button className="primary" type="button" onClick={() => void approvePerson(person.id)}>Approve</button><button className="critical-button" type="button" onClick={() => void rejectPerson(person.id)}>{rejectUserId === person.id ? 'Confirm reject' : 'Reject'}</button></div>{rejectUserId === person.id && <form className="authority-action" onSubmit={(event) => { event.preventDefault(); void rejectPerson(person.id); }}><label>Rejection reason<span aria-hidden="true"> *</span><input value={rejectReason} onChange={(change) => setRejectReason(change.target.value)} required minLength={3} /></label>{rejectError && <p className="form-error" role="alert">{rejectError}</p>}<div className="drawer-actions"><button type="button" onClick={() => { setRejectUserId(null); setRejectError(''); }}>Cancel</button><button className="critical-button" type="submit">Submit rejection</button></div></form>}</article>)}</div>}{showAddPerson && (() => {
             const adminHalls = masters.flatMap((event) => event.halls).filter((hall) => hall.active !== false);
             const hmHalls = profile?.scopes.flatMap((scope) => scope.hall ? [{ id: scope.hall.id, code: scope.hall.code, name: scope.hall.name }] : []) ?? [];
             const hallOptions = role === 'ADMIN' ? adminHalls : hmHalls;
@@ -1867,9 +1857,9 @@ export function ManagementWorkspace({ role }: { role: 'HALL_MANAGER' | 'ADMIN' }
             const subtypeOptions = [...new Set(poolSubtypes.length ? poolSubtypes : (personServiceCategory === 'ELECTRICAL' ? ['Lighting', 'NCP', 'General'] : ['General']))];
             return <form className="authority-action" onSubmit={(event) => void createPerson(event)}>
               <label>Name<span aria-hidden="true"> *</span><input name="name" required minLength={2} autoComplete="name" /></label>
-              <label>Login email<span aria-hidden="true"> *</span><input name="email" type="email" required autoComplete="username" /></label>
+              <label>User ID<span aria-hidden="true"> *</span><input name="email" type="text" required autoComplete="username" minLength={2} maxLength={254} spellCheck={false} /></label>
               <label>Phone<input name="phone" autoComplete="tel" /></label>
-              <label>Temporary password<span aria-hidden="true"> *</span><input name="password" type="password" required minLength={10} autoComplete="new-password" /><span className="otp-hint">Must be changed on first sign-in.</span></label>
+              <label>Temporary password<span aria-hidden="true"> *</span><input name="password" type="password" required minLength={NEW_PASSWORD_MIN_LENGTH} maxLength={PASSWORD_MAX_BYTES} pattern={NEW_PASSWORD_PATTERN.source} title="Use at least 8 characters, including a letter and a number" autoComplete="new-password" /><span className="otp-hint">Must be changed on first sign-in.</span></label>
               {role === 'ADMIN' ? (
                 <label>Public person ID (optional)<input name="employeeCode" placeholder="STF-00012" /><span className="otp-hint">Leave blank to auto-generate. Hall Managers cannot assign IDs.</span></label>
               ) : (
@@ -1884,7 +1874,7 @@ export function ManagementWorkspace({ role }: { role: 'HALL_MANAGER' | 'ADMIN' }
                 </label>
               ) : <input type="hidden" name="role" value="STAFF" />}
               {hallOptions.length === 0 ? (
-                <p className="form-error" role="alert">No hall is available in your scope. Add a hall in Masters before creating staff.</p>
+                <p className="form-error" role="alert">No hall is available in your scope. Add a hall in Event setup before creating staff.</p>
               ) : hallOptions.length === 1 && role === 'HALL_MANAGER' ? (
                 <label>Hall<span aria-hidden="true"> *</span>
                   <input type="hidden" name="hallId" value={hallOptions[0].id} />
@@ -1921,40 +1911,44 @@ export function ManagementWorkspace({ role }: { role: 'HALL_MANAGER' | 'ADMIN' }
                 <button className="primary" type="submit" disabled={personSubmitting || hallOptions.length === 0}>{personSubmitting ? 'Creating…' : 'Create account'}</button>
               </div>
             </form>;
-          })()}{visibleWorkforce.length ? visibleWorkforce.map((membership) => <article key={membership.user.id + membership.pool.category + membership.pool.subtype}><div><strong>{membership.user.name}</strong><span>{membership.user.employeeCode ?? 'No public ID'}{membership.user.email ? (' · ' + membership.user.email) : ''}</span></div><div><span>Service</span><strong>{membership.pool.category} · {membership.pool.subtype}</strong></div><div><span>Availability</span><strong>{membership.availability.replaceAll('_', ' ')}</strong></div><div><span>Load</span><strong>{membership.activeAssignmentCount ?? membership.activeCount ?? 0}/{membership.capacity ?? 1}</strong></div><div><span>Approval</span><strong>{(membership.user.approvalStatus ?? 'APPROVED').replaceAll('_', ' ')}</strong></div><div><span>Account</span><strong>{membership.user.status ?? 'ACTIVE'}</strong></div>{membership.user.rejectionReason && <div><span>Rejection</span><strong>{membership.user.rejectionReason}</strong></div>}{role === 'ADMIN' && membership.user.approvalStatus === 'PENDING_APPROVAL' && <div className="drawer-actions"><button className="primary" type="button" onClick={() => void approvePerson(membership.user.id)}>Approve</button><button className="critical-button" type="button" onClick={() => void rejectPerson(membership.user.id)}>{rejectUserId === membership.user.id ? 'Confirm reject' : 'Reject'}</button></div>}{rejectUserId === membership.user.id && <form className="authority-action" onSubmit={(event) => { event.preventDefault(); void rejectPerson(membership.user.id); }}><label>Rejection reason<span aria-hidden="true"> *</span><input value={rejectReason} onChange={(change) => setRejectReason(change.target.value)} required minLength={3} /></label>{rejectError && <p className="form-error" role="alert">{rejectError}</p>}<div className="drawer-actions"><button type="button" onClick={() => { setRejectUserId(null); setRejectError(''); }}>Cancel</button><button className="critical-button" type="submit">Submit rejection</button></div></form>}<div className="drawer-actions">{capacityEditUserId === membership.user.id ? <form className="authority-action" onSubmit={(event) => { event.preventDefault(); const nextCapacity = Number(capacityValue); if (Number.isInteger(nextCapacity) && nextCapacity >= 1) void updatePersonCapacity(membership.user.id, nextCapacity); }}><label>Capacity<span aria-hidden="true"> *</span><input type="number" min={1} max={20} value={capacityValue} onChange={(change) => setCapacityValue(change.target.value)} required /></label><div className="drawer-actions"><button type="button" onClick={() => setCapacityEditUserId(null)}>Cancel</button><button className="primary" type="submit">Save capacity</button></div></form> : <button type="button" onClick={() => { setCapacityEditUserId(membership.user.id); setCapacityValue(String(membership.capacity ?? 1)); }}>Edit capacity</button>}<button type="button" onClick={() => void updatePersonStatus(membership.user.id, membership.user.status === 'DISABLED' ? 'ACTIVE' : 'DISABLED')}>{membership.user.status === 'DISABLED' ? 'Activate' : 'Deactivate'}</button></div></article>) : <p className="empty-state">No workforce identities match this filter.</p>}</section>;
+          })()}{visibleWorkforce.length ? visibleWorkforce.map((membership) => <article key={membership.user.id + membership.pool.category + membership.pool.subtype}><div><strong>{membership.user.name}</strong><span>{membership.user.role === 'HALL_MANAGER' ? 'Hall manager' : 'Staff'} · {serviceLabel(membership.pool.category)} · {membership.pool.subtype}</span><span>{masters.flatMap((event) => event.halls).find((hall) => hall.id === membership.pool.hallId)?.name ?? 'Event scope'}{membership.user.employeeCode ? ` · ${membership.user.employeeCode}` : ''}</span>{membership.user.email ? <span>{membership.user.email}</span> : null}</div><div><span>Duty</span><strong>{membership.availability.toLowerCase().replaceAll('_', ' ').replace(/\b\w/g, (letter) => letter.toUpperCase())}</strong></div><div><span>Load</span><strong>{membership.activeAssignmentCount ?? membership.activeCount ?? 0}/{membership.capacity ?? 1}</strong></div><div><span>Approval</span><strong>{(membership.user.approvalStatus ?? 'APPROVED').replaceAll('_', ' ')}</strong></div><div><span>Account</span><strong>{membership.user.status ?? 'ACTIVE'}</strong></div>{membership.user.rejectionReason && <div><span>Rejection</span><strong>{membership.user.rejectionReason}</strong></div>}{role === 'ADMIN' && membership.user.approvalStatus === 'PENDING_APPROVAL' && <div className="drawer-actions"><button className="primary" type="button" onClick={() => void approvePerson(membership.user.id)}>Approve</button><button className="critical-button" type="button" onClick={() => void rejectPerson(membership.user.id)}>{rejectUserId === membership.user.id ? 'Confirm reject' : 'Reject'}</button></div>}{rejectUserId === membership.user.id && <form className="authority-action" onSubmit={(event) => { event.preventDefault(); void rejectPerson(membership.user.id); }}><label>Rejection reason<span aria-hidden="true"> *</span><input value={rejectReason} onChange={(change) => setRejectReason(change.target.value)} required minLength={3} /></label>{rejectError && <p className="form-error" role="alert">{rejectError}</p>}<div className="drawer-actions"><button type="button" onClick={() => { setRejectUserId(null); setRejectError(''); }}>Cancel</button><button className="critical-button" type="submit">Submit rejection</button></div></form>}<div className="drawer-actions">{capacityEditUserId === membership.user.id ? <form className="authority-action" onSubmit={(event) => { event.preventDefault(); const nextCapacity = Number(capacityValue); if (Number.isInteger(nextCapacity) && nextCapacity >= 1) void updatePersonCapacity(membership.user.id, nextCapacity); }}><label>Capacity<span aria-hidden="true"> *</span><input type="number" min={1} max={20} value={capacityValue} onChange={(change) => setCapacityValue(change.target.value)} required /></label><div className="drawer-actions"><button type="button" onClick={() => setCapacityEditUserId(null)}>Cancel</button><button className="primary" type="submit">Save capacity</button></div></form> : <button type="button" onClick={() => { setCapacityEditUserId(membership.user.id); setCapacityValue(String(membership.capacity ?? 1)); }}>Edit capacity</button>}<button type="button" onClick={() => void updatePersonStatus(membership.user.id, membership.user.status === 'DISABLED' ? 'ACTIVE' : 'DISABLED')}>{membership.user.status === 'DISABLED' ? 'Activate' : 'Deactivate'}</button></div></article>) : <p className="empty-state">No workforce identities match this filter.</p>}</section>;
         })()}
-        {activeSection === 'Exceptions' && <section className="portfolio-list"><div className="section-title"><div><h2>Exception inbox</h2><p>Queued, overdue, complaint, reopened, and escalated tickets</p></div></div>{exceptions.length ? exceptions.map((ticket) => <div key={ticket.id}><TicketCard ticket={ticket} /><div className="drawer-actions"><button type="button" onClick={() => { setSelected(ticket); setActiveSection(role === 'ADMIN' ? 'Tickets' : 'Live tickets'); }}>Open ticket</button></div></div>) : <p className="empty-state">No unresolved exceptions.</p>}</section>}
-        {activeSection === 'Audit' && <section className="portfolio-list"><div className="section-title"><div><h2>Audit history</h2><p>Append-only scoped operational events</p></div></div>{auditEvents.map((event) => <article key={event.id}><div><strong>{event.ticket.publicNo}</strong><span>{event.actor?.name ?? 'System'}</span></div><div><span>Action</span><strong>{event.eventType.replaceAll('_', ' ')}</strong></div><div><span>Server time</span><strong>{eventTime(event.createdAt)}</strong></div></article>)}</section>}
-        {(activeSection === 'Masters' || activeSection === 'Halls / Zones / Stalls') && <section className="portfolio-list"><div className="section-title"><div><h2>Event setup</h2><p>Halls, zones, stalls, and service timing</p></div><div className="drawer-actions"><button type="button" onClick={() => { setMasterForm(masterForm === 'hall' ? null : 'hall'); setMasterFormError(''); }}>Add hall</button><button type="button" onClick={() => { setMasterForm(masterForm === 'zone' ? null : 'zone'); setMasterFormError(''); }}>Add zone</button><button type="button" onClick={() => { setMasterForm(masterForm === 'stall' ? null : 'stall'); setMasterFormError(''); }}>Add stall</button></div></div>
+        {activeSection === 'Exceptions' && <section className="portfolio-list"><div className="section-title"><div><h2>Exception inbox</h2><p>Queued, overdue, complaint, reopened, and escalated tickets</p></div></div>{exceptions.length ? exceptions.map((ticket) => <div key={ticket.id}><TicketCard ticket={ticket} /><div className="drawer-actions"><button type="button" onClick={() => { setSelected(ticket); setActiveSection('Tickets'); }}>Open ticket</button></div></div>) : <p className="empty-state">No unresolved exceptions.</p>}</section>}
+        {activeSection === 'Audit' && <section className="portfolio-list"><div className="section-title"><div><h2>Administrative history</h2><p>Registration, workforce, configuration, and ticket lifecycle events for {eventName}. Ticket activity for one request stays on that ticket. This list cannot be edited. Refresh shows records added since this page was opened. Load more continues older records. Showing {auditHistory.items.length}.</p></div><div className="drawer-actions"><label>Ticket or account<input aria-label="Audit ticket" value={auditTicketQuery} onChange={(event) => setAuditTicketQuery(event.target.value)} /></label><label>Action<input aria-label="Audit action" value={auditActionQuery} onChange={(event) => setAuditActionQuery(event.target.value)} /></label><button type="button" onClick={() => void auditHistory.refresh()}>Refresh</button></div></div>{auditHistory.stale && auditHistory.error ? <p className="alert-line" role="status">{auditHistory.error}</p> : null}{!auditHistory.loaded ? <p className="empty-state">Loading history…</p> : auditHistory.error && !auditHistory.items.length ? <p className="form-error" role="alert">{auditHistory.error}</p> : auditHistory.items.length ? <>{auditHistory.items.map((event) => <article key={(event.kind ?? 'ticket') + event.id}><div><strong>{event.ticket.publicNo}</strong><span>{event.actor?.name ?? 'System'}{event.actor?.role ? ` · ${event.actor.role.replaceAll('_', ' ')}` : ''}</span></div><div><span>Record</span><strong>{event.kind === 'workforce' ? 'Administrative change' : 'Ticket lifecycle'}</strong></div><div><span>Action</span><strong>{event.eventType.replaceAll('_', ' ')}</strong></div><div><span>Server time</span><strong>{eventTime(event.createdAt)}</strong></div></article>)}{auditHistory.nextCursor ? <button type="button" onClick={() => void auditHistory.loadMore()}>Load more</button> : null}</> : <p className="empty-state">No history matches this search.</p>}</section>}
+        {activeSection === 'Event setup' && <section className="portfolio-list"><div className="section-title"><div><h2>Event setup</h2><p>Halls, zones, and service timing for {eventName}. Stall records and exhibitor logins are created in Registrations, so saving a stall here cannot be mistaken for creating a login.</p></div><div className="drawer-actions"><button type="button" onClick={() => { setMasterForm(masterForm === 'hall' ? null : 'hall'); setMasterFormError(''); }}>Add hall</button><button type="button" onClick={() => { setMasterForm(masterForm === 'zone' ? null : 'zone'); setMasterFormError(''); }}>Add zone</button><Link href="/admin/registrations">Open registrations</Link></div></div>
           {masterForm === 'hall' && <form className="authority-action" onSubmit={(event) => void createMaster(event)}><label>Hall code<span aria-hidden="true"> *</span><input name="code" required minLength={1} /></label><label>Hall name<span aria-hidden="true"> *</span><input name="name" required minLength={1} /></label><label>Status<select name="status" defaultValue="ACTIVE"><option value="ACTIVE">Active</option><option value="INACTIVE">Inactive</option></select></label>{masterFormError && <p className="form-error" role="alert">{masterFormError}</p>}<div className="drawer-actions"><button type="button" onClick={() => setMasterForm(null)}>Cancel</button><button className="primary" type="submit" disabled={masterSubmitting}>{masterSubmitting ? 'Saving…' : 'Create hall'}</button></div></form>}
           {masterForm === 'zone' && <form className="authority-action" onSubmit={(event) => void createMaster(event)}><label>Hall<span aria-hidden="true"> *</span><select name="hallId" required>{masters.flatMap((event) => event.halls).map((hall) => <option key={hall.id} value={hall.id}>{hall.name}</option>)}</select></label><label>Zone code<span aria-hidden="true"> *</span><input name="code" required minLength={1} /></label>{masterFormError && <p className="form-error" role="alert">{masterFormError}</p>}<div className="drawer-actions"><button type="button" onClick={() => setMasterForm(null)}>Cancel</button><button className="primary" type="submit" disabled={masterSubmitting}>{masterSubmitting ? 'Saving…' : 'Create zone'}</button></div></form>}
-          {masterForm === 'stall' && <form className="authority-action" onSubmit={(event) => void createMaster(event)}><label>Zone<span aria-hidden="true"> *</span><select name="zoneId" required>{masters.flatMap((event) => event.halls.flatMap((hall) => hall.zones.map((zone) => <option key={zone.id} value={zone.id}>{hall.name} · {zone.code}</option>)))}</select></label><label>Stall code<span aria-hidden="true"> *</span><input name="stallCode" required minLength={1} /></label><label>Exhibitor<span aria-hidden="true"> *</span><input name="exhibitorName" required minLength={1} /></label><label>Contact<input name="contact" /></label><label>Service priority<select name="servicePriority" defaultValue="MEDIUM"><option value="HIGH">High</option><option value="MEDIUM">Medium</option><option value="LOW">Low</option></select></label><label>Active<select name="active" defaultValue="true"><option value="true">Active</option><option value="false">Inactive</option></select></label>{masterFormError && <p className="form-error" role="alert">{masterFormError}</p>}<div className="drawer-actions"><button type="button" onClick={() => setMasterForm(null)}>Cancel</button><button className="primary" type="submit" disabled={masterSubmitting}>{masterSubmitting ? 'Saving…' : 'Create stall'}</button></div></form>}
           {!masters.length ? <p className="empty-state">No master hierarchy is available for your event scope.</p> : masters.map((event) => <div key={event.id}><article><div><strong>{event.name}</strong><span>{event.timezone ? `Timezone ${event.timezone}` : 'Event masters'}</span></div><div><span>Halls</span><strong>{event.halls.length}</strong></div><div><span>Zones</span><strong>{event.halls.reduce((sum, hall) => sum + hall.zones.length, 0)}</strong></div><div><span>Stalls</span><strong>{event.halls.reduce((sum, hall) => sum + hall.zones.reduce((zoneSum, zone) => zoneSum + zone.stalls.length, 0), 0)}</strong></div></article>{event.halls.map((hall) => <article key={hall.id}><div><strong>{hall.name}</strong><span>{hall.zones.length} zones · {hall.zones.reduce((sum, zone) => sum + zone.stalls.length, 0)} stalls</span></div><div><span>Zones</span><strong>{hall.zones.map((zone) => zone.code).join(', ') || 'None'}</strong></div><div><span>Stalls</span><strong>{hall.zones.flatMap((zone) => zone.stalls.map((stall) => stall.stallCode)).join(', ') || 'None'}</strong></div></article>)}{event.pools.map((pool) => <article key={pool.id}><div><strong>{pool.category} · {pool.subtype}</strong><span>{pool.active ? 'Active' : 'Inactive'}</span></div><div><span>Response SLA</span><strong>{duration(pool.responseTargetSeconds)}</strong></div><div><span>Resolution SLA</span><strong>{duration(pool.resolutionTargetSeconds)}</strong></div>{slaEditPoolId === pool.id ? <form className="authority-action" onSubmit={(formEvent) => void updatePool(formEvent, pool)}><label>Response target (seconds)<span aria-hidden="true"> *</span><input name="responseTargetSeconds" type="number" min={1} required defaultValue={pool.responseTargetSeconds} /></label><label>Resolution target (seconds)<span aria-hidden="true"> *</span><input name="resolutionTargetSeconds" type="number" min={1} required defaultValue={pool.resolutionTargetSeconds} /></label>{slaFormError && <p className="form-error" role="alert">{slaFormError}</p>}<div className="drawer-actions"><button type="button" onClick={() => setSlaEditPoolId(null)}>Cancel</button><button className="primary" type="submit" disabled={slaSubmitting}>{slaSubmitting ? 'Saving…' : 'Save SLA'}</button></div></form> : <button type="button" onClick={() => { setSlaEditPoolId(pool.id); setSlaFormError(''); }}>Edit SLA</button>}</article>)}</div>)}</section>}
-        {(activeSection === 'Reports') && <section className="portfolio-list"><div className="section-title"><div><h2>Reports</h2><p>Scoped metrics for the selected creation range, plus authorized CSV export jobs</p></div><div className="drawer-actions"><label className="sr-only" htmlFor="report-range">Report range</label><select id="report-range" aria-label="Report range" value={reportRange} onChange={(event) => setReportRange(event.target.value as 'live' | 'today' | 'custom')}><option value="live">All tickets in scope</option><option value="today">Created today</option><option value="custom">Custom range</option></select>{reportRange === 'custom' && <><label className="sr-only" htmlFor="report-from">From</label><input id="report-from" aria-label="Report from" type="datetime-local" value={reportFrom} onChange={(event) => setReportFrom(event.target.value)} /><label className="sr-only" htmlFor="report-to">To</label><input id="report-to" aria-label="Report to" type="datetime-local" value={reportTo} onChange={(event) => setReportTo(event.target.value)} /></>}<button type="button" onClick={() => void exportView()}>Queue CSV export</button></div></div><CommandInsights metrics={liveMetrics} />{exports.length ? exports.map((job) => <article key={job.id}><div><strong>{job.format}</strong><span>{eventTime(job.createdAt)}</span></div><div><span>Status</span><strong>{job.status}</strong></div><div><span>Rows</span><strong>{job.rowCount ?? 'Pending'}</strong></div>{job.status === 'READY' && <a href={'/api/management/exports/' + job.id + '/download'}>Download</a>}</article>) : <p className="empty-state">No export jobs yet. Queue an export from Live operations or Reports.</p>}</section>}
-        {showLive && <section className="workspace">
+        {(activeSection === 'Reports') && <section className="portfolio-list"><div className="section-title"><div><h2>Reports</h2><p>Figures below use tickets created in the selected range, inside {eventName}. Open is not closed or cancelled. Queued is waiting for staff. Response overdue counts assignments past the response target. Resolution and response averages use completed timestamps only; a dash means there is no completed sample. CSV export uses the ticket filters currently selected on Tickets, not a separate definition.</p></div><div className="drawer-actions"><label className="sr-only" htmlFor="report-range">Report range</label><select id="report-range" aria-label="Report range" value={reportRange} onChange={(event) => setReportRange(event.target.value as 'live' | 'today' | 'custom')}><option value="live">All tickets in scope</option><option value="today">Created today</option><option value="custom">Custom range</option></select>{reportRange === 'custom' && <><label className="sr-only" htmlFor="report-from">From</label><input id="report-from" aria-label="Report from" type="datetime-local" value={reportFrom} onChange={(event) => setReportFrom(event.target.value)} /><label className="sr-only" htmlFor="report-to">To</label><input id="report-to" aria-label="Report to" type="datetime-local" value={reportTo} onChange={(event) => setReportTo(event.target.value)} /></>}<button type="button" onClick={() => void exportView()}>Queue CSV export</button></div></div><CommandInsights metrics={liveMetrics} />{exports.length ? exports.map((job) => <article key={job.id}><div><strong>{job.format}</strong><span>{eventTime(job.createdAt)}</span></div><div><span>Status</span><strong>{job.status}</strong></div><div><span>Rows</span><strong>{job.rowCount ?? 'Pending'}</strong></div>{job.status === 'READY' && <a href={'/api/management/exports/' + job.id + '/download'}>Download</a>}</article>) : <p className="empty-state">No export jobs yet. Queue a CSV from Tickets or from this page.</p>}</section>}
+        {role === 'HALL_MANAGER' && activeSection === 'Attention' && <section className={selected ? 'workspace manager-focus' : 'workspace'} aria-label="Needs attention">
           <div className="operations">
-            <div className="section-title"><div><h2>Live operations</h2><p>{total} scoped tickets · server-authoritative status</p></div>{role === 'ADMIN' && <button onClick={() => void exportView()}>Export view</button>}</div>
-            <div className="filters"><select aria-label="Status filter" value={statusFilter} onChange={(event) => setStatusFilter(event.target.value)}><option value="">All statuses</option>{Object.keys(statusLabels).map((status) => <option key={status} value={status}>{statusLabels[status as TicketStatus]}</option>)}</select><select aria-label="Service filter" value={categoryFilter} onChange={(event) => setCategoryFilter(event.target.value)}><option value="">All services</option><option value="ELECTRICAL">Electrical</option><option value="HOUSE_HELP">House Help</option><option value="HALL_MANAGER">Hall Manager</option></select>{hallOptions.length > 1 && <select aria-label="Hall filter" value={hallFilter} onChange={(event) => setHallFilter(event.target.value)}><option value="">All halls</option>{hallOptions.map((hall) => <option key={hall.id} value={hall.id}>{hall.code} · {hall.name}</option>)}</select>}<label className="sr-only" htmlFor="created-from">Created from</label><input id="created-from" aria-label="Created from" type="datetime-local" value={createdFrom} onChange={(event) => setCreatedFrom(event.target.value)} /><label className="sr-only" htmlFor="created-to">Created to</label><input id="created-to" aria-label="Created to" type="datetime-local" value={createdTo} onChange={(event) => setCreatedTo(event.target.value)} /><label className="sr-only" htmlFor="ticket-search">Search tickets</label><input id="ticket-search" value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search ticket or stall" autoFocus={activeSection === 'Search'} />{filtersActive && <button type="button" onClick={() => { setStatusFilter(''); setCategoryFilter(''); setHallFilter(''); setCreatedFrom(''); setCreatedTo(''); setSearch(''); }}>Clear filters</button>}</div>
-            {loading ? <p className="empty-state">Loading live operations…</p> : loadError ? <p className="form-error">{loadError}</p> : !items.length ? <p className="empty-state">{filtersActive ? 'No tickets match these filters.' : 'No tickets match the current scope.'}{filtersActive && <> <button type="button" onClick={() => { setStatusFilter(''); setCategoryFilter(''); setHallFilter(''); setCreatedFrom(''); setCreatedTo(''); setSearch(''); }}>Clear filters</button></>}</p> : <><div className="table-wrap"><table><thead><tr><th>Ticket</th><th>Location / issue</th><th>Status</th><th>Age</th><th>Response</th><th>Total</th><th>Assignee</th><th>SLA</th></tr></thead><tbody>{items.map((ticket) => <tr key={ticket.no} tabIndex={0} className={selected?.no === ticket.no ? 'selected' : ''} onClick={() => setSelected(ticket)} onKeyDown={(event) => { if (event.key === 'Enter') setSelected(ticket); }}><td><strong>{ticket.no}</strong><small>{ticket.service}</small></td><td><strong>{ticket.location}</strong><small>{ticket.description}</small></td><td><Status value={ticket.status} /></td><td className={ticket.priority ? 'red' : ''}>{ticket.age}</td><td>{duration(timings[ticket.id]?.assignToAcceptSeconds)}</td><td>{duration(timings[ticket.id]?.totalResolutionSeconds)}</td><td>{ticket.assignee}</td><td><span className={ticket.slaState === 'On track' ? 'sla' : 'sla breach'}>{ticket.slaState}</span></td></tr>)}</tbody></table></div>{nextCursor && <button onClick={() => void loadMore()}>Load more</button>}</>}
+            <div className="section-title"><div><h2>Needs attention</h2><p>{attentionTotal} in this hall. Newly raised, reopened, complained, escalated, urgent, overdue, waiting for a completion code, or assigned and not yet started. Ordinary waiting tickets stay in Queue. Showing {attentionItems.length}.</p></div></div>
+            {attentionStale && attentionError ? <p className="alert-line" role="status">{attentionError}</p> : null}
+            {attentionLoading && !attentionItems.length ? <p className="empty-state">Loading work that needs attention…</p> : attentionError && !attentionItems.length ? <p className="form-error" role="alert">{attentionError}</p> : attentionTotal === 0 ? <p className="empty-state">Nothing needs attention right now.</p> : <div className="manager-list">{attentionItems.map((ticket) => <button type="button" key={ticket.id} className={selected?.id === ticket.id ? 'manager-card selected' : 'manager-card'} onClick={() => setSelected(ticket)}><strong>{attentionReason(ticket) ?? 'Needs attention'}</strong><span>{ticket.location}</span><span>{ticket.service}</span><span>{ticket.no} · {statusLabels[ticket.status]}</span><span>Next: {managerNextStep(ticket)}</span></button>)}</div>}{attentionCursor && <button type="button" onClick={() => void loadMoreAttention()}>Load more</button>}
           </div>
-          {selected && <TicketDrawer ticket={selected} timing={timings[selected.id]} detail={detail} canAdmin={role === 'ADMIN'} canEmergencyClose={selected.capabilities.emergencyClose} canAdvance={selected.capabilities.advanceHallManagerWork} canVerifyOtp={!!selected.capabilities.verifyStallOtp} eligibleStaff={workforce.filter((membership) => membership.availability === 'ON_DUTY' && (membership.user.approvalStatus ?? 'APPROVED') === 'APPROVED' && membership.user.status !== 'DISABLED')} onAdvance={() => void runTicketAction('/transition', { to: selected.status === 'ACCEPTED' ? 'IN_PROGRESS' : selected.status === 'IN_PROGRESS' ? 'AWAITING_OTP' : 'ACCEPTED' })} onPing={(message) => runTicketAction('/ping', { message })} onReassign={reassignSelected} onReopen={(reason) => transitionSelected('REOPENED', reason)} onEscalate={(reason) => transitionSelected('ESCALATED', reason)} onPrioritize={(reason) => runTicketAction('/prioritize', { reason })} onSetServicePriority={(servicePriority, reason) => runTicketAction('/service-priority', { servicePriority, reason })} onCancel={(reason) => transitionSelected('CANCELLED', reason)} onOverrideClose={(reason) => runTicketAction('/override-close', { reason })} onVerifyOtp={async (otp) => {
-            const response = await apiFetch('/api/tickets/' + selected.id + '/otp/verify', {
-              method: 'POST',
-              credentials: 'include',
-              headers: { 'content-type': 'application/json' },
-              body: JSON.stringify({ otp }),
-            });
-            if (!response.ok) {
-              setManagementError(await apiErrorMessage(response, 'Could not verify the completion code'));
-              return false;
-            }
-            setManagementError('Completion verified. Ticket closed.');
-            await refresh();
-            return true;
-          }} />}
+          {ticketPanel}
+        </section>}
+        {role === 'HALL_MANAGER' && activeSection === 'Queue' && <section className={selected ? 'workspace manager-focus' : 'workspace'} aria-label="Waiting queue">
+          <div className="operations">
+            <div className="section-title"><div><h2>Waiting queue</h2><p>{queueTotal} waiting · moved-ahead tickets, then high, medium, and low stall priority, then oldest. Urgency does not change this order. Assigned work stays with the worker. Showing {queuedItems.length}. A scheduling position is the rank in one hall, one service, and one subtype. Combined services, subtypes, halls, or a search show Waiting.</p></div></div>
+            <div className="filters"><select aria-label="Queue service" value={categoryFilter} onChange={(event) => { setCategoryFilter(event.target.value); setSubtypeFilter(''); }}><option value="">All services</option><option value="ELECTRICAL">Electrical</option><option value="HOUSE_HELP">House Help</option><option value="HALL_MANAGER">Hall Manager</option></select>{subtypeChoices.length > 0 && <select aria-label="Queue subtype" value={subtypeFilter} onChange={(event) => setSubtypeFilter(event.target.value)}><option value="">All subtypes</option>{subtypeChoices.map((subtype) => <option key={subtype} value={subtype}>{subtype}</option>)}</select>}{hallOptions.length > 1 && <select aria-label="Queue hall" value={hallFilter} onChange={(event) => setHallFilter(event.target.value)}><option value="">All halls</option>{hallOptions.map((hall) => <option key={hall.id} value={hall.id}>{hall.code} · {hall.name}</option>)}</select>}<label className="sr-only" htmlFor="queue-search">Find a waiting ticket</label><input id="queue-search" value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Ticket number or stall" />{(categoryFilter || subtypeFilter || hallFilter || search) && <button type="button" onClick={() => { setCategoryFilter(''); setSubtypeFilter(''); setHallFilter(''); setSearch(''); }}>Clear filters</button>}</div>
+            {queueStale && queueError ? <p className="alert-line" role="status">{queueError}</p> : null}
+            {queueLoading && !queuedItems.length ? <p className="empty-state">Loading the waiting queue…</p> : queueError && !queuedItems.length ? <p className="form-error" role="alert">{queueError}</p> : !queuedItems.length ? <p className="empty-state">{categoryFilter || hallFilter || search || subtypeFilter ? 'No waiting tickets match this search.' : 'No tickets are waiting in the queue.'}</p> : <><div className="manager-list">{queuedItems.map((ticket, index) => <button type="button" key={ticket.id} className={selected?.id === ticket.id ? 'manager-card selected' : 'manager-card'} onClick={() => setSelected(ticket)}><span className="eyebrow">{schedulingQueueLabel({ index, search, category: categoryFilter, subtype: subtypeFilter, hallId: hallFilter, scopedHallCount })}</span><strong>{ticket.no} · Stall {ticket.locationParts.stall}</strong><span>{ticket.location}</span><span>{ticket.service} · {statusLabels[ticket.status]}</span><span>{ticket.queuePriorityOverrideAt ? 'Moved ahead' : `${ticket.servicePriority ?? 'MEDIUM'} stall priority`}{ticket.priority ? ' · Urgent' : ''}</span></button>)}</div>{queueCursor && <button type="button" onClick={() => void loadMoreQueue()}>Load more</button>}</>}
+          </div>
+          {ticketPanel}
+        </section>}
+        {showLive && <section className={role === 'HALL_MANAGER' && selected ? 'workspace manager-focus' : 'workspace'}>
+          <div className="operations">
+            <div className="section-title"><div><h2>Tickets</h2><p>{role === 'HALL_MANAGER' ? `${total} tickets in this hall. Open one for the full activity log.` : `${total} tickets in ${eventName}. Showing ${items.length}. Open a row for activity and actions. Export uses these filters.`}</p></div>{role === 'ADMIN' && <button onClick={() => void exportView()}>Export this filter</button>}</div>
+            <div className="filters"><select aria-label="Status filter" value={statusFilter} onChange={(event) => { setStatusFilter(event.target.value); if (role === 'ADMIN') { const params = new URLSearchParams(searchParams.toString()); params.set('section', 'Tickets'); if (event.target.value) params.set('status', event.target.value); else params.delete('status'); router.push('/admin?' + params.toString(), { scroll: false }); } }}><option value="">All statuses</option>{Object.keys(statusLabels).map((status) => <option key={status} value={status}>{statusLabels[status as TicketStatus]}</option>)}</select><select aria-label="Service filter" value={categoryFilter} onChange={(event) => { setCategoryFilter(event.target.value); if (role === 'ADMIN') { const params = new URLSearchParams(searchParams.toString()); params.set('section', 'Tickets'); if (event.target.value) params.set('category', event.target.value); else params.delete('category'); router.push('/admin?' + params.toString(), { scroll: false }); } }}><option value="">All services</option><option value="ELECTRICAL">Electrical</option><option value="HOUSE_HELP">House Help</option><option value="HALL_MANAGER">Hall Manager</option></select>{hallOptions.length > 1 && <select aria-label="Hall filter" value={hallFilter} onChange={(event) => { setHallFilter(event.target.value); if (role === 'ADMIN') { const params = new URLSearchParams(searchParams.toString()); params.set('section', 'Tickets'); if (event.target.value) params.set('hall', event.target.value); else params.delete('hall'); router.push('/admin?' + params.toString(), { scroll: false }); } }}><option value="">All halls</option>{hallOptions.map((hall) => <option key={hall.id} value={hall.id}>{hall.code} · {hall.name}</option>)}</select>}<label className="sr-only" htmlFor="created-from">Created from</label><input id="created-from" aria-label="Created from" type="datetime-local" value={createdFrom} onChange={(event) => { setCreatedFrom(event.target.value); if (role === 'ADMIN') { const params = new URLSearchParams(searchParams.toString()); params.set('section', 'Tickets'); if (event.target.value) params.set('from', event.target.value); else params.delete('from'); router.push('/admin?' + params.toString(), { scroll: false }); } }} /><label className="sr-only" htmlFor="created-to">Created to</label><input id="created-to" aria-label="Created to" type="datetime-local" value={createdTo} onChange={(event) => { setCreatedTo(event.target.value); if (role === 'ADMIN') { const params = new URLSearchParams(searchParams.toString()); params.set('section', 'Tickets'); if (event.target.value) params.set('to', event.target.value); else params.delete('to'); router.push('/admin?' + params.toString(), { scroll: false }); } }} /><label className="sr-only" htmlFor="ticket-search">Search tickets</label><input id="ticket-search" value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search ticket or stall" autoFocus={role === 'ADMIN' && activeSection === 'Tickets'} />{filtersActive && <button type="button" onClick={() => { setStatusFilter(''); setCategoryFilter(''); setSubtypeFilter(''); setHallFilter(''); setCreatedFrom(''); setCreatedTo(''); setSearch(''); if (role === 'ADMIN') router.push('/admin?section=Tickets', { scroll: false }); }}>Clear filters</button>}</div>
+            {ticketsStale && loadError ? <p className="alert-line" role="status">{loadError}</p> : null}
+            {loading && !items.length ? <p className="empty-state">Loading live operations…</p> : loadError && !items.length ? <p className="form-error">{loadError}</p> : !items.length ? <p className="empty-state">{filtersActive ? 'No tickets match these filters.' : 'No tickets match the current scope.'}</p> : role === 'HALL_MANAGER' ? <><div className="manager-list">{items.map((ticket) => <button type="button" key={ticket.id} className={selected?.id === ticket.id ? 'manager-card selected' : 'manager-card'} onClick={() => setSelected(ticket)}><strong>{ticket.no} · Stall {ticket.locationParts.stall}</strong><span>{ticket.location}</span><span>{ticket.service}</span><span>{statusLabels[ticket.status]} · {ticket.assignee}</span><TimingFacts ticket={ticket} /></button>)}</div>{nextCursor && <button type="button" onClick={() => void loadMore()}>Load more</button>}</> : <><div className="admin-ticket-cards">{items.map((ticket) => <button type="button" key={ticket.id} className={selected?.id === ticket.id ? 'manager-card selected' : 'manager-card'} onClick={() => { setSelected(ticket); const params = new URLSearchParams(searchParams.toString()); params.set('section', 'Tickets'); params.set('ticket', ticket.id); router.push('/admin?' + params.toString(), { scroll: false }); }}><strong>{ticket.no}</strong><span>{ticket.location}</span><span>{ticket.service}</span><span>{statusLabels[ticket.status]} · {ticket.assignee}</span></button>)}</div><div className="table-wrap admin-ticket-table"><table><thead><tr><th>Ticket</th><th>Location / issue</th><th>Status</th><th>Timing</th><th>Response</th><th>Total</th><th>Assignee</th><th>SLA</th></tr></thead><tbody>{items.map((ticket) => <tr key={ticket.no} tabIndex={0} className={selected?.no === ticket.no ? 'selected' : ''} onClick={() => { setSelected(ticket); if (role === 'ADMIN') { const params = new URLSearchParams(searchParams.toString()); params.set('section', 'Tickets'); params.set('ticket', ticket.id); router.push('/admin?' + params.toString(), { scroll: false }); } }} onKeyDown={(event) => { if (event.key === 'Enter') setSelected(ticket); }}><td><strong>{ticket.no}</strong><small>{ticket.service}</small></td><td><strong>{ticket.location}</strong><small>{ticket.description}</small></td><td><Status value={ticket.status} /></td><td className={ticket.priority ? 'red' : ''}><TimingFacts ticket={ticket} /></td><td>{duration(timings[ticket.id]?.assignToAcceptSeconds)}</td><td>{duration(timings[ticket.id]?.totalResolutionSeconds)}</td><td>{ticket.assignee}</td><td><span className={ticket.slaState === 'On track' ? 'sla' : 'sla breach'}>{ticket.slaState}</span></td></tr>)}</tbody></table></div>{nextCursor && <button type="button" onClick={() => void loadMore()}>Load more</button>}</>}
+          </div>
+          {ticketPanel}
         </section>}
       </main>
     </div>
+    </OperationalClock>
   );
 }
 
@@ -1962,34 +1956,36 @@ type PortfolioEvent = { id: string; event: string; venue: string; status?: strin
 
 export function SuperAdminWorkspace() {
   const profile = useProfile();
-  const [activeSection, setActiveSection] = useState('Portfolio overview');
+  const searchParams = useSearchParams();
+  const router = useRouter();
+  const section = ['Events', 'Tickets', 'Admins', 'Reports', 'Configuration', 'Audit'].includes(searchParams.get('section') ?? '') ? searchParams.get('section') ?? 'Overview' : 'Overview';
+  const selectedEvent = searchParams.get('event') ?? '';
+  const explorerStatus = searchParams.get('status') ?? '';
+  const explorerCategory = searchParams.get('category') ?? '';
   const [portfolio, setPortfolio] = useState<PortfolioEvent[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
-  const [selectedEvent, setSelectedEvent] = useState('');
   const [admins, setAdmins] = useState<Array<{ id: string; name: string; email: string; status: string; scopes: Array<{ event: { name: string } }> }>>([]);
-  const [governanceAudit, setGovernanceAudit] = useState<Array<{ id: string; eventType: string; createdAt: string; ticket: { publicNo: string }; actor: { name: string } | null }>>([]);
+  const [auditTicket, setAuditTicket] = useState('');
+  const [auditAction, setAuditAction] = useState('');
+  const governanceHistory = useAuditHistory(section === 'Audit', auditTicket, auditAction);
   const [governanceExports, setGovernanceExports] = useState<Array<{ id: string; format: string; status: string; rowCount: number | null; createdAt: string }>>([]);
   const [showAddAdmin, setShowAddAdmin] = useState(false);
   const [adminFormError, setAdminFormError] = useState('');
   const [adminSubmitting, setAdminSubmitting] = useState(false);
-  const [explorerStatus, setExplorerStatus] = useState('');
-  const [explorerCategory, setExplorerCategory] = useState('');
+  const [adminEventIds, setAdminEventIds] = useState<string[]>([]);
+  const [openedTicket, setOpenedTicket] = useState<Ticket | null>(null);
   const [analytics, setAnalytics] = useState<OperationalMetrics>({});
   const [analyticsError, setAnalyticsError] = useState('');
-  const [auditTicket, setAuditTicket] = useState('');
-  const [auditAction, setAuditAction] = useState('');
   const [governanceMasters, setGovernanceMasters] = useState<Array<{ id: string; name: string; pools: Array<{ id: string; category: string; subtype: string; responseTargetSeconds: number; resolutionTargetSeconds: number; active: boolean }> }>>([]);
   const [slaPoolId, setSlaPoolId] = useState<string | null>(null);
   const [slaError, setSlaError] = useState('');
   useAuthLoss(() => {
     setPortfolio([]);
     setAdmins([]);
-    setGovernanceAudit([]);
     setGovernanceExports([]);
     setAnalytics({});
     setGovernanceMasters([]);
-    setSelectedEvent('');
   });
   const explorerQuery = new URLSearchParams({
     view: 'all',
@@ -1998,44 +1994,55 @@ export function SuperAdminWorkspace() {
     ...(explorerStatus ? { status: explorerStatus } : {}),
     ...(explorerCategory ? { category: explorerCategory } : {}),
   }).toString();
-  const { items: eventTickets, total: eventTicketTotal, loading: ticketsLoading } = useApiTickets(explorerQuery);
+  const { items: eventTickets, total: eventTicketTotal, nextCursor: eventTicketCursor, loading: ticketsLoading, loadMore: loadMoreEventTickets } = useApiTickets(explorerQuery, { enabled: section === 'Tickets' });
+  function openGovernance(patch: Record<string, string | null>) {
+    const params = new URLSearchParams(searchParams.toString());
+    for (const [key, value] of Object.entries(patch)) {
+      if (value) params.set(key, value);
+      else params.delete(key);
+    }
+    router.push('/super-admin?' + params.toString(), { scroll: false });
+  }
   useEffect(() => {
-    void apiFetch('/api/management/portfolio', { credentials: 'include', cache: 'no-store' })
-      .then((response) => {
-        if (!response.ok) throw new Error('Portfolio could not be loaded');
-        return response.json() as Promise<PortfolioEvent[]>;
-      })
-      .then((values: PortfolioEvent[]) => setPortfolio(values))
-      .catch((cause) => setError(cause instanceof Error ? cause.message : 'Portfolio could not be loaded'))
-      .finally(() => setLoading(false));
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const loadPortfolio = () => {
+      void apiFetch('/api/management/portfolio', { credentials: 'include', cache: 'no-store' })
+        .then(async (response) => {
+          if (cancelled) return;
+          if (response.status === 429) {
+            setError('Event figures are busy right now.');
+            timer = setTimeout(loadPortfolio, jitteredRetryMs(retryAfterMs(response.headers.get('retry-after')), Math.random()));
+            return;
+          }
+          if (!response.ok) throw new Error('Portfolio could not be loaded');
+          setPortfolio(await response.json() as PortfolioEvent[]);
+          setError('');
+          setLoading(false);
+        })
+        .catch((cause) => {
+          if (cancelled) return;
+          setError(cause instanceof Error ? cause.message : 'Portfolio could not be loaded');
+          setLoading(false);
+        });
+    };
+    loadPortfolio();
+    return () => {
+      cancelled = true;
+      if (timer) clearTimeout(timer);
+    };
   }, []);
   useEffect(() => {
     void Promise.all([
       apiFetch('/api/management/admins', { credentials: 'include', cache: 'no-store' }),
-      apiFetch('/api/management/audit', { credentials: 'include', cache: 'no-store' }),
       apiFetch('/api/management/exports', { credentials: 'include', cache: 'no-store' }),
-    ]).then(async ([adminResponse, auditResponse, exportResponse]) => {
+    ]).then(async ([adminResponse, exportResponse]) => {
       if (adminResponse.ok) setAdmins(await adminResponse.json() as typeof admins);
-      if (auditResponse.ok) setGovernanceAudit(await auditResponse.json() as typeof governanceAudit);
       if (exportResponse.ok) setGovernanceExports(await exportResponse.json() as typeof governanceExports);
     }).catch(() => setError('Governance data could not be loaded'));
   }, []);
   useEffect(() => {
-    if (!['Audit'].includes(activeSection)) return;
-    const parameters = new URLSearchParams();
-    if (auditTicket.trim()) parameters.set('ticket', auditTicket.trim());
-    if (auditAction.trim()) parameters.set('action', auditAction.trim());
-    const timer = setTimeout(() => {
-      void apiFetch('/api/management/audit?' + parameters.toString(), { credentials: 'include', cache: 'no-store' })
-        .then(async (response) => {
-          if (response.ok) setGovernanceAudit(await response.json() as typeof governanceAudit);
-        })
-        .catch(() => setError('Audit history could not be loaded'));
-    }, 300);
-    return () => clearTimeout(timer);
-  }, [activeSection, auditTicket, auditAction]);
-  useEffect(() => {
-    if (activeSection !== 'Analytics') return;
+    if (section !== 'Reports') return;
     const parameters = new URLSearchParams();
     if (selectedEvent) parameters.set('eventId', selectedEvent);
     void apiFetch('/api/management/metrics?' + parameters.toString(), { credentials: 'include', cache: 'no-store' })
@@ -2045,17 +2052,18 @@ export function SuperAdminWorkspace() {
         setAnalyticsError('');
       })
       .catch(() => setAnalyticsError('Analytics could not be loaded'));
-  }, [activeSection, selectedEvent]);
+  }, [section, selectedEvent]);
   useEffect(() => {
-    if (activeSection !== 'Configuration') return;
+    if (section !== 'Configuration') return;
     void apiFetch('/api/management/masters', { credentials: 'include', cache: 'no-store' })
       .then(async (response) => {
         if (response.ok) setGovernanceMasters(await response.json() as typeof governanceMasters);
       })
       .catch(() => setError('Configuration could not be loaded'));
-  }, [activeSection]);
-  const totalOpen = portfolio.reduce((sum, event) => sum + event.open, 0);
-  const totalExceptions = portfolio.reduce((sum, event) => sum + event.exceptions, 0);
+  }, [section]);
+  const figuresReady = !loading && !error;
+  const totalOpen = figuresReady ? portfolio.reduce((sum, event) => sum + event.open, 0) : null;
+  const totalExceptions = figuresReady ? portfolio.reduce((sum, event) => sum + event.exceptions, 0) : null;
   const medianResponse = portfolio[0]?.portfolioMedianResponseSeconds == null ? '—' : duration(portfolio[0].portfolioMedianResponseSeconds);
   async function exportPortfolio() {
     const response = await apiFetch('/api/management/exports', {
@@ -2064,7 +2072,13 @@ export function SuperAdminWorkspace() {
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ format: 'CSV', filters: selectedEvent ? { eventId: selectedEvent } : {}, columns: [] }),
     });
-    setError(response.ok ? 'Portfolio export queued.' : 'Portfolio export could not be queued.');
+    if (!response.ok) {
+      setError('Portfolio export could not be queued.');
+      return;
+    }
+    setError('Portfolio export queued.');
+    const jobs = await apiFetch('/api/management/exports', { credentials: 'include', cache: 'no-store' });
+    if (jobs.ok) setGovernanceExports(await jobs.json() as typeof governanceExports);
   }
   async function createAdmin(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -2072,10 +2086,12 @@ export function SuperAdminWorkspace() {
     setAdminSubmitting(true);
     setAdminFormError('');
     const values = new FormData(event.currentTarget);
-    const eventIds = String(values.get('eventIds') ?? '')
-      .split(',')
-      .map((value) => value.trim())
-      .filter(Boolean);
+    const eventIds = adminEventIds.filter((eventId) => portfolio.some((event) => event.id === eventId));
+    if (!eventIds.length) {
+      setAdminFormError('Choose at least one authorized event.');
+      setAdminSubmitting(false);
+      return;
+    }
     const response = await apiFetch('/api/management/admins', {
       method: 'POST',
       credentials: 'include',
@@ -2120,26 +2136,55 @@ export function SuperAdminWorkspace() {
     if (mastersResponse.ok) setGovernanceMasters(await mastersResponse.json() as typeof governanceMasters);
   }
   const visibleEvents = selectedEvent ? portfolio.filter((event) => event.id === selectedEvent) : portfolio;
+  const organizationName = profile?.organization?.name ?? 'Authorized organization';
+  const selectedEventName = portfolio.find((event) => event.id === selectedEvent)?.event ?? 'All authorized events';
+  useEffect(() => {
+    const ticketId = searchParams.get('ticket');
+    if (section !== 'Tickets' || !ticketId) {
+      setOpenedTicket(null);
+      return;
+    }
+    const listed = eventTickets.find((ticket) => ticket.id === ticketId);
+    if (listed) {
+      setOpenedTicket(listed);
+      return;
+    }
+    let cancelled = false;
+    void apiFetch('/api/tickets/' + encodeURIComponent(ticketId), { credentials: 'include', cache: 'no-store' })
+      .then(async (response) => {
+        if (cancelled || !response.ok) return;
+        const body = await response.json() as ApiTicket;
+        if (body.id && body.publicNo && body.hall && body.stall) setOpenedTicket(mapTicket(body));
+      })
+      .catch(() => undefined);
+    return () => { cancelled = true; };
+  }, [section, searchParams, eventTickets]);
   return (
+    <OperationalClock timeZone={profile?.scopes[0]?.event.timezone}>
     <div className="app-shell super-shell">
-      <aside className="sidebar">
+      <aside className="sidebar admin">
         <div className="brand"><span>E</span>EveOps</div>
-        <nav aria-label="SuperAdmin navigation">{['Portfolio overview', 'Events', 'Tickets', 'Analytics', 'Exports', 'Configuration', 'Admins', 'Audit'].map((item) => <button className={activeSection === item ? 'active' : ''} onClick={() => setActiveSection(item)} key={item}>{item}</button>)}</nav>
+        <nav aria-label="Super Admin navigation">{['Overview', 'Events', 'Tickets', 'Admins', 'Reports', 'Configuration', 'Audit'].map((item) => <button className={section === item ? 'active' : ''} aria-current={section === item ? 'page' : undefined} onClick={() => openGovernance({ section: item === 'Overview' ? null : item, ticket: null })} key={item}>{item}</button>)}</nav>
         <div className="user"><span>SA</span><div><strong>{profile?.name ?? 'Organization owner'}</strong><small>SUPER ADMIN</small></div></div>
         <LogoutButton />
       </aside>
       <main className="management">
-        <header className="topbar"><div><span className="eyebrow">Organization governance</span><h1>{activeSection}</h1></div><div className="top-actions"><select aria-label="Event" value={selectedEvent} onChange={(event) => setSelectedEvent(event.target.value)}><option value="">All authorized events</option>{portfolio.map((event) => <option key={event.id} value={event.id}>{event.event}</option>)}</select><button type="button" onClick={() => setActiveSection('Analytics')}>Exceptions · {totalExceptions}</button></div></header>
+        <header className="topbar"><div><span className="eyebrow">{organizationName} · {selectedEventName}</span><h1>{section}</h1></div><div className="top-actions"><label className="sr-only" htmlFor="governance-event">Event</label><select id="governance-event" aria-label="Event" value={selectedEvent} onChange={(event) => openGovernance({ event: event.target.value || null, ticket: null })}><option value="">All authorized events</option>{portfolio.map((event) => <option key={event.id} value={event.id}>{event.event}</option>)}</select></div></header>
         {error && <div className={error.endsWith('queued.') || error.includes('must be changed') ? 'alert-line' : 'form-error'}>{error}</div>}
-        {activeSection === 'Portfolio overview' && <section className="portfolio-hero"><div><span>Authorized events</span><strong>{portfolio.length}</strong></div><div><span>Open tickets</span><strong>{totalOpen}</strong></div><div><span>Cross-event exceptions</span><strong className="red">{totalExceptions}</strong></div><div><span>Median response</span><strong>{medianResponse}</strong></div></section>}
-        {(activeSection === 'Portfolio overview' || activeSection === 'Events') && <section className="portfolio-list"><div className="section-title"><div><h2>Event performance</h2><p>Cross-event operational comparison</p></div><button onClick={() => void exportPortfolio()}>Export portfolio</button></div>{loading ? <p className="empty-state">Loading authorized events…</p> : visibleEvents.length ? visibleEvents.map((event) => <article key={event.id}><div><strong>{event.event}</strong><span>{event.venue}{event.status ? ` · ${event.status}` : ''}</span></div><div><span>Open</span><strong>{event.open}</strong></div><div><span>Exceptions</span><strong className="red">{event.exceptions}</strong></div><div><span>Median response</span><strong>{duration(event.medianResponseSeconds)}</strong></div><button onClick={() => { setSelectedEvent(event.id); setActiveSection('Tickets'); }}>Open event</button></article>) : <p className="empty-state">No events are assigned to this governance account.</p>}</section>}
-        {activeSection === 'Tickets' && <section className="portfolio-list"><div className="section-title"><div><h2>{selectedEvent ? 'Selected event tickets' : 'Cross-event ticket explorer'}</h2><p>{eventTicketTotal} authorized tickets</p></div><div className="drawer-actions"><select aria-label="Explorer status" value={explorerStatus} onChange={(event) => setExplorerStatus(event.target.value)}><option value="">All statuses</option>{Object.keys(statusLabels).map((status) => <option key={status} value={status}>{statusLabels[status as TicketStatus]}</option>)}</select><select aria-label="Explorer service" value={explorerCategory} onChange={(event) => setExplorerCategory(event.target.value)}><option value="">All services</option><option value="ELECTRICAL">Electrical</option><option value="HOUSE_HELP">House Help</option><option value="HALL_MANAGER">Hall Manager</option></select>{(explorerStatus || explorerCategory) && <button type="button" onClick={() => { setExplorerStatus(''); setExplorerCategory(''); }}>Clear filters</button>}</div></div>{ticketsLoading ? <p className="empty-state">Loading tickets…</p> : eventTickets.length ? eventTickets.map((ticket) => <article key={ticket.id}><div><strong>{ticket.no}</strong><span>{ticket.location}</span></div><div><span>Status</span><Status value={ticket.status} /></div><div><span>Service</span><strong>{ticket.service}</strong></div><div><span>Age</span><strong>{ticket.age}</strong></div></article>) : <p className="empty-state">No tickets match this explorer.</p>}</section>}
-        {activeSection === 'Analytics' && <>{analyticsError && <p className="form-error">{analyticsError}</p>}<CommandInsights metrics={analytics} /></>}
-        {activeSection === 'Admins' && <section className="portfolio-list"><div className="section-title"><div><h2>Organization admins</h2><p>Event-scoped operational administrators</p></div><button type="button" onClick={() => { setShowAddAdmin((value) => !value); setAdminFormError(''); }}>{showAddAdmin ? 'Close form' : 'Add admin'}</button></div>{showAddAdmin && <form className="authority-action" onSubmit={(event) => void createAdmin(event)}><label>Name<span aria-hidden="true"> *</span><input name="name" required minLength={2} /></label><label>Email<span aria-hidden="true"> *</span><input name="email" type="email" required /></label><label>Temporary password<span aria-hidden="true"> *</span><input name="password" type="password" required minLength={12} /></label><label>Authorized event IDs (comma separated)<span aria-hidden="true"> *</span><input name="eventIds" required defaultValue={selectedEvent || portfolio.map((event) => event.id).join(',')} /></label>{adminFormError && <p className="form-error" role="alert">{adminFormError}</p>}<div className="drawer-actions"><button type="button" onClick={() => setShowAddAdmin(false)}>Cancel</button><button className="primary" type="submit" disabled={adminSubmitting}>{adminSubmitting ? 'Creating…' : 'Create admin'}</button></div></form>}{admins.length ? admins.map((admin) => <article key={admin.id}><div><strong>{admin.name}</strong><span>{admin.email}</span></div><div><span>Status</span><strong>{admin.status}</strong></div><div><span>Events</span><strong>{admin.scopes.map((scope) => scope.event.name).join(', ')}</strong></div></article>) : <p className="empty-state">No organization admins yet.</p>}</section>}
-        {activeSection === 'Audit' && <section className="portfolio-list"><div className="section-title"><div><h2>Cross-event audit</h2><p>Immutable ticket lifecycle activity</p></div><div className="drawer-actions"><label className="sr-only" htmlFor="audit-ticket">Ticket</label><input id="audit-ticket" aria-label="Audit ticket" value={auditTicket} onChange={(event) => setAuditTicket(event.target.value)} placeholder="Ticket number" /><label className="sr-only" htmlFor="audit-action">Action</label><input id="audit-action" aria-label="Audit action" value={auditAction} onChange={(event) => setAuditAction(event.target.value)} placeholder="Action" /></div></div>{governanceAudit.length ? governanceAudit.map((event) => <article key={event.id}><div><strong>{event.ticket.publicNo}</strong><span>{event.actor?.name ?? 'System'}</span></div><div><span>Action</span><strong>{event.eventType.replaceAll('_', ' ')}</strong></div><div><span>Time</span><strong>{eventTime(event.createdAt)}</strong></div></article>) : <p className="empty-state">No audit events match this search.</p>}</section>}
-        {activeSection === 'Exports' && <section className="portfolio-list"><div className="section-title"><div><h2>Export center</h2><p>Authorized cross-event reports. Generated files expire after 24 hours.</p></div><button type="button" onClick={() => void exportPortfolio()}>Queue CSV export</button></div>{governanceExports.length ? governanceExports.map((job) => <article key={job.id}><div><strong>{job.format}</strong><span>{eventTime(job.createdAt)}</span></div><div><span>Status</span><strong>{job.status}</strong></div><div><span>Rows</span><strong>{job.rowCount ?? 'Pending'}</strong></div>{job.status === 'READY' && <a href={'/api/management/exports/' + job.id + '/download'}>Download</a>}</article>) : <p className="empty-state">No export jobs yet.</p>}</section>}
-        {activeSection === 'Configuration' && <section className="portfolio-list"><div className="section-title"><div><h2>Service configuration</h2><p>SLA defaults for authorized events. Export files expire after 24 hours.</p></div></div>{governanceMasters.length ? governanceMasters.map((event) => <div key={event.id}>{event.pools.map((pool) => <article key={pool.id}><div><strong>{event.name}</strong><span>{pool.category} · {pool.subtype} · {pool.active ? 'Active' : 'Inactive'}</span></div><div><span>Response SLA</span><strong>{duration(pool.responseTargetSeconds)}</strong></div><div><span>Resolution SLA</span><strong>{duration(pool.resolutionTargetSeconds)}</strong></div>{slaPoolId === pool.id ? <form className="authority-action" onSubmit={(formEvent) => void savePoolSla(formEvent, pool.id)}><label>Response target (seconds)<span aria-hidden="true"> *</span><input name="responseTargetSeconds" type="number" min={1} required defaultValue={pool.responseTargetSeconds} /></label><label>Resolution target (seconds)<span aria-hidden="true"> *</span><input name="resolutionTargetSeconds" type="number" min={1} required defaultValue={pool.resolutionTargetSeconds} /></label>{slaError && <p className="form-error" role="alert">{slaError}</p>}<div className="drawer-actions"><button type="button" onClick={() => setSlaPoolId(null)}>Cancel</button><button className="primary" type="submit">Save SLA</button></div></form> : <button type="button" onClick={() => { setSlaPoolId(pool.id); setSlaError(''); }}>Edit SLA</button>}</article>)}</div>) : <p className="empty-state">No service pools are configured for authorized events.</p>}</section>}
+        {section === 'Overview' && <section aria-label="Organization overview"><div className="section-title"><div><h2>Organization summary</h2><p>Counts include every event this account is allowed to open. Open means not closed or cancelled. Exceptions are escalated tickets and unresolved complaints. Median response uses completed acceptances only. A dash means the figure has not loaded.</p></div></div><section className="metric-grid">{[
+          { label: 'Authorized events', value: figuresReady ? String(portfolio.length) : '—', detail: 'Events this account can open' },
+          { label: 'Open tickets', value: totalOpen == null ? '—' : String(totalOpen), detail: 'Not closed or cancelled' },
+          { label: 'Exceptions', value: totalExceptions == null ? '—' : String(totalExceptions), detail: 'Escalated or complaint status' },
+          { label: 'Median response', value: figuresReady ? medianResponse : '—', detail: 'Raise to first acceptance, all authorized events' },
+        ].map((metric) => <article key={metric.label} className="metric"><span>{metric.label}</span><strong>{metric.value}</strong><small>{metric.detail}</small></article>)}</section><div className="drawer-actions"><button type="button" onClick={() => openGovernance({ section: 'Events' })}>Review events</button><button type="button" onClick={() => openGovernance({ section: 'Tickets' })}>Review tickets</button></div></section>}
+        {section === 'Events' && <section className="portfolio-list"><div className="section-title"><div><h2>Authorized events</h2><p>{selectedEvent ? `${selectedEventName} is selected in the header.` : 'Every event this account can open. Choosing one limits tickets, reports, and exports to that event.'}</p></div></div>{loading ? <p className="empty-state">Loading authorized events…</p> : error ? <p className="form-error" role="alert">{error}</p> : visibleEvents.length ? visibleEvents.map((event) => <article key={event.id}><div><strong>{event.event}</strong><span>{event.venue}{event.status ? ` · ${event.status}` : ''}</span></div><div><span>Open</span><strong>{event.open}</strong></div><div><span>Exceptions</span><strong className={event.exceptions ? 'red' : undefined}>{event.exceptions}</strong></div><div><span>Median response</span><strong>{event.medianResponseSeconds == null ? '—' : duration(event.medianResponseSeconds)}</strong></div><button type="button" onClick={() => openGovernance({ section: 'Tickets', event: event.id })}>Open tickets</button></article>) : <p className="empty-state">No events are assigned to this account.</p>}</section>}
+        {section === 'Tickets' && <section className={openedTicket ? 'workspace manager-focus' : 'workspace'}><div className="operations"><div className="section-title"><div><h2>{selectedEvent ? selectedEventName : 'Cross-event tickets'}</h2><p>{ticketsLoading && !eventTickets.length ? 'Loading authorized tickets…' : `${eventTicketTotal} authorized tickets. Showing ${eventTickets.length}.`} Open a row for activity. This account does not accept, snooze, or close work from here.</p></div></div><div className="filters"><select aria-label="Explorer status" value={explorerStatus} onChange={(event) => openGovernance({ section: 'Tickets', status: event.target.value || null, ticket: null })}><option value="">All statuses</option>{Object.keys(statusLabels).map((status) => <option key={status} value={status}>{statusLabels[status as TicketStatus]}</option>)}</select><select aria-label="Explorer service" value={explorerCategory} onChange={(event) => openGovernance({ section: 'Tickets', category: event.target.value || null, ticket: null })}><option value="">All services</option><option value="ELECTRICAL">Electrical</option><option value="HOUSE_HELP">House Help</option><option value="HALL_MANAGER">Hall Manager</option></select>{(explorerStatus || explorerCategory || selectedEvent) && <button type="button" onClick={() => openGovernance({ section: 'Tickets', status: null, category: null, event: null, ticket: null })}>Clear filters</button>}</div>{ticketsLoading && !eventTickets.length ? <p className="empty-state">Loading tickets…</p> : eventTickets.length ? <><div className="manager-list">{eventTickets.map((ticket) => <button type="button" key={ticket.id} className={openedTicket?.id === ticket.id ? 'manager-card selected' : 'manager-card'} onClick={() => openGovernance({ section: 'Tickets', ticket: ticket.id })}><strong>{ticket.no}</strong><span>{ticket.location}</span><span>{ticket.service}</span><span>{statusLabels[ticket.status]}</span></button>)}</div>{eventTicketCursor && <button type="button" onClick={() => void loadMoreEventTickets()}>Load more</button>}</> : <p className="empty-state">No tickets match this explorer.</p>}</div>{openedTicket && <aside className="drawer" aria-label={'Ticket ' + openedTicket.no + ' detail'}><button type="button" onClick={() => openGovernance({ ticket: null })}>Back to the list</button><div className="drawer-head"><div><span className="eyebrow">{openedTicket.no}</span><h2>{openedTicket.service}</h2></div><Status value={openedTicket.status} audience="manager" /></div><p>{openedTicket.location}</p><p className="description">{openedTicket.description}</p><TicketActivity ticketId={openedTicket.id} /></aside>}</section>}
+        {section === 'Admins' && <section className="portfolio-list"><div className="section-title"><div><h2>Admin accounts</h2><p>Event access is chosen from the events this organization account can already open. Creating an admin does not add events or grant hall-manager actions.</p></div><button type="button" onClick={() => { setShowAddAdmin((value) => !value); setAdminFormError(''); setAdminEventIds(selectedEvent ? [selectedEvent] : []); }}>{showAddAdmin ? 'Close form' : 'Add admin'}</button></div>{showAddAdmin && <form className="authority-action" onSubmit={(event) => void createAdmin(event)}><label>Name<span aria-hidden="true"> *</span><input name="name" required minLength={2} /></label><label>User ID<span aria-hidden="true"> *</span><input name="email" type="text" required minLength={2} maxLength={254} spellCheck={false} /></label><label>Temporary password<span aria-hidden="true"> *</span><input name="password" type="password" required minLength={NEW_PASSWORD_MIN_LENGTH} maxLength={PASSWORD_MAX_BYTES} pattern={NEW_PASSWORD_PATTERN.source} title="Use at least 8 characters, including a letter and a number" /></label><fieldset><legend>Event access</legend>{portfolio.map((event) => <label key={event.id}><input type="checkbox" checked={adminEventIds.includes(event.id)} onChange={(change) => setAdminEventIds((current) => change.target.checked ? [...current, event.id] : current.filter((id) => id !== event.id))} /> {event.event}</label>)}</fieldset>{adminFormError && <p className="form-error" role="alert">{adminFormError}</p>}<div className="drawer-actions"><button type="button" onClick={() => setShowAddAdmin(false)}>Cancel</button><button className="primary" type="submit" disabled={adminSubmitting}>{adminSubmitting ? 'Creating…' : 'Create admin'}</button></div></form>}{admins.length ? admins.map((admin) => <article key={admin.id}><div><strong>{admin.name}</strong><span>{admin.email}</span></div><div><span>Status</span><strong>{admin.status}</strong></div><div><span>Events</span><strong>{admin.scopes.map((scope) => scope.event.name).join(', ') || 'No event access'}</strong></div></article>) : <p className="empty-state">No admin accounts are visible in this organization.</p>}</section>}
+        {section === 'Reports' && <section className="portfolio-list"><div className="section-title"><div><h2>Reports and exports</h2><p>Figures use {selectedEvent ? selectedEventName : 'every authorized event'}. Open is not closed or cancelled. Averages and medians use completed timestamps only; a dash means there is no completed sample or the figure has not loaded. CSV export uses the selected event and expires after 24 hours. An empty file still downloads when the filter matches nothing.</p></div><button type="button" onClick={() => void exportPortfolio()}>Queue CSV export</button></div>{analyticsError && <p className="form-error" role="alert">{analyticsError}</p>}<CommandInsights metrics={analytics} />{governanceExports.length ? governanceExports.map((job) => <article key={job.id}><div><strong>{job.format}</strong><span>{eventTime(job.createdAt)}</span></div><div><span>Status</span><strong>{job.status}</strong></div><div><span>Rows</span><strong>{job.rowCount ?? 'Pending'}</strong></div>{job.status === 'READY' && <a href={'/api/management/exports/' + job.id + '/download'}>Download</a>}</article>) : <p className="empty-state">No export jobs yet.</p>}</section>}
+        {section === 'Audit' && <section className="portfolio-list"><div className="section-title"><div><h2>Administrative history</h2><p>Registration, workforce, configuration, and ticket lifecycle records for authorized events. This list cannot be edited. Refresh shows records added since this page was opened. Load more continues older records. Showing {governanceHistory.items.length}.</p></div><div className="drawer-actions"><label>Ticket or account<input aria-label="Audit ticket" value={auditTicket} onChange={(event) => setAuditTicket(event.target.value)} /></label><label>Action<input aria-label="Audit action" value={auditAction} onChange={(event) => setAuditAction(event.target.value)} /></label><button type="button" onClick={() => void governanceHistory.refresh()}>Refresh</button></div></div>{governanceHistory.stale && governanceHistory.error ? <p className="alert-line" role="status">{governanceHistory.error}</p> : null}{!governanceHistory.loaded ? <p className="empty-state">Loading history…</p> : governanceHistory.error && !governanceHistory.items.length ? <p className="form-error" role="alert">{governanceHistory.error}</p> : governanceHistory.items.length ? <>{governanceHistory.items.map((event) => <article key={(event.kind ?? 'ticket') + event.id}><div><strong>{event.ticket.publicNo}</strong><span>{event.actor?.name ?? 'System'}{event.actor?.role ? ` · ${event.actor.role.replaceAll('_', ' ')}` : ''}</span></div><div><span>Record</span><strong>{event.kind === 'workforce' ? 'Administrative change' : 'Ticket lifecycle'}</strong></div><div><span>Action</span><strong>{event.eventType.replaceAll('_', ' ')}</strong></div><div><span>Time</span><strong>{eventTime(event.createdAt)}</strong></div></article>)}{governanceHistory.nextCursor ? <button type="button" onClick={() => void governanceHistory.loadMore()}>Load more</button> : null}</> : <p className="empty-state">No history matches this search.</p>}</section>}
+        {section === 'Configuration' && <section className="portfolio-list"><div className="section-title"><div><h2>Service configuration</h2><p>SLA defaults for authorized events. Export files expire after 24 hours.</p></div></div>{governanceMasters.length ? governanceMasters.map((event) => <div key={event.id}>{event.pools.map((pool) => <article key={pool.id}><div><strong>{event.name}</strong><span>{pool.category} · {pool.subtype} · {pool.active ? 'Active' : 'Inactive'}</span></div><div><span>Response SLA</span><strong>{duration(pool.responseTargetSeconds)}</strong></div><div><span>Resolution SLA</span><strong>{duration(pool.resolutionTargetSeconds)}</strong></div>{slaPoolId === pool.id ? <form className="authority-action" onSubmit={(formEvent) => void savePoolSla(formEvent, pool.id)}><label>Response target (seconds)<span aria-hidden="true"> *</span><input name="responseTargetSeconds" type="number" min={1} required defaultValue={pool.responseTargetSeconds} /></label><label>Resolution target (seconds)<span aria-hidden="true"> *</span><input name="resolutionTargetSeconds" type="number" min={1} required defaultValue={pool.resolutionTargetSeconds} /></label>{slaError && <p className="form-error" role="alert">{slaError}</p>}<div className="drawer-actions"><button type="button" onClick={() => setSlaPoolId(null)}>Cancel</button><button className="primary" type="submit">Save SLA</button></div></form> : <button type="button" onClick={() => { setSlaPoolId(pool.id); setSlaError(''); }}>Edit SLA</button>}</article>)}</div>) : <p className="empty-state">No service pools are configured for authorized events.</p>}</section>}
       </main>
     </div>
+    </OperationalClock>
   );
 }

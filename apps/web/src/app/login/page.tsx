@@ -1,6 +1,6 @@
 'use client';
 
-import type { Role } from '@eveops/contracts';
+import { PASSWORD_MAX_BYTES, PASSWORD_MIN_LENGTH, type Role } from '@eveops/contracts';
 import { FormEvent, useState } from 'react';
 import { useRouter } from 'next/navigation';
 
@@ -28,13 +28,13 @@ export default function LoginPage() {
         credentials: 'include',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({
-          email: String(form.get('email') ?? ''),
+          userId: String(form.get('userId') ?? ''),
           password: String(form.get('password') ?? ''),
           portal: 'OPERATIONS',
         }),
       });
       if (!response.ok) {
-        if (response.status === 401) throw new Error('Incorrect email or password');
+        if (response.status === 401) throw new Error('Incorrect user ID or password');
         if (response.status === 403) {
           const payload = await response.json().catch(() => null) as { message?: string | string[] } | null;
           const message = Array.isArray(payload?.message) ? payload?.message[0] : payload?.message;
@@ -72,12 +72,12 @@ export default function LoginPage() {
           <p>Your account opens only the workspace and event scope assigned to you.</p>
           <form onSubmit={login}>
             <label>
-              Email address
-              <input name="email" type="email" autoComplete="username" required />
+              User ID
+              <input name="userId" type="text" autoComplete="username" required minLength={2} maxLength={254} spellCheck={false} />
             </label>
             <label>
               Password
-              <input name="password" type="password" autoComplete="current-password" required minLength={8} />
+              <input name="password" type="password" autoComplete="current-password" required minLength={PASSWORD_MIN_LENGTH} maxLength={PASSWORD_MAX_BYTES} />
             </label>
             {error && <div className="form-error" role="alert">{error}</div>}
             <button className="primary" type="submit" disabled={loading}>

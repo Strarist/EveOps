@@ -1,5 +1,6 @@
 import { Injectable, Logger, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
 import { PrismaClient } from '@prisma/client';
+import { assertEffectiveDatabase } from '@eveops/operations';
 import { ensureDemoSeed, shouldEnsureDemoSeed } from './demo-seed';
 
 @Injectable()
@@ -8,6 +9,12 @@ export class PrismaService extends PrismaClient implements OnModuleInit, OnModul
 
   async onModuleInit() {
     await this.$connect();
+    const databaseName = await assertEffectiveDatabase(this);
+    this.logger.log(`Effective database: ${databaseName}`);
+    if (databaseName === 'eveops_regression') {
+      this.logger.log('Demo seed skipped on eveops_regression');
+      return;
+    }
     if (!shouldEnsureDemoSeed()) return;
     try {
       await ensureDemoSeed(this);

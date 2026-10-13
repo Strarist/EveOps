@@ -16,12 +16,11 @@ import {
   Post,
   UseGuards,
 } from '@nestjs/common';
-import type { AuthScope, Role } from '@eveops/contracts';
-import { serviceQueueOrderBy } from '@eveops/operations';
+import { LOGIN_IDENTIFIER_PATTERN, USER_ID_MESSAGE, type AuthScope, type Role } from '@eveops/contracts';
+import { fanOutTicketAlerts, serviceQueueOrderBy } from '@eveops/operations';
 import { Availability, Prisma, UserStatus } from '@prisma/client';
 import { Type } from 'class-transformer';
 import {
-  IsEmail,
   IsIn,
   IsInt,
   IsOptional,
@@ -34,6 +33,7 @@ import {
 } from 'class-validator';
 import { hash } from 'bcryptjs';
 import { CurrentScope, SessionGuard } from './auth';
+import { IsNewPassword } from './password-policy';
 import { assertScope, assertTransition, requireAuthority } from './domain';
 import { PrismaService } from './prisma.service';
 import { RealtimeService } from './realtime';
@@ -57,9 +57,9 @@ export class AvailabilityDto {
 
 export class CreatePersonDto {
   @IsString() @MinLength(2) name!: string;
-  @IsEmail() email!: string;
+  @IsString() @Matches(LOGIN_IDENTIFIER_PATTERN, { message: USER_ID_MESSAGE }) email!: string;
   @IsOptional() @IsString() phone?: string;
-  @IsString() @MinLength(10) password!: string;
+  @IsString() @IsNewPassword() password!: string;
   @IsIn([...MANAGED_ROLES]) role!: ManagedRole;
   @IsString() eventId!: string;
   @IsOptional() @IsString() hallId?: string;
@@ -75,7 +75,7 @@ export class UpdatePersonDto {
   @IsOptional() @IsString() phone?: string;
   @IsOptional() @IsIn(['ACTIVE', 'DISABLED']) status?: UserStatus;
   @IsOptional() @Type(() => Number) @IsInt() @Min(1) @Max(20) capacity?: number;
-  @IsOptional() @IsString() @MinLength(10) password?: string;
+  @IsOptional() @IsString() @IsNewPassword() password?: string;
   @IsOptional() @IsString() hallId?: string;
   @IsOptional() @IsString() serviceCategory?: string;
   @IsOptional() @IsString() serviceSubtype?: string;
@@ -634,6 +634,7 @@ export class WorkforceService {
             employeeCode,
             name: dto.name.trim(),
             email: dto.email.trim().toLowerCase(),
+            loginId: dto.email.trim().toLowerCase(),
             phone: dto.phone?.trim() || null,
             passwordHash,
             mustChangePassword: true,
@@ -906,6 +907,9 @@ export class WorkforceService {
         if (deactivated || dto.password !== undefined) {
           await tx.session.deleteMany({ where: { userId: user.id } });
         }
+        if (deactivated) {
+          await tx.pushSubscription.deleteMany({ where: { userId: user.id } });
+        }
 
         const actions = ['USER_UPDATED'];
         if (deactivated) actions.push('USER_DEACTIVATED');
@@ -1005,23 +1009,20 @@ export class WorkforceService {
           payload: { ticketId, eventId: ticket.eventId, hallId: ticket.hallId, stallId: ticket.stallId, assigneeId: staffId, previousAssigneeId: active?.staffId ?? null },
         },
       });
-      await tx.notification.create({
-        data: {
+      await fanOutTicketAlerts(tx, {
+        type: 'TICKET_ASSIGNED',
+        mode: 'assignment',
+        actorId: scope.userId,
+        assigneeId: staffId,
+        eventToken: assignment.id,
+        ticket: {
+          id: ticketId,
           eventId: ticket.eventId,
-          recipientId: staffId,
-          ticketId,
-          type: 'TICKET_ASSIGNED',
-          dedupeKey: `ticket-reassigned:${ticketId}:${assignment.id}:${staffId}`,
-          payload: {
-            hallId: ticket.hallId,
-            stallCode: (await tx.stall.findUnique({ where: { id: ticket.stallId }, select: { stallCode: true } }))?.stallCode,
-            category: ticket.category,
-            priority: ticket.priority,
-            issue: ticket.description.slice(0, 140),
-            publicNo: ticket.publicNo,
-            summary: 'New task',
-            previousStaffId: active?.staffId ?? null,
-          },
+          hallId: ticket.hallId,
+          stallId: ticket.stallId,
+          version: ticket.version + 1,
+          category: ticket.category,
+          publicNo: ticket.publicNo,
         },
       });
       return { assignment, previousStaffId: active?.staffId };
