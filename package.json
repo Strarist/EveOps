@@ -14,6 +14,7 @@
     "build:packages": "npm run build -w @eveops/contracts && npm run build -w @eveops/operations",
     "test": "npm run test -w @eveops/api",
     "test:e2e": "playwright test",
+    "test:e2e:regression": "playwright test -c playwright.regression.config.ts",
     "test:load": "node scripts/operational-load-smoke.mjs",
     "test:load:http": "node scripts/load-smoke.mjs",
     "debug:ticket": "tsx scripts/debug-ticket.ts",

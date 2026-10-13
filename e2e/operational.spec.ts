@@ -235,7 +235,8 @@ test.describe.serial('isolated multi-role operational acceptance', () => {
     expect(ticket.status).toBe('ASSIGNED');
     const staffPage = await staff.newPage();
     await staffPage.goto('/staff');
-    await expect(staffPage.getByText(ticket.publicNo)).toBeVisible();
+    // Staff cards are stall-first (03-ui-ux-spec §5.1); publicNo is shown on stall/admin surfaces.
+    await expect(staffPage.getByRole('heading', { name: 'Stall E2E-S1' })).toBeVisible();
     await expect(staffPage.getByRole('button', { name: 'Accept task' }).first()).toBeVisible();
     await advanceToOtp(staff, ticket.id);
     const afterRequest = await (await staff.request.get(`/api/tickets/${ticket.id}`)).json() as { status: string; completionRequestedAt: string | null };

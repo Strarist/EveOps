@@ -2,6 +2,20 @@ import { defineConfig, devices } from '@playwright/test';
 
 export default defineConfig({
   testDir: './e2e',
+  // Regression / phase browser suites need eveops_regression + playwright.regression.config.ts.
+  testIgnore: [
+    'regression-smoke.spec.ts',
+    'regression-staff.spec.ts',
+    'phase1-registration.spec.ts',
+    'phase2-alerts.spec.ts',
+    'phase3a-manager.spec.ts',
+    'phase3a-pagination.spec.ts',
+    'phase3b-stall.spec.ts',
+    'phase3c-admin.spec.ts',
+    'phase3d-super.spec.ts',
+    'phase4-vacant-stall.spec.ts',
+    'readiness-requests.spec.ts',
+  ],
   fullyParallel: false,
   workers: 1,
   timeout: 45_000,
