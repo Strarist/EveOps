@@ -384,7 +384,9 @@ test.describe.serial('isolated multi-role operational acceptance', () => {
     const stall = await login(browser, emails.stall);
     const admin = await login(browser, emails.admin);
     const adminPage = await admin.newPage();
-    await adminPage.goto('/admin');
+    // Admin Overview does not subscribe to ticket lists; Tickets section owns live reconcile.
+    await adminPage.goto('/admin?section=Tickets');
+    await expect(adminPage.getByRole('heading', { name: 'Tickets' })).toBeVisible();
     await admin.setOffline(true);
     const ticket = await createTicket(stall);
     await admin.setOffline(false);
