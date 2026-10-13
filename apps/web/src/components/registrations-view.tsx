@@ -133,10 +133,11 @@ export function RegistrationsView() {
   async function submitLogin(event: FormEvent<HTMLFormElement>, path: string) {
     event.preventDefault();
     if (busy) return;
+    const form = event.currentTarget;
     setBusy(true);
     setNotice('');
     setError('');
-    const values = new FormData(event.currentTarget);
+    const values = new FormData(form);
     const zone = zones.find((item) => item.id === String(values.get('zoneId') ?? ''));
     const body: Record<string, string> = { idempotencyKey: registrationKey.current };
     for (const [key, value] of values.entries()) {
@@ -157,7 +158,7 @@ export function RegistrationsView() {
     registrationKey.current = crypto.randomUUID();
     setHandoff(result.handoff ?? null);
     setLoginStallId(null);
-    event.currentTarget.reset();
+    form.reset();
     setNotice(result.credentialIssued ? 'Exhibitor login is ready. Copy the instructions before leaving this page.' : 'This login already exists. Reset the initial password if you still need one.');
     await load();
   }
