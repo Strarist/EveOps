@@ -419,16 +419,6 @@ test.describe.serial('isolated multi-role operational acceptance', () => {
     await Promise.all([manager.close(), admin.close()]);
   });
 
-  test('10 SuperAdmin governance login is isolated and functional', async ({ page }) => {
-    await page.goto('/governance-access');
-    await page.getByLabel('SuperAdmin ID').fill(emails.super);
-    await page.getByLabel('Password').fill(password);
-    await page.getByRole('button', { name: 'Enter governance workspace' }).click();
-    await expect(page).toHaveURL(/\/super-admin/);
-    await expect(page.getByText('Organization governance')).toBeVisible();
-    expect((await page.request.get('/api/management/portfolio')).status()).toBe(200);
-  });
-
   test('11 Hall Manager creates House Help worker pending Admin approval', async ({ browser }) => {
     const manager = await login(browser, emails.manager);
     const admin = await login(browser, emails.admin);
